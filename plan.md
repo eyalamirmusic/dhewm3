@@ -3,7 +3,8 @@
 Moving dhewm3 off SDL2 + OpenGL and onto [eacp](https://github.com/eyalamirmusic/eacp):
 app lifecycle and message loop first, GPU rendering (Metal / D3D12) as the real work.
 
-**Status: Phase 0 is done and merged. Phase 1 is next, and touches no eacp API.**
+**Status: Phase 0 is done and merged. Phase 1 has landed its gate and its seam.
+Phase 2 is next, and is where eacp starts being used.**
 
 Reference implementation for almost everything on the platform side:
 `~/Code/PureDOOM/examples/EACP` — a complete engine hosted on eacp, with its own
@@ -338,27 +339,53 @@ Numbers are never reused, so a hole is an entry that closed.
 
 ### Phase 0 — eacp — **done**, see §4
 
-### Phase 1 — dhewm3 under SDL/GL: the backend seam ← **next**
+### Phase 1 — dhewm3 under SDL/GL: the backend seam — **done**
 
-Introduce `idRenderBackend` over the choke points that already exist (the `GLS_*`
-state bitfield, the two `*WithCounters` draw functions, `GL_SelectTexture` /
-`idImage::Bind`). Implement it on GL. **Nothing about the output changes.**
+`idRenderBackend` (`neo/renderer/RenderBackend.h`) over the choke points that
+already existed — the `GLS_*` bitfield, the two `*WithCounters` draw functions,
+`GL_SelectTexture`, the draw buffer, the swap — with the existing bodies moved
+unchanged into `RenderBackend_GL.cpp`. The free functions stay as one-line
+forwarders, so the ~2000 qgl call sites above them were never touched.
 
-This phase ships a still-playable game and is fully verifiable:
+`idImage::Bind` is deliberately *not* behind it. The plan listed it as a choke
+point and it is one, but putting it behind the interface means moving texture
+creation and upload, which is Phase 2's work. Same for `backEnd.glState`: the
+cache stays where it is because `idImage::Bind` and the tools read it from
+outside the backend.
 
-1. Record reference demos under the current build (`recordDemo`).
-2. Land the seam.
-3. `timeDemo` the same demos — output and timing should be unchanged.
+**297 of 297 frames identical**, against a canary that moves all 297.
 
-Those demos are the regression gate for Phase 2. This is the single highest-value
-thing in the plan: it is what makes a long-lived renderer branch survivable, and it
-is what PureDOOM had that made its port measurable rather than hopeful.
+#### The gate — `regression/`, and read its README
+
+`regression/gate.sh record | capture LABEL | compare A B`. A recorded render
+demo replayed frame-by-frame through `aviDemo` and hashed: playback is
+frame-exact, so two captures of one build are byte-identical. About twenty
+seconds a capture.
+
+Three things it cost to get there, all written up in `regression/README.md`:
+
+- **Playing a render demo crashed outright on demo data.**
+  `StartPlayingRenderDemo` dereferences `guis/map/loading.gui` unconditionally
+  and `demo00.pk4` does not ship one. Four sites in `Session.cpp` already
+  treated `guiLoading` as nullable and five did not. Fixed.
+- **Recording had to be scriptable, and gameplay is not.** The tour drives the
+  camera through the map's own eighteen `info_location` entities with
+  `setviewpos`. Two traps: the level opens on a cinematic that owns the camera,
+  and `wait N` counts command-buffer executions rather than frames — the buffer
+  runs several times per frame, so N is about six times the frames it holds.
+- **The first answer the gate gave was wrong, and was perfectly reproducible.**
+  `gate.sh` redirected `fs_savepath` but not `fs_configpath`, which dhewm3 keeps
+  separately, so the `r_skipSpecular 1` canary archived that cvar into the real
+  config and every capture afterwards read it back. Determinism was verified and
+  was real; it said nothing about whether the configuration was the intended one.
+  **Reproducible is not correct**, and a comparison harness that writes anywhere
+  the program also reads is a feedback loop.
 
 The demo data is already unpacked at `cmake-build-debug/neo/demo/demo00.pk4`
-(`CMake/DemoData.cmake` fetches it at configure time), so the gate needs no retail
-install.
+(`CMake/DemoData.cmake` fetches it at configure time), so the gate needs no
+retail install.
 
-### Phase 2 — cut the platform layer and the backend together
+### Phase 2 — cut the platform layer and the backend together ← **next**
 
 Both at once, on one branch:
 
@@ -405,26 +432,51 @@ Explicitly **not** ported:
 - Gamepad support, initially (see gap 10).
 - Depth bounds test (10 refs) — an optimisation, drop it.
 
-**Linux — resolved, and it is a real loss.** The earlier open question guessed that
-eacp's README might be stale because `Core/App/App-Linux.cpp` exists. It is not
-stale, and that file is not evidence: `Lib/eacp/CMakeLists.txt:5` gates the entire
-graphics stack — `Graphics`, **`GPU`**, `Text`, `Sprites`, `UI`, `SVG` — behind
-`(APPLE OR WIN32)`. Only `Core`, `SIMD` and `Network` build on Linux, which is why
-CI builds Linux and there is still no window there to put a frame in.
+**Linux — dropped. Decided, not discovered.** eacp's README is not stale:
+`Lib/eacp/CMakeLists.txt:5` gates the entire graphics stack — `Graphics`,
+**`GPU`**, `Text`, `Sprites`, `UI`, `SVG` — behind `(APPLE OR WIN32)`. Only
+`Core`, `SIMD` and `Network` build on Linux, which is why CI builds Linux and
+there is still no window there to put a frame in.
 
-So **this port ends dhewm3's Linux support**, which dhewm3 has today. That is a
-consequence to accept deliberately rather than discover in Phase 2. The ways out,
-none free: keep the SDL/GL backend alive behind the Phase 1 seam and build it on
-Linux only; add Linux windowing and a Vulkan backend to eacp (there is a
-`vulkan-backend` branch); or accept macOS + Windows.
+Three ways out were on the table: keep the SDL/GL backend alive behind the
+Phase 1 seam and build it on Linux only; add Linux windowing and a Vulkan
+backend to eacp (there is a `vulkan-backend` branch); or accept macOS + Windows.
+**The third is the answer** — so this port ends dhewm3's Linux support, which
+dhewm3 has today.
+
+What that settles, and it is the reason the question had to be answered before
+Phase 2: **the GL backend behind the seam is throwaway.** It exists to keep the
+game running and measurable while the eacp one is written beside it, and it is
+deleted when the eacp one passes the gate. No second backend to keep alive, no
+GL path to keep honest, and no reason for `idRenderBackend` to stay expressible
+in fixed-function terms a moment longer than the port needs.
+
+Nothing has been deleted yet. `neo/sys/linux/`, the SDL layer and the POSIX
+files still build, and there is no reason to remove them before Phase 2 wants
+their call sites — but nothing is owed to them either.
 
 ---
 
 ## 8. Next steps
 
-1. **Record the reference demos** on today's SDL/GL build and confirm `timeDemo`
-   replays them. Everything after this is measured against them.
-2. **Land the `idRenderBackend` seam** on GL underneath, with the demos proving the
-   output did not move.
-3. **Decide Linux** (§7) before Phase 2 starts deleting `glimp.cpp` — the answer
-   changes whether the GL backend behind the seam is throwaway or permanent.
+Phase 1's three steps are done: the gate is recorded and verified in both
+directions, the seam is landed at 297/297, and Linux is decided (§7 — dropped,
+which makes the GL backend throwaway).
+
+Phase 2 is the first work that compiles against eacp. In rough order:
+
+1. **Stand up the eacp app shell** — `App.h` / `View.h` / `Input.h` transcribed
+   from `~/Code/PureDOOM/examples/EACP`, CPM in `neo/CMakeLists.txt`, a window
+   that opens and does nothing else.
+2. **Bridge events**, push-callback to dhewm3's polled `Sys_GetEvent`, through a
+   ring buffer — `PushConsoleEvent` (`neo/sys/events.cpp:909`) is the pattern
+   already in the tree. Drive `common->Frame()` from `GPUView::update()`.
+3. **`idRenderBackendEacp` beside the GL one**, taking the gate's frames as the
+   target. The two are selectable while the second is unfinished; the GL one
+   goes when it stops being needed.
+4. **Delete** `glimp.cpp`, `events.cpp`, `threads.cpp`, `neo/sys/linux/`, SDL.
+
+The gate is the whole reason this can be done in that order rather than as one
+jump. It is also worth re-reading `regression/README.md` before trusting it on
+a backend it has never seen: it was built against a renderer whose output it
+already knew, and the first thing it said was wrong.
