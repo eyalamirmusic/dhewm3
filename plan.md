@@ -447,6 +447,52 @@ Two things it cost, and both are worth more than the window:
   pins a SHA, which is at least honest and makes a bump a commit somebody can
   see.
 
+#### Step 2a — threading, off SDL and onto the standard library — **done**
+
+`neo/sys/threads.cpp` rewritten on `std::thread` / `std::recursive_mutex` /
+`std::condition_variable_any`, and `xthreadInfo::threadHandle` retyped from
+`SDL_Thread *` to an opaque `sysThread_t *` — nothing outside `threads.cpp` does
+anything with it but compare it against `NULL`. `tools/debugger/debugger.cpp`,
+which was calling `SDL_CreateThread` directly and bypassing the engine's own
+API, now goes through `Sys_CreateThread` too.
+
+Done in the *shared* file rather than a new `sys/eacp/` one, because nothing
+here needs a window system: both executables use it, which also makes it the
+one piece of the platform swap the Phase 1 gate can measure. **297 of 297
+frames identical.**
+
+**`Sys_EnterCriticalSection` has to be recursive, and nothing says so.** The
+first version used `std::mutex`, compiled without a warning, and hung on the
+first capture. `idSoundWorldLocal::ProcessDemoCommand` takes
+`CRITICAL_SECTION_ZERO` around `ReadFromSaveGame`, whose first act is
+`ClearAllSoundEmitters`, which takes it again (`snd_world.cpp:340` and `:203`).
+That was never a bug: both implementations this API has ever had are recursive —
+Win32's `CRITICAL_SECTION` by definition, and `SDL_CreateMutex`, which
+documents itself as reentrant. The API's own header says neither.
+
+Two things worth keeping from it:
+
+- **The deadlock was on the one path the gate drives and a hand-run of the game
+  might not have reached** — replaying a *render demo* is what calls
+  `ProcessDemoCommand`. A port that swapped the platform layer wholesale and
+  tested by playing would plausibly have shipped this.
+- **`condition_variable_any` follows from the recursive mutex**, and brings its
+  own constraint: `wait()` unlocks once, so a thread that entered
+  `CRITICAL_SECTION_SYS` twice and then waited would release neither. Nothing
+  does — `Sys_WaitForEvent` takes the section itself — and the SDL version was
+  under the same constraint for the same reason.
+
+What the gate covered, and what it did not. Every run creates two threads:
+`AsyncThread` (`Common.cpp:3176`) and `backgroundDownload`
+(`FileSystem.cpp:2701`), so create, destroy, the blocking `Sys_WaitForEvent`
+and the recursive enter were all exercised across 297 frames.
+**`Sys_TriggerEvent`'s signalling branch was not** — it fires from
+`BackgroundDownload`, which only runs when `image_useCache` is on, and it
+defaults to 0. Re-run with `image_useCache 1` it completes, and the SDL build
+and this one produce byte-identical frames under it. (That configuration moves
+181 of the 297 frames against the default one — the cvar genuinely changes what
+is drawn, which is worth knowing before anyone captures a baseline with it set.)
+
 ### Shader inventory for Phase 2
 
 Roughly 10–15 EDSL programs, each in the sampling variants §4.3 sizes — 8 worst case
@@ -511,11 +557,11 @@ Phase 2 is the first work that compiles against eacp. In rough order:
 
 1. ~~**Stand up the eacp app shell**~~ — **done**, §6. `neo/sys/eacp/` and the
    `dhewm3-eacp` target; a window that opens and does nothing else.
-2. **Boot the engine into it** ← next. Threading first (`Sys_CreateThread` and
-   friends onto `std::thread` / `std::mutex`), then the `Sys_*` entry points
+2. **Boot the engine into it.** Threading is ~~first~~ **done** (§6, step 2a) —
+   on `std::thread` and measured at 297/297. Next are the `Sys_*` entry points
    `posix_main.cpp` / `DOOMController.mm` own, then `common->Init` off
    `Apps::run` with `common->Frame()` driven from `GPUView::update()`. The
-   renderer is the last thing to come up, so `GLimp_*` is stubbed until step 3
+   renderer is the last thing to come up, so `GLimp_*` is stubbed until step 4
    and the game runs headless first.
 3. **Bridge events**, push-callback to dhewm3's polled `Sys_GetEvent`, through a
    ring buffer — `PushConsoleEvent` (`neo/sys/events.cpp:909`) is the pattern

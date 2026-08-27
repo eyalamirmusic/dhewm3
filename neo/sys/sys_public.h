@@ -376,18 +376,17 @@ void			Sys_ShutdownNetworking( void );
 ==============================================================
 */
 
-struct SDL_Thread;
+// Opaque outside sys/threads.cpp, which is the only file that knows what a
+// thread handle actually is. Everything else does one thing with it: compares
+// it against NULL to ask whether the thread was ever started.
+struct sysThread_t;
 
 typedef int (*xthread_t)( void * );
 
 typedef struct {
 	const char		*name;
-	SDL_Thread		*threadHandle;
-#ifdef D3_SDL3
+	sysThread_t		*threadHandle;
 	uint64_t		threadId;
-#else
-	unsigned long	threadId;
-#endif
 } xthreadInfo;
 
 void				Sys_CreateThread( xthread_t function, void *parms, xthreadInfo &info, const char *name );

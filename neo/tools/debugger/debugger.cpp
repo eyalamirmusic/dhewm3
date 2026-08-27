@@ -44,7 +44,9 @@ static HWND						gDebuggerWindow = NULL;
 #endif
 
 static rvDebuggerServer*		gDebuggerServer			= NULL;
-static SDL_Thread*				gDebuggerServerThread   = NULL;
+// Through the engine's own threading API rather than SDL's, so this file does
+// not keep a second, parallel platform dependency alive (plan.md, Phase 2).
+static xthreadInfo				gDebuggerServerThread   = { };
 static bool						gDebuggerServerQuit     = false;
 
 #if defined( ID_ALLOW_TOOLS )
@@ -127,14 +129,14 @@ DebuggerServerThread
 Thread proc for the debugger server
 ================
 */
-static int SDLCALL DebuggerServerThread ( void *param )
+static int DebuggerServerThread ( void *param )
 {
 	assert ( gDebuggerServer );
 
 	while ( !gDebuggerServerQuit )
 	{
 		gDebuggerServer->ProcessMessages ( );
-		SDL_Delay( 1 );
+		Sys_Sleep( 1 );
 	}
 
 	return 0;
@@ -180,11 +182,7 @@ bool DebuggerServerInit ( void )
 	}
 	
 	// Start the debugger server thread
-#if SDL_VERSION_ATLEAST(2, 0, 0)
-	gDebuggerServerThread = SDL_CreateThread( DebuggerServerThread, "DebuggerServer", NULL );
-#else // SDL 1.2
-	gDebuggerServerThread = SDL_CreateThread( DebuggerServerThread, NULL );
-#endif
+	Sys_CreateThread( DebuggerServerThread, NULL, gDebuggerServerThread, "DebuggerServer" );
 
 	return true;
 }
@@ -198,14 +196,13 @@ Shuts down the debugger server
 */
 void DebuggerServerShutdown ( void )
 {
-	if ( gDebuggerServerThread != NULL )
+	if ( gDebuggerServerThread.threadHandle != NULL )
 	{
 		// Signal the debugger server to quit
 		gDebuggerServerQuit = true;
 
 		// Wait for the thread to finish
-		SDL_WaitThread( gDebuggerServerThread, NULL );
-		gDebuggerServerThread = NULL;
+		Sys_DestroyThread( gDebuggerServerThread );
 
 		// Shutdown the server now
 		gDebuggerServer->Shutdown();
