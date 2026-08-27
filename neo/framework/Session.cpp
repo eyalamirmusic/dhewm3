@@ -943,7 +943,9 @@ void idSessionLocal::StartPlayingRenderDemo( idStr demoName ) {
 	// bring up the loading screen manually, since demos won't
 	// call ExecuteMapChange()
 	guiLoading = uiManager->FindGui( "guis/map/loading.gui", true, false, true );
-	guiLoading->SetStateString( "demo", common->GetLanguageDict()->GetString( "#str_02087" ) );
+	if ( guiLoading ) {
+		guiLoading->SetStateString( "demo", common->GetLanguageDict()->GetString( "#str_02087" ) );
+	}
 	readDemo = new idDemoFile;
 	demoName.DefaultFileExtension( ".demo" );
 	if ( !readDemo->OpenForReading( demoName ) ) {
@@ -959,7 +961,9 @@ void idSessionLocal::StartPlayingRenderDemo( idStr demoName ) {
 	insideExecuteMapChange = true;
 	UpdateScreen();
 	insideExecuteMapChange = false;
-	guiLoading->SetStateString( "demo", "" );
+	if ( guiLoading ) {
+		guiLoading->SetStateString( "demo", "" );
+	}
 
 	// setup default render demo settings
 	// that's default for <= Doom3 v1.1
@@ -989,15 +993,19 @@ void idSessionLocal::TimeRenderDemo( const char *demoName, bool twice ) {
 
 	if ( twice && readDemo ) {
 		// cycle through once to precache everything
-		guiLoading->SetStateString( "demo", common->GetLanguageDict()->GetString( "#str_04852" ) );
-		guiLoading->StateChanged( com_frameTime );
+		if ( guiLoading ) {
+			guiLoading->SetStateString( "demo", common->GetLanguageDict()->GetString( "#str_04852" ) );
+			guiLoading->StateChanged( com_frameTime );
+		}
 		while ( readDemo ) {
 			insideExecuteMapChange = true;
 			UpdateScreen();
 			insideExecuteMapChange = false;
 			AdvanceRenderDemo( true );
 		}
-		guiLoading->SetStateString( "demo", "" );
+		if ( guiLoading ) {
+			guiLoading->SetStateString( "demo", "" );
+		}
 		StartPlayingRenderDemo( demo );
 	}
 
@@ -1483,7 +1491,9 @@ void idSessionLocal::LoadLoadingGui( const char *mapName ) {
 	} else {
 		guiLoading = uiManager->FindGui( "guis/map/loading.gui", true, false, true );
 	}
-	guiLoading->SetStateFloat( "map_loading", 0.0f );
+	if ( guiLoading ) {
+		guiLoading->SetStateFloat( "map_loading", 0.0f );
+	}
 }
 
 /*
