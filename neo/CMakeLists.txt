@@ -858,6 +858,19 @@ if(D3XP AND NOT HARDLINK_GAME)
 	target_compile_definitions(d3xp PRIVATE _D3XP CTF)
 endif()
 
+# The executable dlopen()s the game libraries at runtime, so CMake sees no
+# dependency between them. Without this, building just the dhewm3 target - which
+# is what IDE run configurations do - produces an executable that dies with
+# "couldn't load game dynamic library 'base.dylib'".
+if(CORE AND NOT HARDLINK_GAME)
+	if(BASE)
+		add_dependencies(dhewm3 base)
+	endif()
+	if(D3XP)
+		add_dependencies(dhewm3 d3xp)
+	endif()
+endif()
+
 # Optionally fetch the free Doom 3 demo, so a fresh build has game data to run with.
 include(DemoData)
 

@@ -70,4 +70,8 @@ add_custom_command(
 	VERBATIM
 )
 
-add_custom_target(demo-data ALL DEPENDS "${demo_basepath}/demo/demo00.pk4")
+add_custom_target(demo-data DEPENDS "${demo_basepath}/demo/demo00.pk4")
+
+# Hang it off the executable rather than relying on ALL: building just the
+# dhewm3 target should still leave you with something you can run.
+add_dependencies(dhewm3 demo-data)
