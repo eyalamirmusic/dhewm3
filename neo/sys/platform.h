@@ -126,34 +126,47 @@ If you have questions concerning this license or the applicable additional terms
 
 #endif
 
-// Setting D3_ARCH for VisualC++ from CMake doesn't work when using VS integrated CMake
-// so set it in code instead
-#ifdef _MSC_VER
+// D3_ARCH and D3_SIZEOFPTR describe the CPU we're being compiled for, and are
+// deliberately *not* set by the buildsystem: a macOS universal binary compiles
+// every source file once per architecture from a single CMake configure run, so
+// CMake can't know which one applies. (It also never worked for Visual Studio's
+// integrated CMake.) The compiler's own predefined macros always know.
 
 #ifdef D3_ARCH
   #undef D3_ARCH
 #endif // D3_ARCH
 
-#ifdef _M_X64
-  // this matches AMD64 and ARM64EC (but not regular ARM64), but they're supposed to be binary-compatible somehow, so whatever
+#if defined(_M_X64) || defined(__x86_64__)
+  // _M_X64 matches AMD64 and ARM64EC (but not regular ARM64), but they're supposed to be binary-compatible somehow, so whatever
   #define D3_ARCH "x86_64"
-#elif defined(_M_ARM64)
+#elif defined(_M_ARM64) || defined(__aarch64__)
   #define D3_ARCH "arm64"
-#elif defined(_M_ARM)
+#elif defined(_M_ARM) || defined(__arm__)
   #define D3_ARCH "arm"
-#elif defined(_M_IX86)
+#elif defined(_M_IX86) || defined(__i386__)
   #define D3_ARCH "x86"
 #else
-  // if you're not targeting one of the aforementioned architectures,
-  // check https://learn.microsoft.com/en-us/cpp/preprocessor/predefined-macros
-  // to find out how to detect yours and add it here - and please send a patch :)
+  // if you're not targeting one of the aforementioned architectures, check
+  // https://learn.microsoft.com/en-us/cpp/preprocessor/predefined-macros (MSVC)
+  // or `echo | cc -dM -E -` (GCC/clang) to find out how to detect yours and add
+  // it here - and please send a patch :)
   #error "Unknown CPU architecture!"
   // (for a quick and dirty solution, comment out the previous line, but keep in mind
   //  that savegames may not be compatible with other builds of dhewm3)
   #define D3_ARCH "UNKNOWN"
 #endif // _M_X64 etc
 
-#endif // _MSC_VER
+#ifdef D3_SIZEOFPTR
+  #undef D3_SIZEOFPTR
+#endif // D3_SIZEOFPTR
+
+#ifdef __SIZEOF_POINTER__ // GCC, clang
+  #define D3_SIZEOFPTR __SIZEOF_POINTER__
+#elif defined(_WIN64)
+  #define D3_SIZEOFPTR 8
+#else
+  #define D3_SIZEOFPTR 4
+#endif
 
 
 // Mac OSX

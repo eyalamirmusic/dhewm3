@@ -770,7 +770,7 @@ static void signalhandlerConsoleStuff(int sig)
 
 static void installSigHandler(int sig, int flags, void (*handler)(int))
 {
-	struct sigaction sigact = {0};
+	struct sigaction sigact = {};
 	sigact.sa_handler = handler;
 	sigemptyset(&sigact.sa_mask);
 	sigact.sa_flags = flags;

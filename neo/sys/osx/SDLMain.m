@@ -8,6 +8,8 @@
 #if defined(__clang__)
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wdeprecated-declarations"
+// intentional: the SDLApplication category below overrides -[NSApplication terminate:]
+#pragma clang diagnostic ignored "-Wobjc-protocol-method-implementation"
 #endif
 
 #ifdef D3_SDL3
@@ -15,7 +17,9 @@
   // as SDL.h doesn't implicitly include SDL_main.h anymore,
   // declare SDL_main() here. I think it's the only part of SDL_main.h we used,
   // we implement it in DOOMController.mm an call it here in applicationDidFinishLaunching
-  extern "C" int SDL_main( int argc, char *argv[] );
+  // (this is Objective-C, not Objective-C++, so no extern "C" - C linkage is the default here
+  //  and matches the extern "C" declaration on the C++ side)
+  extern int SDL_main( int argc, char *argv[] );
 #else // SDL2 and SDL1.2
   #include "SDL.h"
 #endif
@@ -86,9 +90,13 @@ static NSString *getApplicationName(void)
 /* Invoked from the Quit menu item */
 - (void)terminate:(id)sender
 {
-    /* Post a SDL_QUIT event */
+    /* Post a quit event */
     SDL_Event event;
+#ifdef D3_SDL3
+    event.type = SDL_EVENT_QUIT; /* SDL3 renamed SDL_QUIT */
+#else
     event.type = SDL_QUIT;
+#endif
     SDL_PushEvent(&event);
 }
 @end

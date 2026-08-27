@@ -1480,7 +1480,6 @@ Com_ExecMachineSpecs_f
 =================
 */
 #ifdef MACOS_X
-void OSX_GetVideoCard( int& outVendorId, int& outDeviceId );
 bool OSX_GetCPUIdentification( int& cpuId, bool& oldArchitecture );
 #endif
 void Com_ExecMachineSpec_f( const idCmdArgs &args ) {
@@ -1583,12 +1582,10 @@ void Com_ExecMachineSpec_f( const idCmdArgs &args ) {
 	cvarSystem->SetCVarBool( "g_muzzleFlash", true, CVAR_ARCHIVE );
 
 #if MACOS_X
-	// On low settings, G4 systems & 64MB FX5200/NV34 Systems should default shadows off
+	// On low settings, old (PowerPC G4 era) systems should default shadows off
 	bool oldArch;
-	int vendorId, deviceId, cpuId;
-	OSX_GetVideoCard( vendorId, deviceId );
+	int cpuId;
 	OSX_GetCPUIdentification( cpuId, oldArch );
-	bool isFX5200 = vendorId == 0x10DE && ( deviceId & 0x0FF0 ) == 0x0320;
 	if ( oldArch && ( com_machineSpec.GetInteger() == 0 ) ) {
 		cvarSystem->SetCVarBool( "r_shadows", false, CVAR_ARCHIVE );
 	} else {
