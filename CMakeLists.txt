@@ -13,4 +13,6 @@ project(dhewm3
 	LANGUAGES C CXX
 )
 
+list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/CMake")
+
 add_subdirectory(neo)

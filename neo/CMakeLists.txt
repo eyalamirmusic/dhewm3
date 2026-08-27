@@ -31,6 +31,7 @@ option(BASE				"Build the base game code (Doom 3)" ON)
 option(D3XP				"Build the d3xp game code (Resurrection of Evil)" ON)
 option(HARDLINK_GAME	"Compile the game code into the executable instead of separate game libraries" OFF)
 option(REPRODUCIBLE_BUILD "Replace __DATE__ and __TIME__ with hardcoded values for reproducible builds" OFF)
+option(FETCH_DEMO_DATA	"Download the free Doom 3 demo so the build is runnable without the retail game" ON)
 
 if(NOT MSVC)
 	option(ASAN			"Enable the Address Sanitizer" OFF)
@@ -856,6 +857,9 @@ if(D3XP AND NOT HARDLINK_GAME)
 	add_game_library(d3xp d3xp ${src_d3xp})
 	target_compile_definitions(d3xp PRIVATE _D3XP CTF)
 endif()
+
+# Optionally fetch the free Doom 3 demo, so a fresh build has game data to run with.
+include(DemoData)
 
 if(is_multi_config)
 	message(STATUS "Building dhewm3 for ${os} (build type is chosen at build time)")
