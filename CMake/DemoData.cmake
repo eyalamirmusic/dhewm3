@@ -72,6 +72,11 @@ add_custom_command(
 
 add_custom_target(demo-data DEPENDS "${demo_basepath}/demo/demo00.pk4")
 
-# Hang it off the executable rather than relying on ALL: building just the
-# dhewm3 target should still leave you with something you can run.
+# Hang it off the executables rather than relying on ALL: building just one of
+# them should still leave you with something you can run. Both land in the same
+# directory and read the same demo/ out of it.
 add_dependencies(dhewm3 demo-data)
+
+if(TARGET dhewm3-eacp)
+	add_dependencies(dhewm3-eacp demo-data)
+endif()

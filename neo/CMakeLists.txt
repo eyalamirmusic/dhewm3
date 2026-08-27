@@ -838,34 +838,75 @@ if(CORE)
 endif()
 
 # --------------------------------------------------------------------------- #
-# The eacp app shell
+# The eacp host
 # --------------------------------------------------------------------------- #
 
 # A second executable rather than a switch on the first, and it stays that way
 # for the whole of Phase 2: the regression gate measures the SDL/GL binary, and
 # a port is only measurable while the thing it is being measured against still
 # builds and runs. This one grows until it passes that gate, and the GL one is
-# deleted the day it does (plan.md, Phase 2 step 3).
-if(EACP)
+# deleted the day it does (plan.md, Phase 2 step 5).
+#
+# macOS only for now. The shell that stood here before built on Windows too, but
+# it was a window and nothing else; the engine underneath it needs the Sys_*
+# entry points that sys/posix/ and sys/osx/ own, and sys/win32/win_main.cpp
+# holds Windows' copies of those behind its own WinMain. Splitting that is a
+# pass of its own, and it would be a pass nobody here can run - so it is left
+# named rather than written (plan.md, Phase 2 step 2).
+if(EACP AND NOT APPLE)
+	message(STATUS "EACP: the eacp host is macOS-only for now, skipping dhewm3-eacp")
+endif()
+
+if(EACP AND APPLE)
 	set(src_sys_eacp
 		sys/eacp/App.h
 		sys/eacp/Main.cpp
 		sys/eacp/View.h
 		sys/eacp/View.cpp
+		sys/eacp/Platform.h
+		sys/eacp/Platform.mm
+		sys/eacp/GLimp.cpp
+		sys/eacp/Input.cpp
+
+		# Shared with the SDL/GL target, and free of any window system: the
+		# threading is on the standard library, the rest is POSIX and Cocoa.
+		sys/cpu.cpp
+		sys/threads.cpp
+		sys/sys_local.cpp
+		sys/posix/posix_net.cpp
+		sys/posix/posix_main.cpp
+		sys/osx/macosx_misc.mm
 	)
 
-	add_executable(dhewm3-eacp WIN32 MACOSX_BUNDLE ${src_sys_eacp})
-	source_group(TREE ${CMAKE_CURRENT_SOURCE_DIR} PREFIX neo FILES ${src_sys_eacp})
-	target_link_libraries(dhewm3-eacp PRIVATE eacp-gpu)
+	add_executable(dhewm3-eacp WIN32 MACOSX_BUNDLE ${src_core} ${src_sys_eacp})
+	source_group(TREE ${CMAKE_CURRENT_SOURCE_DIR} PREFIX neo FILES ${src_core} ${src_sys_eacp})
+
+	target_include_directories(dhewm3-eacp PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/libs/imgui")
+	target_link_libraries(dhewm3-eacp PRIVATE idlib eacp-gpu OpenAL::OpenAL "-framework Cocoa")
+
+	# SDL is still linked, and it is not the platform layer any more: what is
+	# left of it here is renderer/qgl.h reaching for SDL_opengl.h's GL types,
+	# idlib's endian macros, Dear ImGui's SDL backend and the script debugger's
+	# mutexes. All four go with the GL backend in step 5; none of them opens a
+	# window, and Common.cpp's SDL_Init is compiled out below.
+	target_link_libraries(dhewm3-eacp PRIVATE SDL3::SDL3)
+
+	if(CURL_FOUND)
+		target_link_libraries(dhewm3-eacp PRIVATE CURL::libcurl)
+	endif()
+
+	# D3_EACP marks the shared engine sources that still have a platform choice
+	# in them - SDL_Init/SDL_Quit in Common.cpp is the only one so far.
+	target_compile_definitions(dhewm3-eacp PRIVATE __DOOM_DLL__ D3_EACP=1)
 
 	# eacp is C++20; the directory this target is declared in is C++11, for the
 	# Doom 3 code around it. That this target can raise the standard on its own
 	# was measured before it was relied on: of the 359 translation units this
 	# tree builds, every one outside neo/game and neo/d3xp already compiles
-	# clean as C++20 - so when this target grows to hold ${src_core}, the
-	# standard is not what will stop it. The game code does not, but it is a
-	# separate shared library that stays at 11; what stops it there is a
-	# parameter named `requires` in three of its headers, and nothing else.
+	# clean as C++20 - which is what let ${src_core} move in here. The game code
+	# does not, but it is a separate shared library that stays at 11; what stops
+	# it there is a parameter named `requires` in three of its headers, and
+	# nothing else.
 	set_target_properties(dhewm3-eacp PROPERTIES CXX_STANDARD 20)
 
 	set(eacp_bundle_id "org.dhewm3.eacp")
@@ -874,10 +915,21 @@ if(EACP)
 		MACOSX_BUNDLE_GUI_IDENTIFIER ${eacp_bundle_id}
 		XCODE_ATTRIBUTE_PRODUCT_BUNDLE_IDENTIFIER ${eacp_bundle_id})
 
-	# eacp's own, and the reason CMake/Eacp.cmake has to fill in EACP_MACOS_PLIST
-	# by hand: the second of these is what stamps the bundle plist on.
+	# eacp's own: a GUI (non-console) subsystem and the embedded AppInfo the
+	# library reads its name and version out of.
 	eacp_set_gui_subsystem(dhewm3-eacp)
-	set_default_target_setting(dhewm3-eacp)
+
+	# What set_default_target_setting(dhewm3-eacp) would do, minus the two parts
+	# of it that are eacp's policy for eacp's own code rather than anything this
+	# target wants. It adds -Wall -Wextra -Wpedantic, which is right for a 2026
+	# library and produces 37 warnings from one Doom 3 translation unit, across
+	# some 350 of them - enough to bury anything worth reading. It also
+	# turns on LTO for Release, which the SDL/GL target does not have, and a port
+	# measured frame-for-frame against that target should not quietly differ in
+	# how it is optimized. The plist is the part we came for, and CMake/Eacp.cmake
+	# is what fills EACP_MACOS_PLIST in.
+	set_target_properties(dhewm3-eacp PROPERTIES
+		MACOSX_BUNDLE_INFO_PLIST "${EACP_MACOS_PLIST}")
 endif()
 
 # The game code is built as a shared library that the executable loads at runtime,

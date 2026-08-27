@@ -4,7 +4,8 @@ Moving dhewm3 off SDL2 + OpenGL and onto [eacp](https://github.com/eyalamirmusic
 app lifecycle and message loop first, GPU rendering (Metal / D3D12) as the real work.
 
 **Status: Phase 0 is done and merged. Phase 1 has landed its gate and its seam.
-Phase 2 is next, and is where eacp starts being used.**
+Phase 2 is under way: the app shell, the threading and the engine's own boot are
+in, and the engine now runs headless on eacp. Input and the renderer are next.**
 
 Reference implementation for almost everything on the platform side:
 `~/Code/PureDOOM/examples/EACP` — a complete engine hosted on eacp, with its own
@@ -121,7 +122,7 @@ not design.
 | `App.h` | `Window` + `GPUView` content view, `view.focus()`. ~15 lines. |
 | `View.h` / `View.cpp` | The loop shape: `update(FrameTime)` steps the engine when *its own clock* says a tic is due; `render(Frame&)` draws. Mouse lock engaged on click, `rawDelta` accumulated into aim, flushed once per tic. |
 | `Input.h` | The positional `KeyCode` → engine-key table, wholesale. Read its header comment on why positional must win even where a character is available. |
-| `CMakeLists.txt` | Consuming eacp via CPM, including the `EACP_MACOS_PLIST` workaround (gap #3), `eacp_set_gui_subsystem`, `set_default_target_setting`. |
+| `CMakeLists.txt` | Consuming eacp via CPM, including the `EACP_MACOS_PLIST` workaround (gap #3) and `eacp_set_gui_subsystem`. Not `set_default_target_setting` — see §6, step 2b. |
 
 Two patterns worth stealing beyond the code:
 
@@ -324,6 +325,22 @@ Numbers are never reused, so a hole is an entry that closed.
     an eacp module or drop controller support for now (see scope cuts).
 11. **Texture arrays** — PureDOOM's gap #12. Would collapse per-texture draw
     batching; matters more for Doom 3's draw counts than it did for DOOM's.
+13. **Continuous mode stops when the display sleeps** — and so, now, does the
+    engine, because `GPUView::update` is what drives `common->Frame()`. Measured
+    rather than inferred: with the panel asleep `CGGetActiveDisplayList` reports
+    **0 active displays** and `CVDisplayLinkCreateWithActiveCGDisplays` fails
+    with `-6661`, so `startContinuous` builds a link that never ticks and the
+    window still paints the three frames layout asks for — which is exactly
+    enough to look like it is working. `CVDisplayLinkCreateWithCGDisplay(
+    CGMainDisplayID())` succeeds in the same process at the same moment, so the
+    failure is the *active* display list and not CoreVideo.
+
+    Arguably right — a game whose screen is off has nothing to draw — and it is
+    not what `while (1) common->Frame()` does, which keeps stepping the
+    simulation, the sound and the network. Worth deciding rather than
+    inheriting, and worth knowing before someone spends an hour looking for the
+    bug in this port. (Someone did. `caffeinate -du` wakes the panel and every
+    measurement here was taken with it held awake.)
 
 ### Checked, and *not* gaps
 
@@ -493,6 +510,108 @@ and this one produce byte-identical frames under it. (That configuration moves
 181 of the 297 frames against the default one — the cvar genuinely changes what
 is drawn, which is worth knowing before anyone captures a baseline with it set.)
 
+#### Step 2b — the engine, booted headless — **done**
+
+`dhewm3-eacp` holds `${src_core}` now, and the engine comes up inside
+`Apps::run`. What that took:
+
+- **`sys/eacp/Platform.mm`** — `Sys_GetPath`, `Posix_GetExePath` /
+  `Posix_GetSavePath`, `Sys_Shutdown`, `Sys_GetSystemRam`. This is
+  `sys/osx/DOOMController.mm` with its `SDL_main` removed: that function is a
+  second entry point and a second `while (1) common->Frame()`, and the eacp
+  target has `Apps::run` for both. The rest of the file was never about SDL.
+- **`sys/eacp/GLimp.cpp`** — every `GLimp_*` entry point, all but three of them a
+  `FatalError` naming `com_skipRenderer`. The renderer is step 4, so the boot
+  runs with `com_skipRenderer 1` and `R_InitOpenGL` is never reached.
+- **`sys/eacp/Input.cpp`** — the event queue, with only the console half filled
+  in. `sys/events.cpp` pushed terminal lines into *SDL's* queue as
+  `SDL_USEREVENT` and read them back in `Sys_GetEvent`; this is the same ring
+  without SDL under it, and step 3 adds the keyboard and mouse as further
+  producers rather than a second mechanism.
+- **`View::update`** starts the engine on the first refresh and calls
+  `common->Frame()` on every one after it. Started from the view rather than
+  from `main()` because step 4's renderer will want a window, and `update` is
+  the first place there certainly is one.
+
+**Measured, both directions.** The eacp build's boot log is line-for-line the
+SDL build's under `com_skipRenderer 1`. Everything the diff reports is either a
+number that cannot repeat (pid, script compile time, the timer calibration) or
+a statement about the platform layer: `SDL video driver: (null)` against
+`cocoa`, one eacp line asking for an app icon, and the two GL lines the SDL
+build prints on the way out. `com_speeds 1` typed at its console reports
+frames 17ms apart, so the engine is running at 60 on a 120Hz panel, which is
+what `setMaxFps(60)` is there for. `quit` typed at the same console shuts it
+down cleanly. And the SDL/GL build is still **297 of 297 frames identical**
+through the gate, which is what the two shared-source changes below needed.
+
+**The frame is paced by the display link, and the engine has to be told.**
+`idCommonLocal::Frame` ends by sleeping until the next 60Hz tic *unless* vsync
+is on and the display is running at 60 — under vsync the swap already blocked
+for that long. Here the display link is the swap, and it calls `update` on the
+main thread, so a sleep inside it would be sleeping inside the callback the next
+refresh is waiting on. `GLimp_GetSwapInterval` answers 1 and
+`GLimp_GetDisplayRefresh` answers 60 for that reason: not a claim about hardware
+that isn't there, but the same statement the SDL build makes when vsync is on,
+made by the host that is doing the pacing. `setMaxFps(60)` makes the other half
+of it true on a panel that isn't 60Hz.
+
+**Four things it cost, and each is worth more than the boot:**
+
+- **`com_fullyInitialized` was set and never cleared, and nothing had ever
+  asked.** The engine's own `quit` shuts down and then exits the process from
+  inside the frame — and `exit()` runs static destructors, which destroy eacp's
+  app, whose view then tried to shut down an engine that had already shut down.
+  It died in the file system, as a *recursed* fatal error, which is a fatal
+  error with its own reporting already torn down. One line at the end of
+  `idCommonLocal::Shutdown` and a `common->IsInitialized()` in the view's
+  destructor. The SDL build never noticed because nothing runs after its
+  `exit()`.
+
+- **Dear ImGui's `NewFrame` crashes on a null context, and the SDL build has the
+  same bug.** `D3::ImGuiHooks::Init` is only ever called from `GLimp_Init`, so
+  `com_skipRenderer 1` — or a dedicated server — reaches
+  `ImGui_ImplOpenGL2_NewFrame` with no context at all. It *looks* guarded: there
+  is an "all windows are closed" early-out right above. That early-out
+  deliberately runs two frames before it takes effect, and two frames is enough.
+  Fixed in the shared file, because it is not the eacp build's bug.
+
+- **`+set` has to be appended to the command line, not prepended.**
+  `ParseCommandLine` starts a new console line at each argument beginning with
+  `+` and appends everything else to the line before it. A leading
+  `+set com_skipRenderer 1` therefore swallows the user's first argument into
+  its own value list if that argument does not itself start with `+`. At the end
+  nothing can follow it.
+
+- **`set_default_target_setting` is eacp's warning policy, not a target
+  setting.** PureDOOM's template calls it and this target inherited the call.
+  It adds `-Wall -Wextra -Wpedantic`, which is right for a 2026 library and
+  produces 37 warnings from one Doom 3 translation unit, across some 350 of
+  them — enough to bury anything worth reading — and turns on LTO for Release,
+  which the SDL/GL target does not have. The bundle plist is the part
+  this target came for, so it now sets that property itself.
+
+Also: `DOOMController.mm` makes the bundle's `Resources` directory current and
+`Sys_Error`s if it cannot. This bundle has no `Resources`, so that was a fatal
+error on an empty question — nothing in the engine reads the working directory
+(`Posix_Cwd` has no callers), so all it decides is where a relative path typed
+at the console lands. It is now the directory the `.app` sits in, which is
+`PATH_BASE`, which is where the game data is.
+
+**macOS only, and deliberately named rather than written.** The eacp target used
+to build on Windows too, as a window and nothing else. The engine underneath it
+needs the `Sys_*` entry points that `sys/posix/` and `sys/osx/` own, and
+Windows' copies of those live in `sys/win32/win_main.cpp` behind its own
+`WinMain` — a second entry point, the same conflict `DOOMController.mm` had.
+Splitting it is a pass of its own and one nobody on this machine can run, so
+`dhewm3-eacp` is `if(EACP AND APPLE)` and says so at configure time.
+
+**What is still SDL, and why it is still linked.** `renderer/qgl.h` includes
+`SDL_opengl.h` for its GL types, `idlib/Lib.cpp` uses SDL's endian macros, Dear
+ImGui has an SDL backend, and the script debugger uses SDL mutexes. All four go
+with the GL backend in step 5. `SDL_Init` is compiled out of `Common.cpp` for
+this target — it would open a second video driver, which on macOS means a second
+`NSApplication` delegate fighting the one `Apps::run` installed.
+
 ### Shader inventory for Phase 2
 
 Roughly 10–15 EDSL programs, each in the sampling variants §4.3 sizes — 8 worst case
@@ -557,21 +676,33 @@ Phase 2 is the first work that compiles against eacp. In rough order:
 
 1. ~~**Stand up the eacp app shell**~~ — **done**, §6. `neo/sys/eacp/` and the
    `dhewm3-eacp` target; a window that opens and does nothing else.
-2. **Boot the engine into it.** Threading is ~~first~~ **done** (§6, step 2a) —
-   on `std::thread` and measured at 297/297. Next are the `Sys_*` entry points
-   `posix_main.cpp` / `DOOMController.mm` own, then `common->Init` off
-   `Apps::run` with `common->Frame()` driven from `GPUView::update()`. The
-   renderer is the last thing to come up, so `GLimp_*` is stubbed until step 4
-   and the game runs headless first.
-3. **Bridge events**, push-callback to dhewm3's polled `Sys_GetEvent`, through a
-   ring buffer — `PushConsoleEvent` (`neo/sys/events.cpp:909`) is the pattern
-   already in the tree. `Input.h`'s positional `KeyCode` table transcribes from
-   PureDOOM; the modifier-key gap (§5, 9) needs its per-frame diff.
+2. ~~**Boot the engine into it.**~~ — **done**, §6 steps 2a and 2b. Threading on
+   `std::thread` at 297/297, then the `Sys_*` entry points and `common->Init`
+   off `Apps::run` with `common->Frame()` driven from `GPUView::update()`. The
+   engine runs headless: `GLimp_*` is stubbed and `com_skipRenderer 1` is
+   appended to the command line until step 4.
+3. **Bridge events** ← **next**. The queue is already there
+   (`sys/eacp/Input.cpp`) with the terminal as its only producer; what is left
+   is pushing eacp's keyboard and mouse callbacks into it. `Input.h`'s
+   positional `KeyCode` table transcribes from PureDOOM; the modifier-key gap
+   (§5, 9) needs its per-frame diff. Mouse lock is `Window::setMouseLocked`,
+   which `GLimp_GrabInput` currently does nothing about.
+
+   Two things the boot left for this step: `Sys_GetScancodeName` and its
+   localized pair answer `NULL`, which every call site in `KeyInput.cpp`
+   already handles but which means no key has a name yet; and
+   `Sys_GetConsoleKey` answers a fixed backtick rather than reading the layout.
 4. **`idRenderBackendEacp` beside the GL one**, taking the gate's frames as the
    target. The two are selectable while the second is unfinished; the GL one
    goes when it stops being needed.
 5. **Delete** `glimp.cpp`, `events.cpp`, `threads.cpp`, `neo/sys/linux/`, SDL,
    and fold `dhewm3-eacp` back into `dhewm3`.
+
+Off to one side of that order, and needed before the port is finished rather
+than before the next step: **the Windows host**. `dhewm3-eacp` is macOS-only
+from step 2b (§6), because `sys/win32/win_main.cpp` holds Windows' `Sys_*`
+entry points behind its own `WinMain`. Splitting that file the way
+`DOOMController.mm` was split is the whole of it.
 
 The gate is the whole reason this can be done in that order rather than as one
 jump. It is also worth re-reading `regression/README.md` before trusting it on

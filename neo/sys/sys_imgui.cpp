@@ -318,6 +318,17 @@ void Shutdown()
 void NewFrame()
 {
 	D3P_ScopedCPUSample(Imgui_NewFrame);
+
+	// Init() is called from GLimp_Init(), so there is no context at all when the
+	// renderer never started: com_skipRenderer 1, a dedicated server, or the
+	// eacp host before its renderer lands. Everything below would then be called
+	// on a NULL ImGui context - which crashed rather than did nothing, because
+	// the "all windows closed" early-out two blocks down still runs a couple of
+	// frames first.
+	if ( imguiCtx == NULL ) {
+		return;
+	}
+
 	// it can happen that NewFrame() is called without EndFrame() having been called
 	// after the last NewFrame() call, for example when D3Radiant is active and in
 	// idSessionLocal::UpdateScreen() Sys_IsWindowVisible() returns false.

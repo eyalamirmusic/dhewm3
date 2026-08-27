@@ -3015,6 +3015,13 @@ void idCommonLocal::Init( int argc, char **argv ) {
 #endif
 #endif
 
+#ifndef D3_EACP
+	// The eacp host owns the loop, the window and the input devices, so SDL must
+	// not open a second video driver underneath it - on macOS that would be a
+	// second NSApplication delegate, fighting the one Apps::run installed. What
+	// is left of SDL in that build is headers, endian macros, Dear ImGui's
+	// backend and the script debugger's mutexes; none of it needs SDL_Init.
+	// (plan.md, Phase 2)
 #if SDL_VERSION_ATLEAST(3, 0, 0)
 	if ( ! SDL_Init(SDL_INIT_VIDEO | SDL_INIT_JOYSTICK | SDL_INIT_GAMEPAD) )
 	{
@@ -3035,10 +3042,11 @@ void idCommonLocal::Init( int argc, char **argv ) {
 			Sys_Error("Error while initializing SDL: %s", SDL_GetError());
 		}
 	}
+#endif // !D3_EACP
 
 	Sys_InitThreads();
 
-#if SDL_VERSION_ATLEAST(2, 0, 0)
+#if !defined(D3_EACP) && SDL_VERSION_ATLEAST(2, 0, 0)
 	/* Force the window to minimize when focus is lost. This was the
 	 * default behavior until SDL 2.0.12 and changed with 2.0.14.
 	 * The windows staying maximized has some odd implications for
@@ -3234,7 +3242,15 @@ void idCommonLocal::Shutdown( void ) {
 
 	Sys_ShutdownThreads();
 
+	// Set in Init and, until now, never cleared: nothing ran after Shutdown to
+	// ask. The eacp host asks - its window can be closed after a `quit` has
+	// already torn the engine down, and shutting a shut-down engine down again
+	// dies in the file system.
+	com_fullyInitialized = false;
+
+#ifndef D3_EACP
 	SDL_Quit();
+#endif
 }
 
 /*
