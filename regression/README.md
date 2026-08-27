@@ -21,11 +21,32 @@ scene however fast the machine happens to run - unlike a live game, where the
 frame you screenshot depends on timing. Two captures of one build come out
 byte-identical; that is what makes the hashes worth comparing at all.
 
-The gate was checked in both directions before being trusted: two captures of
-the same build match on all 296 frames, and a build with `r_skipSpecular 1`
+The gate is checked in both directions before being trusted: two captures of
+the same build match on all 297 frames, and a capture with `r_skipSpecular 1`
 differs on every one of them. A gate that cannot fail is not a gate.
 
-A capture takes about 17 seconds and writes 296 frames at 320x240.
+A capture takes about twenty seconds and writes 297 frames at 320x240.
+
+## Both paths have to be pinned, not just fs_savepath
+
+dhewm3 keeps `dhewm.cfg` on `fs_configpath`, which is separate from
+`fs_savepath`. An earlier version of `gate.sh` redirected only the save path,
+which left the real config both readable and writable by every run. The
+`r_skipSpecular 1` capture above archived that cvar into it, and every capture
+afterwards silently read it back - so the gate went on producing stable,
+reproducible, byte-identical hashes of a scene that was being rendered wrong,
+and reported a difference against a commit that had not changed a thing.
+
+Two lessons worth keeping, because neither is specific to this script:
+
+- **Reproducible is not the same as correct.** Determinism was verified and was
+  real; it just said nothing about whether the configuration was the intended
+  one. The check that would have caught it is asserting the *value*, not the
+  stability, of what the run is configured with.
+- **A comparison harness that writes anywhere the program also reads is a
+  feedback loop.** `gate.sh` now points `fs_savepath` and `fs_configpath` at
+  `regression/work` and gives every run a fresh game directory, so a run cannot
+  inherit anything from the run before it.
 
 ## What the tour covers
 

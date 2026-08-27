@@ -315,6 +315,7 @@ set(src_renderer
 	renderer/Model_sprite.cpp
 	renderer/RenderEntity.cpp
 	renderer/RenderSystem.cpp
+	renderer/RenderBackend_GL.cpp
 	renderer/RenderSystem_init.cpp
 	renderer/RenderWorld.cpp
 	renderer/RenderWorld_demo.cpp
