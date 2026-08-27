@@ -837,6 +837,49 @@ if(CORE)
 	endif()
 endif()
 
+# --------------------------------------------------------------------------- #
+# The eacp app shell
+# --------------------------------------------------------------------------- #
+
+# A second executable rather than a switch on the first, and it stays that way
+# for the whole of Phase 2: the regression gate measures the SDL/GL binary, and
+# a port is only measurable while the thing it is being measured against still
+# builds and runs. This one grows until it passes that gate, and the GL one is
+# deleted the day it does (plan.md, Phase 2 step 3).
+if(EACP)
+	set(src_sys_eacp
+		sys/eacp/App.h
+		sys/eacp/Main.cpp
+		sys/eacp/View.h
+		sys/eacp/View.cpp
+	)
+
+	add_executable(dhewm3-eacp WIN32 MACOSX_BUNDLE ${src_sys_eacp})
+	source_group(TREE ${CMAKE_CURRENT_SOURCE_DIR} PREFIX neo FILES ${src_sys_eacp})
+	target_link_libraries(dhewm3-eacp PRIVATE eacp-gpu)
+
+	# eacp is C++20; the directory this target is declared in is C++11, for the
+	# Doom 3 code around it. That this target can raise the standard on its own
+	# was measured before it was relied on: of the 359 translation units this
+	# tree builds, every one outside neo/game and neo/d3xp already compiles
+	# clean as C++20 - so when this target grows to hold ${src_core}, the
+	# standard is not what will stop it. The game code does not, but it is a
+	# separate shared library that stays at 11; what stops it there is a
+	# parameter named `requires` in three of its headers, and nothing else.
+	set_target_properties(dhewm3-eacp PROPERTIES CXX_STANDARD 20)
+
+	set(eacp_bundle_id "org.dhewm3.eacp")
+	set_target_properties(dhewm3-eacp PROPERTIES
+		MACOSX_BUNDLE_BUNDLE_NAME "dhewm3-eacp"
+		MACOSX_BUNDLE_GUI_IDENTIFIER ${eacp_bundle_id}
+		XCODE_ATTRIBUTE_PRODUCT_BUNDLE_IDENTIFIER ${eacp_bundle_id})
+
+	# eacp's own, and the reason CMake/Eacp.cmake has to fill in EACP_MACOS_PLIST
+	# by hand: the second of these is what stamps the bundle plist on.
+	eacp_set_gui_subsystem(dhewm3-eacp)
+	set_default_target_setting(dhewm3-eacp)
+endif()
+
 # The game code is built as a shared library that the executable loads at runtime,
 # unless HARDLINK_GAME is set, in which case it's already part of the executable.
 function(add_game_library name sourcedir)

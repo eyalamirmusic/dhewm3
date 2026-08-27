@@ -385,7 +385,7 @@ The demo data is already unpacked at `cmake-build-debug/neo/demo/demo00.pk4`
 (`CMake/DemoData.cmake` fetches it at configure time), so the gate needs no
 retail install.
 
-### Phase 2 — cut the platform layer and the backend together ← **next**
+### Phase 2 — cut the platform layer and the backend together ← **in progress**
 
 Both at once, on one branch:
 
@@ -402,6 +402,50 @@ Dropped, because with PureDOOM's files to transcribe the platform swap is a day 
 two, so the stepping stone only shortens a phase that is already cheap, and we would
 pay for legacy GL plumbing we then throw away. The demo-replay gate from Phase 1 is
 the better answer to the same worry.
+
+#### Step 1 — the app shell — **done**
+
+`neo/sys/eacp/` — `App.h`, `View.h`, `View.cpp`, `Main.cpp` — and a
+`dhewm3-eacp` target beside `dhewm3`, built by `cmake -DEACP=ON`. It opens a
+1024x768 window titled `ENGINE_VERSION`, clears it, and does nothing else. The
+window is `setStencil(true)` and `setContinuous(true)` from the start, because
+both are properties the engine will need rather than choices: Doom 3's lighting
+is stencil shadow volumes, and a game redraws every refresh whether or not
+anything the platform layer can see has changed.
+
+**A second executable, not a switch on the first**, and it stays that way for
+the whole of Phase 2. The regression gate measures the SDL/GL binary, and a
+port is only measurable while the thing it is measured against still builds and
+runs. Both targets build from one configure.
+
+Two things it cost, and both are worth more than the window:
+
+- **The C++ standard was measured, not assumed.** eacp is C++20;
+  `neo/CMakeLists.txt:53` pins the tree to C++11 for Dear ImGui and the Doom 3
+  code. Rather than guess whether the engine survives C++20, every one of the
+  359 translation units this tree builds was recompiled at `-std=c++20`. **126
+  failed, and all 126 are in `neo/game` and `neo/d3xp`** — the game code, which
+  builds as separate shared libraries and can stay at C++11 indefinitely. The
+  engine, idlib, the renderer and `neo/sys` are already C++20-clean, so when
+  `dhewm3-eacp` grows to hold `${src_core}` the standard is not what will stop
+  it.
+
+  The game code's failure is one identifier, not a language problem: a
+  parameter named `requires` in `Game_local.h`, `Mover.h` and `Trigger.h` (and
+  their `.cpp`s), doubled because `d3xp` is a copy of `game`. Worth knowing if
+  `HARDLINK_GAME` is ever wanted alongside eacp — that option *would* pull the
+  game code into the C++20 target, and a rename is the whole fix.
+
+- **`GIT_TAG main` under a CPM source cache does not mean main.** The first
+  configure fetched eacp, reported success, and failed on an unknown
+  `eacp_set_gui_subsystem` — because CPM keys its cache on the *declaration*, so
+  a branch name is cloned once and never looked at again. What it had was eacp
+  at `0ba29cf`, from four months earlier, with none of the Phase 0 stencil work
+  this port is built on. A branch tag under a source cache is not "we track
+  main"; it is "we track whatever main was the first time this machine
+  configured it" — neither current nor reproducible. `CMake/Eacp.cmake` now
+  pins a SHA, which is at least honest and makes a bump a commit somebody can
+  see.
 
 ### Shader inventory for Phase 2
 
@@ -465,16 +509,23 @@ which makes the GL backend throwaway).
 
 Phase 2 is the first work that compiles against eacp. In rough order:
 
-1. **Stand up the eacp app shell** — `App.h` / `View.h` / `Input.h` transcribed
-   from `~/Code/PureDOOM/examples/EACP`, CPM in `neo/CMakeLists.txt`, a window
-   that opens and does nothing else.
-2. **Bridge events**, push-callback to dhewm3's polled `Sys_GetEvent`, through a
+1. ~~**Stand up the eacp app shell**~~ — **done**, §6. `neo/sys/eacp/` and the
+   `dhewm3-eacp` target; a window that opens and does nothing else.
+2. **Boot the engine into it** ← next. Threading first (`Sys_CreateThread` and
+   friends onto `std::thread` / `std::mutex`), then the `Sys_*` entry points
+   `posix_main.cpp` / `DOOMController.mm` own, then `common->Init` off
+   `Apps::run` with `common->Frame()` driven from `GPUView::update()`. The
+   renderer is the last thing to come up, so `GLimp_*` is stubbed until step 3
+   and the game runs headless first.
+3. **Bridge events**, push-callback to dhewm3's polled `Sys_GetEvent`, through a
    ring buffer — `PushConsoleEvent` (`neo/sys/events.cpp:909`) is the pattern
-   already in the tree. Drive `common->Frame()` from `GPUView::update()`.
-3. **`idRenderBackendEacp` beside the GL one**, taking the gate's frames as the
+   already in the tree. `Input.h`'s positional `KeyCode` table transcribes from
+   PureDOOM; the modifier-key gap (§5, 9) needs its per-frame diff.
+4. **`idRenderBackendEacp` beside the GL one**, taking the gate's frames as the
    target. The two are selectable while the second is unfinished; the GL one
    goes when it stops being needed.
-4. **Delete** `glimp.cpp`, `events.cpp`, `threads.cpp`, `neo/sys/linux/`, SDL.
+5. **Delete** `glimp.cpp`, `events.cpp`, `threads.cpp`, `neo/sys/linux/`, SDL,
+   and fold `dhewm3-eacp` back into `dhewm3`.
 
 The gate is the whole reason this can be done in that order rather than as one
 jump. It is also worth re-reading `regression/README.md` before trusting it on

@@ -15,4 +15,10 @@ project(dhewm3
 
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/CMake")
 
+# The platform layer this port is moving onto. Off by default until it can run
+# the game; see plan.md.
+option(EACP "Build the eacp app shell alongside the SDL/GL executable" OFF)
+
+include(Eacp)
+
 add_subdirectory(neo)

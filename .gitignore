@@ -8,6 +8,7 @@
 .settings/
 
 /dhewm*
+/cmake-build*/
 /*-releases/
 /neo/.vs*
 /neo/out*
