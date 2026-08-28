@@ -11,13 +11,10 @@ taken out - Apps::run owns it here (plan.md, Phase 2 step 2).
 ===========================================================================
 */
 
-#ifndef __SYS_EACP_PLATFORM_H__
-#define __SYS_EACP_PLATFORM_H__
+#pragma once
 
 // Resolves PATH_EXE / PATH_BASE / PATH_SAVE and makes the bundle's Resources
 // directory current. Call before anything reads a path - Posix_InitSignalHandlers
 // writes its crash log next to the executable, and the file system is built on
 // PATH_BASE.
 void Sys_InitPaths( void );
-
-#endif /* !__SYS_EACP_PLATFORM_H__ */

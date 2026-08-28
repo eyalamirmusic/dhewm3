@@ -64,10 +64,10 @@ GLExtension_t GLimp_ExtensionPointer( const char *name ) {
 	return NULL;
 }
 
-void GLimp_GrabInput( int flags ) {
-	// Mouse capture is Window::setMouseLocked here, driven from the view.
-	// Phase 2 step 3.
-}
+// GLimp_GrabInput is in sys/eacp/Input.cpp, and it belongs there: it is the
+// input layer's, and the only reason it sits in sys/glimp.cpp in the SDL build
+// is that SDL's grab calls need the window handle that file owns. Here the
+// window belongs to the view, which the input layer already tracks.
 
 bool GLimp_SetSwapInterval( int swapInterval ) {
 	return false;

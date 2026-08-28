@@ -8,16 +8,21 @@ main() because the renderer will want a window to come up in (step 4), and
 update() is the first place there certainly is one: the view is in the window,
 sized, and its Metal layer exists.
 
+It is also where the platform's input arrives. eacp delivers the keyboard and
+the mouse as callbacks on the view, and every one of them is forwarded to
+Input.h - the queue the engine polls - rather than acted on here. The two jobs
+are kept apart on purpose: this file hosts the engine, and that one is the
+platform's input, which happens to be delivered to a view.
+
 Today the engine runs headless - com_skipRenderer 1, see View.cpp - so what is
 on screen is still a cleared window. What is different is that behind it the
-file system, the sound system, the game library and the session are all up, and
-common->Frame() is running once a refresh.
+file system, the sound system, the game library and the session are all up,
+common->Frame() is running once a refresh, and it is being driven by a keyboard.
 
 ===========================================================================
 */
 
-#ifndef __SYS_EACP_VIEW_H__
-#define __SYS_EACP_VIEW_H__
+#pragma once
 
 #include <eacp/GPU/GPU.h>
 
@@ -27,20 +32,27 @@ using namespace eacp;
 
 struct View final : GPU::GPUView
 {
-	View();
-	~View() override;
+    View();
+    ~View() override;
 
-	void update(Threads::FrameTime) override;
-	void render(GPU::Frame& frame) override;
+    void update(Threads::FrameTime) override;
+    void render(GPU::Frame& frame) override;
+
+    void keyDown(const Graphics::KeyEvent& event) override;
+    void keyUp(const Graphics::KeyEvent& event) override;
+
+    void mouseDown(const Graphics::MouseEvent& event) override;
+    void mouseUp(const Graphics::MouseEvent& event) override;
+    void mouseMoved(const Graphics::MouseEvent& event) override;
+    void mouseDragged(const Graphics::MouseEvent& event) override;
+    void mouseWheel(const Graphics::MouseEvent& event) override;
 
 private:
-	// common->Init, once, on the first refresh. It reads pk4s and loads the
-	// game library, so it takes a second or two of that refresh; the display
-	// link coalesces the ticks it misses.
-	void startEngine();
+    // common->Init, once, on the first refresh. It reads pk4s and loads the
+    // game library, so it takes a second or two of that refresh; the display
+    // link coalesces the ticks it misses.
+    void startEngine();
 
-	bool engineStarted = false;
+    bool engineStarted = false;
 };
 } // namespace dhewm3
-
-#endif /* !__SYS_EACP_VIEW_H__ */

@@ -4,8 +4,9 @@ Moving dhewm3 off SDL2 + OpenGL and onto [eacp](https://github.com/eyalamirmusic
 app lifecycle and message loop first, GPU rendering (Metal / D3D12) as the real work.
 
 **Status: Phase 0 is done and merged. Phase 1 has landed its gate and its seam.
-Phase 2 is under way: the app shell, the threading and the engine's own boot are
-in, and the engine now runs headless on eacp. Input and the renderer are next.**
+Phase 2 is under way: the app shell, the threading, the engine's own boot and
+now the input are in — the engine runs headless on eacp and is driven by a
+keyboard and a mouse. The renderer is next.**
 
 Reference implementation for almost everything on the platform side:
 `~/Code/PureDOOM/examples/EACP` — a complete engine hosted on eacp, with its own
@@ -317,10 +318,22 @@ Numbers are never reused, so a hole is an entry that closed.
 ### Platform-side, smaller
 
 8. **`Window::setFullscreen(bool)`** — the public `Window` API has no fullscreen
-   toggle. `r_fullscreen` needs it.
+   toggle. `r_fullscreen` needs it, and so does Alt-Enter, which
+   `sys/events.cpp` handles and `sys/eacp/Input.cpp` therefore does not.
 9. **Modifier keys produce no key events** — PureDOOM's gap #2, still open. Doom 3
-   binds Ctrl/Shift/Alt as ordinary keys. Workaround is PureDOOM's: diff
-   `Keyboard::getModifiers(window)` once per frame into synthetic down/up events.
+   binds Ctrl/Shift/Alt as ordinary keys — `_attack`, `_strafe` and `_speed` in
+   the stock config. Worked around as PureDOOM does, by diffing
+   `Window::getModifiers()`, but **not only once a frame**: step 3 found that a
+   tap between two refreshes never differs from the state the poll last saw and
+   is dropped whole, so the diff also runs from each key and mouse event's own
+   `modifiers`. That fixes the ordering too — the modifier's down now lands
+   ahead of the key it modifies rather than a frame behind it. A modifier
+   pressed entirely alone is still only as good as the frame poll, which is the
+   irreducible part of the gap.
+
+   `ModifierKeys` also does not say which side was pressed, so K_SHIFT and
+   K_RIGHT_SHIFT (and the Ctrl and Alt pairs) cannot be told apart. The stock
+   config binds the left names, so both keys act as the left one.
 10. **Gamepad** — dhewm3 has full SDL gamepad support in `events.cpp`. Either build
     an eacp module or drop controller support for now (see scope cuts).
 11. **Texture arrays** — PureDOOM's gap #12. Would collapse per-texture draw
@@ -341,6 +354,31 @@ Numbers are never reused, so a hole is an entry that closed.
     inheriting, and worth knowing before someone spends an hour looking for the
     bug in this port. (Someone did. `caffeinate -du` wakes the panel and every
     measurement here was taken with it held awake.)
+
+14. **The pointer can only be hidden by locking it.** `Window::setMouseLocked`
+    hides the cursor, pins it and streams relative motion as one decision,
+    which is exactly `GRAB_HIDECURSOR | GRAB_GRABMOUSE | GRAB_RELATIVEMOUSE`
+    and covers Doom 3 in game. What has no answer is the menus, which want the
+    cursor hidden while the pointer stays free, because Doom 3 draws its own —
+    so the system arrow shows through them. Cosmetic, and it needs `MouseCursor`
+    to grow a `None` or the window a `setCursorHidden`, not a new mechanism.
+
+15. **Mouse buttons past the third are undifferentiated.** `MouseButton` is
+    `Left`, `Right`, `Middle`, `Other`, and every extra button reports `Other`,
+    so there is nothing to tell them apart by. Doom 3 binds eight
+    (`K_MOUSE1`..`K_MOUSE8`); this build binds three.
+
+16. **`Keyboard::keyCodeToCharacter` folds in live modifier state on Windows and
+    not on macOS.** Found by writing the key table (§6, step 3), which resolves
+    a printable key by translating its positional code through the layout. The
+    macOS implementation calls `UCKeyTranslate` with no modifiers; the Windows
+    one calls `ToUnicode` with the live `GetKeyboardState`, so holding Shift
+    turns `;` into `:` — and a key that resolves one way on its down and
+    another on its up is never released by the engine. The two backends
+    disagree and one of them is wrong, so it is a bug rather than a constraint,
+    and it has to be fixed before the Windows host (§8) can use this table.
+    `ToUnicode` with a live keyboard state can also consume a dead key and
+    corrupt the character after it, which is the same fix.
 
 ### Checked, and *not* gaps
 
@@ -612,6 +650,119 @@ with the GL backend in step 5. `SDL_Init` is compiled out of `Common.cpp` for
 this target — it would open a second video driver, which on macOS means a second
 `NSApplication` delegate fighting the one `Apps::run` installed.
 
+#### Step 3 — the events, bridged — **done**
+
+`sys/eacp/Input.h` and a grown `Input.cpp`: the keyboard, the mouse, the wheel,
+the modifier keys, the grab and the key names, with the view forwarding eacp's
+callbacks and deciding nothing. `GLimp_GrabInput` moved out of `GLimp.cpp` and
+into `Input.cpp` — it is the input layer's, and the only reason it lives in
+`sys/glimp.cpp` in the SDL build is that SDL's grab calls need the window handle
+that file owns.
+
+**A key is identified by the character it prints, not by where it sits — which
+is the opposite of what PureDOOM concluded, and the argument does not carry
+over.** Doom 3's `keyNum_t` is mostly ASCII: a letter key *is* its lowercase
+character, which is why the stock config binds `w` and `a`. `sys/events.cpp`
+resolves one by asking SDL what the key prints under the current layout, and
+this does the same through `Keyboard::keyCodeToCharacter`, falling back to
+`K_SC_*` for a key that prints nothing nameable — with the digit row, the
+console key and every named key (`ENTER`, `PGDN`, `KP_HOME`) taken positionally
+first, exactly where SDL takes them positionally.
+
+PureDOOM's rule was "never resolve a key by the character the *event* carries",
+and its reason was key up, not layout: the Windows backend fills
+`KeyEvent::characters` on key down alone, so a down and its up resolve
+differently and the engine never clears the key. Nothing here reads the event.
+The positional `KeyCode` is translated through the layout, which is a pure
+function of the code — the same answer on the down and on the up. What that
+buys is a build that behaves like the one it is measured against on every
+layout rather than only on US, and a `K_SC_*` half of `keyNum_t` that still
+means what it means everywhere else. It also turned up gap 16: the Windows
+`keyCodeToCharacter` is *not* that pure function, and has to be fixed before
+the Windows host can rely on this.
+
+**`Sys_InitInput` is called from inside `R_InitOpenGL`**
+(`renderer/RenderSystem_init.cpp:831`, "input and sound systems need to be tied
+to the new window"), so with `com_skipRenderer 1` nothing calls it and the
+console-key layout detection would have answered 0 for the whole run. Made lazy
+rather than given a second init path in the view, because the dependency is
+worth removing rather than working around: what the key between Esc, Tab and 1
+prints is a property of the keyboard layout and has nothing to do with whether
+a window has a GL context.
+
+**Measured with the engine's own instrument, not with print statements.**
+`com_journal 1` (`framework/EventLoop.cpp:86`) records every `sysEvent_t` the
+engine consumes into `journal.dat`, which is a complete, unbiased record of
+what this layer produced — so the whole step was verified without adding a line
+of debug code. Driven by synthetic keyboard and `CGEvent` mouse input against
+the real window, with the demo's `demo_mars_city1` spawned so that bindings fire
+(`idSessionLocal::ProcessEvent` only reaches `ExecKeyBinding` once a map is up;
+before that every event is forced into the console, which is its own useful
+half of the test).
+
+What the journal showed, all of it correct: letters and punctuation as `SE_KEY`
+plus `SE_CHAR`; the digit row and the keypad apart from each other (`7` against
+`K_KP_HOME`); `K_ENTER`, `K_SPACE`, `K_UPARROW`, `K_F6`, `K_BACKSPACE` with its
+`SE_CHAR`; the console key as `K_CONSOLE`; `K_SHIFT`/`K_CTRL`/`K_ALT` bracketing
+the key they modify; `H` for shift+h and *no* `SE_CHAR` at all for ctrl+h or
+alt+h; `K_MOUSE1`/`K_MOUSE2`; `K_MWHEELUP` ×3 for a three-line scroll;
+`SE_MOUSE_ABS` at `512,368` — the centre of the 1024×768 view, top-left origin,
+which is what confirms eacp's backing views are flipped; and `SE_MOUSE` at
+exactly `dx=15 dy=10` per step of a four-step 60×40 drag.
+
+**Three things it cost, and one thing that was found by looking:**
+
+- **A once-a-frame modifier poll drops a tap whole.** PureDOOM diffs
+  `getModifiers()` in `update`, and that is enough for a modifier that is
+  *held* — which is what DOOM binds. Doom 3 binds `_attack` to Ctrl, and a
+  Ctrl pressed and released between two refreshes never differs from the state
+  the poll last saw, so the engine sees nothing at all. The diff therefore also
+  runs from each key and mouse event's own `modifiers`, which fixes the
+  ordering as a side effect: the modifier's down now lands ahead of the key it
+  modifies instead of a frame behind it. Visible in the journal as
+  `K_CTRL down, 'h' down, 'h' up, K_CTRL up`.
+
+- **Nothing releases a key held across a Cmd-Tab.** macOS delivers key-up to
+  the key window alone, so the platform simply never reports it and the player
+  walks into a wall until that key is pressed and released again. The window's
+  `onActivationChanged` now releases everything this layer believes is held.
+  Verified by holding a key with a `CGEvent` down and no up, switching apps,
+  and finding the up in the journal.
+
+- **The wheel had no key-up, and that is a bug this build did not inherit.**
+  `sys/events.cpp` sends `K_MWHEELUP` as a down and never as an up — a wheel
+  has no released position to report. But `idKeyInput` has no notion of a key
+  that is only ever pressed, so the wheel stays down for the rest of the
+  process. It is agreement rather than divergence, too: the *other* consumer of
+  the same event already does it, `idUsercmdGenLocal::Mouse` turning one
+  `M_DELTAZ` into `Key(key, true); Key(key, false)`
+  (`framework/UsercmdGen.cpp:1265`). Only the queue half was missing its up.
+
+- **`rawDelta`, not `delta`, and the mouse therefore feels different from the
+  SDL build.** SDL hands the engine whatever relative motion the system gives
+  it, which on macOS has the pointer acceleration curve already applied. That
+  curve exists so a cursor can cross a screen and still land on a target;
+  applied to a camera it makes an identical flick of the hand turn a different
+  amount depending how fast it was made. Doom 3 has `sensitivity` for the
+  scaling, so the curve is not wanted twice.
+
+**What was not measured, and why:** that the grab actually engages. Everything
+above is a claim about events the journal contains, and the mouse *lock* is not
+an event — it is `CGAssociateMouseAndMouseCursorPosition(false)`, a warp and
+`[NSCursor hide]`. A synthetic `CGEvent` carrying an absolute position moves the
+pointer straight through the association, so the pointer's coordinates cannot
+tell a locked window from one that is merely receiving the motion, and the
+obvious second probe, `CGCursorIsVisible`, has been unavailable since 10.9. The
+wiring is one call deep and the transcribed `handleMouseGrab` decides it, so
+this is a hole to close by hand — start a map, confirm the cursor disappears and
+the pointer stops leaving the window — rather than an open question about the
+code. It is worth closing before step 4, because a grab that never engages is
+the difference between playable and not.
+
+The gate is untouched by this step: nothing outside `sys/eacp/` and the eacp
+block of `neo/CMakeLists.txt` was edited, so the SDL/GL binary is byte-identical
+and its 297/297 still stands without re-running it.
+
 ### Shader inventory for Phase 2
 
 Roughly 10–15 EDSL programs, each in the sampling variants §4.3 sizes — 8 worst case
@@ -681,20 +832,16 @@ Phase 2 is the first work that compiles against eacp. In rough order:
    off `Apps::run` with `common->Frame()` driven from `GPUView::update()`. The
    engine runs headless: `GLimp_*` is stubbed and `com_skipRenderer 1` is
    appended to the command line until step 4.
-3. **Bridge events** ← **next**. The queue is already there
-   (`sys/eacp/Input.cpp`) with the terminal as its only producer; what is left
-   is pushing eacp's keyboard and mouse callbacks into it. `Input.h`'s
-   positional `KeyCode` table transcribes from PureDOOM; the modifier-key gap
-   (§5, 9) needs its per-frame diff. Mouse lock is `Window::setMouseLocked`,
-   which `GLimp_GrabInput` currently does nothing about.
-
-   Two things the boot left for this step: `Sys_GetScancodeName` and its
-   localized pair answer `NULL`, which every call site in `KeyInput.cpp`
-   already handles but which means no key has a name yet; and
-   `Sys_GetConsoleKey` answers a fixed backtick rather than reading the layout.
-4. **`idRenderBackendEacp` beside the GL one**, taking the gate's frames as the
-   target. The two are selectable while the second is unfinished; the GL one
-   goes when it stops being needed.
+3. ~~**Bridge events.**~~ — **done**, §6 step 3. eacp's keyboard, mouse and
+   wheel callbacks push into the queue the terminal was already using; the key
+   table resolves a printable key through the layout the way `sys/events.cpp`
+   does, with `K_SC_*` behind it; the modifier gap (§5, 9) is diffed from both
+   the frame and each event; the grab is `Window::setMouseLocked`. Verified
+   against `com_journal 1`, the engine's own event recorder, rather than
+   against added instrumentation.
+4. **`idRenderBackendEacp` beside the GL one** ← **next**, taking the gate's
+   frames as the target. The two are selectable while the second is unfinished;
+   the GL one goes when it stops being needed.
 5. **Delete** `glimp.cpp`, `events.cpp`, `threads.cpp`, `neo/sys/linux/`, SDL,
    and fold `dhewm3-eacp` back into `dhewm3`.
 

@@ -866,6 +866,7 @@ if(EACP AND APPLE)
 		sys/eacp/Platform.h
 		sys/eacp/Platform.mm
 		sys/eacp/GLimp.cpp
+		sys/eacp/Input.h
 		sys/eacp/Input.cpp
 
 		# Shared with the SDL/GL target, and free of any window system: the

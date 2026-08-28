@@ -6,9 +6,9 @@ dhewm 3 on eacp - the application object Apps::run<T>() owns.
 ===========================================================================
 */
 
-#ifndef __SYS_EACP_APP_H__
-#define __SYS_EACP_APP_H__
+#pragma once
 
+#include "Input.h"
 #include "View.h"
 
 #include "../../framework/Licensee.h"
@@ -26,26 +26,36 @@ constexpr auto defaultWindowHeight = 768;
 
 inline Graphics::WindowOptions windowOptions()
 {
-	auto options = Graphics::WindowOptions {};
+    auto options = Graphics::WindowOptions {};
 
-	options.width = defaultWindowWidth;
-	options.height = defaultWindowHeight;
-	options.title = ENGINE_VERSION;
+    options.width = defaultWindowWidth;
+    options.height = defaultWindowHeight;
+    options.title = ENGINE_VERSION;
 
-	return options;
+    return options;
 }
 
 struct App
 {
-	App()
-	{
-		window.setContentView(view);
-		view.focus();
-	}
+    App()
+    {
+        window.setContentView(view);
+        view.focus();
 
-	Graphics::Window window {windowOptions()};
-	View view;
+        // Key focus, which the input layer needs for two things: the grab is
+        // released while another app is in front, and everything held is
+        // released with it. macOS delivers key-up to the key window alone, so a
+        // Cmd-Tab with W down would otherwise leave the player walking into a
+        // wall until that key is pressed and released again.
+        //
+        // On the window rather than on the view because that is where the
+        // platform reports it: a view has focus within a window, and this is
+        // the window having it within the session.
+        window.events.onActivationChanged = [](bool isKey)
+        { Input::setFocus(isKey); };
+    }
+
+    Graphics::Window window {windowOptions()};
+    View view;
 };
 } // namespace dhewm3
-
-#endif /* !__SYS_EACP_APP_H__ */
