@@ -285,9 +285,13 @@ tell the pass's size apart from the bounds it was given.
 ## 5. eacp gaps still open
 
 Re-verified against `main` at `be7a749` rather than carried forward on trust.
-**None of these blocks Phase 1, which touches no eacp API at all**, and none blocks
+**None of these blocks Phase 1, which touches no eacp API at all**, and none blocked
 *starting* Phase 2 — each degrades the picture or has a workaround, and the list is
 better driven by real content than guessed at now.
+
+That last sentence has now been tested, and 17 is what it turned up: the first
+gap this port found by walking real content rather than by reading eacp, and the
+first one that stops the next step rather than degrading it.
 
 Numbers are never reused, so a hole is an entry that closed.
 
@@ -315,7 +319,60 @@ Numbers are never reused, so a hole is an entry that closed.
     `BlendMode::Additive` is `(SRC_ALPHA, ONE)`, so a fragment written at zero alpha
     contributes nothing and the destination survives untouched. **That covers "write
     no colour at all" and nothing else** — masking *some* channels, which `maskRed`
-    asks for, has no workaround. This is the only open gap that does not.
+    asks for, has no workaround. It is one of the two open gaps that do not; 17 is
+    the other, and the two are siblings, both being the blend equation's.
+
+### Blocking for step 4c, and the one to decide first
+
+17. **`BlendMode` is four named modes, and Doom 3 needs the factors.**
+    `RenderPipelineDescriptor::blendMode` offers `None`, `AlphaBlend`,
+    `AlphaBlendOntoTransparent` and `Additive`. Doom 3's `GLS_SRCBLEND_*` /
+    `GLS_DSTBLEND_*` are nine source factors by eight destination ones, set per
+    material stage from the `blend` keyword, and it uses a real spread of them.
+
+    Counted rather than guessed, over the 67 `.mtr` files the demo ships:
+
+    | `blend` … | GL factors | eacp | stages |
+    | --- | --- | --- | --- |
+    | `add`, `gl_one,gl_one` | `(ONE, ONE)` | workaround | 746 |
+    | `blend` | `(SRC_ALPHA, ONE_MINUS_SRC_ALPHA)` | `AlphaBlend` | 446 |
+    | `gl_zero,gl_one` | `(ZERO, ONE)` | not needed | 110 |
+    | `gl_dst_alpha,*` | `(DST_ALPHA, …)` | **none** | 108 |
+    | `filter`, `gl_dst_color,gl_zero` | `(DST_COLOR, ZERO)` | **none** | 124 |
+    | `gl_one,gl_zero` | `(ONE, ZERO)` | `None` | 39 |
+    | `gl_zero,gl_one_minus_src_*` | | **none** | 24 |
+
+    (`diffusemap` / `bumpmap` / `specularmap` are the other 918 and are the
+    interaction path's, not this one.)
+
+    Two of those rows resolve without eacp changing:
+
+    - `(ONE, ONE)` is `Additive` — which is `(SRC_ALPHA, ONE)` — with the
+      fragment's alpha forced to 1. That is a line in the shader, and the
+      generic-stage program has to compile a variant for it anyway.
+    - `(ZERO, ONE)` keeps the destination exactly, and
+      `RB_STD_T_RenderShaderPasses` already `continue`s past a stage set to it
+      (`neo/renderer/draw_common.cpp:836`) — it is an alpha-mask trick for the
+      depth pass, not a colour blend.
+
+    **The remaining ~256 stages have no expression at all**, and they are not
+    exotic: `filter` is how Doom 3 darkens a surface with a lightmap-like decal,
+    and the `DST_ALPHA` family is how the fog and blend-light passes work. There
+    is no shader-side dodge for either, because the missing operand is the
+    *destination*, which a fragment shader cannot read.
+
+    Same shape as 12: both are the blend equation being partly exposed, and both
+    want the same fix — `RenderPipelineDescriptor` carrying source and
+    destination factors (and a colour write mask) rather than a menu of four
+    presets, with the named modes kept as the presets they are. Both backends
+    already take them: `MTLRenderPipelineColorAttachmentDescriptor` and
+    `D3D12_RENDER_TARGET_BLEND_DESC` are the same eight-factor enum under two
+    names.
+
+    **This is the one to settle before 4c rather than during it.** It is Phase
+    0's pattern — the stencil work was done in eacp first, for exactly this
+    reason — and the alternative is a backend that draws most of the menu and
+    then needs unpicking when the factors arrive.
 
 ### Platform-side, smaller
 
@@ -972,7 +1029,8 @@ Phase 2 is the first work that compiles against eacp. In rough order:
      §6. `com_skipRenderer` is gone, 176 images are Metal textures, the frame
      runs at 60, and the boot log matches the SDL build's from
      `Initializing Game` down.
-   - **4c. 2D.** ← **next.** Everything Doom 3 puts on screen without a world —
+   - **4c. 2D.** ← **next, once §5 gap 17 is settled.** Everything Doom 3 puts
+     on screen without a world —
      the menus, the console, the HUD, the loading screens — goes through one
      path, `RB_STD_DrawShaderPasses` over a `viewDef` with no `viewEntitys`.
      So the *generic material stage* program is the first shader to write, and
