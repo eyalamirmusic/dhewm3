@@ -4,9 +4,11 @@ Moving dhewm3 off SDL2 + OpenGL and onto [eacp](https://github.com/eyalamirmusic
 app lifecycle and message loop first, GPU rendering (Metal / D3D12) as the real work.
 
 **Status: Phase 0 is done and merged. Phase 1 has landed its gate and its seam.
-Phase 2 is under way: the app shell, the threading, the engine's own boot and
-now the input are in — the engine runs headless on eacp and is driven by a
-keyboard and a mouse. The renderer is next.**
+Phase 2 is under way: the app shell, the threading, the boot, the input and now
+the renderer's own scaffolding are in. `dhewm3-eacp` runs the engine with its
+renderer switched **on** — the frontend culls, lights and issues its command
+list, 176 images are on the GPU as Metal textures, and the backend consumes the
+list and draws nothing. Drawing is what is left.**
 
 Reference implementation for almost everything on the platform side:
 `~/Code/PureDOOM/examples/EACP` — a complete engine hosted on eacp, with its own
@@ -763,6 +765,127 @@ The gate is untouched by this step: nothing outside `sys/eacp/` and the eacp
 block of `neo/CMakeLists.txt` was edited, so the SDL/GL binary is byte-identical
 and its 297/297 still stands without re-running it.
 
+#### Step 4a — the seam grows to cover coming up, drawing a view, and images — **done**
+
+Phase 1's seam covered the per-draw state and the draws. It did not cover the
+renderer *starting*, a view being drawn, the renderer going away, or a single
+byte of texture — all four are plain OpenGL in shared files, so the eacp build
+could not have reached any of them without a context. Two commits, both pure
+moves on the SDL/GL build, both **297 of 297**.
+
+**The frame.** `Init()` is the API half of `R_InitOpenGL` — the qgl entry
+points, the driver strings, `R_CheckPortableExtensions`, the ARB programs —
+ending with `glConfig.isInitialized`, because that is the backend saying it is
+ready and nothing above it can tell. `Shutdown()` runs before `GLimp_Shutdown`
+takes the window away, and is empty on GL: the context owns everything the
+backend made, which is the one thing a GL backend gets for free and the one
+thing the eacp one does not. `ReleaseTextures()` is the `qglBindTexture(0)` the
+command loop ends on, the mirror of `SetDefaultState`.
+
+**`DrawView()` is deliberately the whole of a backend's drawing.** It is
+`RB_STD_DrawView` and it is not broken down further, because what Doom 3 does
+inside a view — fill depth, add each light's interactions through the stencil,
+blend the shader passes, fog — is a sequence of *ideas*, and every one of them
+is expressed in fixed-function terms a modern API has no counterpart for. A
+second backend reimplements the sequence rather than reimplementing calls
+underneath it. That is the difference between this port and a GL emulator.
+
+**The formats stay as GL's names.** The image entry points take `GL_RGBA8`,
+`GL_ALPHA8`, `GL_COMPRESSED_RGBA_S3TC_DXT5_EXT`, and that is a decision rather
+than an unfinished edge: half of that enum is the **.dds file format's** as much
+as the API's, and Doom 3's whole format decision is written in it from
+`SelectInternalFormat` down through `BitsForInternalFormat`, the reader and the
+precompressed writer. A second backend mapping them onto what it has is much the
+smaller job than moving the decision.
+
+**Five image paths were not moved**, because an entry point nothing can call is
+worth less than a note saying why. Each is already switched off by something
+this port controls: `Generate3DImage` has no callers at all; `GenerateCubeImage`
+is behind `cubeMapAvailable`; `UploadCompressedNormalMap` and `SetNormalPalette`
+are behind `sharedTexturePaletteAvailable`; `WritePrecompressedImage` is behind
+`image_useOfflineCompression`, which is 0 and is a content tool rather than a
+rendering path.
+
+One GL detail is now stated where it was duplicated: a cube map's filter state
+is its own entry point, because Doom 3 forces clamp on it and applies neither
+anisotropy nor LOD bias, and folding it into the 2D one would have been a change
+of behaviour hiding inside a move.
+
+#### Step 4b — the renderer comes up on eacp, and draws nothing — **done**
+
+`com_skipRenderer` is gone from the command line. The frontend culls, builds
+interactions, extrudes shadow volumes and issues its command list; the images
+are on the GPU as Metal textures; `DrawView` is empty. Landing that separately
+is the point: everything *around* the drawing is measurable before any of the
+drawing exists.
+
+**The two backends are chosen by the linker, not at runtime.** Each is the
+answer for exactly one host — the SDL/GL executable has a context and no eacp
+device, the eacp one has the reverse — so there is nothing to select between.
+`RenderBackend_GL.cpp` left `src_core` and each target names its own.
+
+**`Init()` states what this backend implements, where OpenGL asks a driver**,
+and every `false` in it is an open gap from §5. One pays for itself immediately:
+`textureCompressionAvailable = false` is what `CheckPrecompressedImage` tests
+*before* it opens a `.dds` at all, and the pk4s carry every texture twice —
+**3395 `.dds` beside 3771 `.tga`** in the demo — so refusing compression loads
+the uncompressed original rather than needing a decompressor on day one. Gap 4
+is therefore about load time and memory, not about a missing picture.
+`ARBVertexBufferObjectAvailable = false` is the same shape: `idVertexCache` then
+keeps its blocks in system memory and hands out plain pointers, which is what
+the draws want until it moves onto `GPU::StreamingBuffers` wholesale.
+
+**`common->Frame()` moved out of `View::update` and into `View::render`.** The
+engine's frame *is* a frame: `idCommonLocal::Frame` issues its render commands
+inside the call and the backend consumes them there, so the eacp `Frame` has to
+be open around the whole of it — and eacp hands a `Frame` to `render()` and to
+nothing else. One eacp pass per Doom 3 view, which is not an arbitrary mapping:
+a pass clears depth and stencil unconditionally and can be told whether to clear
+colour, which is exactly what `RB_BeginDrawingView` asks for.
+
+**Measured, and the boot log is the instrument.** From `----- Initializing Game
+-----` to the last line, the eacp build's log is **identical to the SDL build's**
+on the same data, warning for warning and count for count. Everything before it
+is either the platform (SDL's display-mode enumeration and window report against
+one eacp line naming the view's size in both pixels and points) or the API (the
+extension list and the ARB program loads against `GPU: Apple M5 Max`).
+`com_speeds 1` reports 2294 frames at 16–17ms, which is 60 on a 120Hz panel.
+`listImages` reports **176 images, 27.9MB**, every one through the new upload
+path with no warning raised — so nothing reached the compressed or the
+unsupported-source-format branch. The whole run is clean under
+`MTL_DEBUG_LAYER=1` and `MTL_SHADER_VALIDATION=1`.
+
+**Three things it cost:**
+
+- **`idVertexCache::Alloc` reads an uninitialised `vbo`, and it is dhewm3's bug
+  rather than this port's.** `idBlockAlloc` hands back raw memory. The
+  buffer-object path writes `vbo` immediately so nothing ever shows; with
+  `r_useVertexBuffers 0` — or on a backend with no buffer objects to generate —
+  the field keeps whatever was in that heap block and `Alloc` takes the GL
+  branch on garbage. The header's own comment says "only one of vbo / virtMem
+  will be set", which is what every reader assumes and what nothing enforced.
+  Fixed where it happens, in the shared file.
+
+- **`idRenderSystemLocal::InitOpenGL` called `qglGetError` directly**, and it
+  was the last GL call left on the shared boot path. It is `CheckErrors`, which
+  was already on the seam.
+
+- **eacp's headers have to come before Doom 3's in any file that mixes them.**
+  `idlib/Str.h` does `#define strcmp idStr::Cmp`, and the same for eight other
+  `<cstring>` functions, so a standard header pulled in afterwards fails to
+  compile on its own `using ::strcmp`. Worth knowing before the next such file.
+
+**Doom 3's own mip chain is dropped in favour of eacp's**, and that is a real
+difference rather than a detail. Doom 3 generates its chain and uploads it a
+level at a time; eacp builds one on the CPU — deliberately, so Metal's
+`generateMipmaps` and a hand-written D3D12 chain cannot produce two different
+pictures — and has **no per-level upload entry point at all**. What goes with
+Doom 3's chain is `R_MipMap`'s `preserveBorder`, which is what keeps a
+`TR_CLAMP_TO_ZERO` image's zero edge intact all the way down, and
+`image_colorMipLevels`. The first of those is a real artifact waiting to be
+seen — a light projection texture bleeding at distance — and is the thing to
+suspect if one turns up.
+
 ### Shader inventory for Phase 2
 
 Roughly 10–15 EDSL programs, each in the sampling variants §4.3 sizes — 8 worst case
@@ -839,9 +962,32 @@ Phase 2 is the first work that compiles against eacp. In rough order:
    the frame and each event; the grab is `Window::setMouseLocked`. Verified
    against `com_journal 1`, the engine's own event recorder, rather than
    against added instrumentation.
-4. **`idRenderBackendEacp` beside the GL one** ← **next**, taking the gate's
-   frames as the target. The two are selectable while the second is unfinished;
-   the GL one goes when it stops being needed.
+4. **`idRenderBackendEacp` beside the GL one**, taking the gate's frames as the
+   target. The two are the linker's choice rather than a runtime one — each is
+   the answer for exactly one host — and the GL one goes when it stops being
+   needed.
+   - ~~**4a. Grow the seam over init, the view and the images.**~~ — **done**,
+     §6. Two pure moves on the SDL/GL build, both 297/297.
+   - ~~**4b. The renderer comes up on eacp and draws nothing.**~~ — **done**,
+     §6. `com_skipRenderer` is gone, 176 images are Metal textures, the frame
+     runs at 60, and the boot log matches the SDL build's from
+     `Initializing Game` down.
+   - **4c. 2D.** ← **next.** Everything Doom 3 puts on screen without a world —
+     the menus, the console, the HUD, the loading screens — goes through one
+     path, `RB_STD_DrawShaderPasses` over a `viewDef` with no `viewEntitys`.
+     So the *generic material stage* program is the first shader to write, and
+     it buys the largest visible step in the port: a menu that can be clicked.
+     It also exercises the whole draw plumbing at once — the state bitfield
+     translated into a pipeline, the variant cache §4.3 sizes, geometry
+     streamed through `GPU::StreamingBuffers`, textures bound per stage.
+   - **4d. The world.** Depth fill, the interaction program, the stencil shadow
+     pass. `Apps/GPU/StencilShadows` is the worked example for the last of
+     those and exists for exactly this moment.
+   - **4e. What is left.** Fog and blend lights, the texgen variants
+     (reflect, skybox, wobblesky), subviews and mirrors, and `_currentRender` —
+     which needs the composited frame to live in an app-owned render target
+     that the drawable is blitted from, because a texture cannot be sampled by
+     the pass rendering into it. PureDOOM's `captureTarget`, §3.
 5. **Delete** `glimp.cpp`, `events.cpp`, `threads.cpp`, `neo/sys/linux/`, SDL,
    and fold `dhewm3-eacp` back into `dhewm3`.
 
