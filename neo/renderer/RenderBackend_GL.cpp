@@ -63,6 +63,7 @@ static idCVar r_fillWindowAlphaChan( "r_fillWindowAlphaChan", "-1", CVAR_SYSTEM 
 class idRenderBackendGL : public idRenderBackend {
 public:
 	virtual const char *Name( void ) const { return "OpenGL"; }
+	virtual backEndName_t Path( void ) const { return glConfig.allowARB2Path ? BE_ARB2 : BE_BAD; }
 	virtual void	Init( void );
 	virtual void	Shutdown( void );
 	virtual void	DrawView( void );

@@ -244,6 +244,16 @@ void idVertexCache::Alloc( void *data, int size, vertCache_t **buffer, bool inde
 			block->next->prev = block;
 			block->prev->next = block;
 
+			// idBlockAlloc hands back raw memory, and "only one of vbo /
+			// virtMem will be set" is what every reader of these two fields
+			// assumes - so both have to start as neither. In the buffer-object
+			// path qglGenBuffersARB writes vbo immediately and the bug never
+			// shows; with r_useVertexBuffers 0, or on a backend that has no
+			// buffer objects to generate, vbo keeps whatever was in that heap
+			// block and Alloc below takes the GL branch on garbage.
+			block->vbo = 0;
+			block->virtMem = NULL;
+
 			if( !virtualMemory ) {
 				qglGenBuffersARB( 1, & block->vbo );
 			}

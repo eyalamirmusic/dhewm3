@@ -279,6 +279,12 @@ public:
 	idImage *			hashNext;				// for hash chains to speed lookup
 
 	int					refCount;				// overall ref count
+
+	// The backend's own object for this image, where it has one. OpenGL keeps
+	// everything it needs in texnum above; a backend whose texture is an object
+	// with a lifetime of its own keeps it here, and owns it - AllocImage clears
+	// this and FreeImage destroys it.
+	void *				backendTexture;
 };
 
 ID_INLINE idImage::idImage() {
@@ -310,6 +316,7 @@ ID_INLINE idImage::idImage() {
 	cacheUsagePrev = cacheUsageNext = NULL;
 	hashNext = NULL;
 	refCount = 0;
+	backendTexture = NULL;
 }
 
 

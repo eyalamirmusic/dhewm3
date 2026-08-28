@@ -527,21 +527,11 @@ void idRenderSystemLocal::SetBackEndRenderer() {
 
 	bool oldVPstate = backEndRendererHasVertexPrograms;
 
-	backEndRenderer = BE_BAD;
-
-	if ( idStr::Icmp( r_renderer.GetString(), "arb2" ) == 0 ) {
-		if ( glConfig.allowARB2Path ) {
-			backEndRenderer = BE_ARB2;
-		}
-	}
-
-	// fallback
-	if ( backEndRenderer == BE_BAD ) {
-		// choose the best
-		if ( glConfig.allowARB2Path ) {
-			backEndRenderer = BE_ARB2;
-		}
-	}
+	// The backend's, because it is the only thing that knows. r_renderer used
+	// to choose between one path per family of hardware; both values it still
+	// takes named the same path long before this port, so asking it decided
+	// nothing.
+	backEndRenderer = renderBackend->Path();
 
 	backEndRendererHasVertexPrograms = false;
 	backEndRendererMaxLight = 1.0;
@@ -549,6 +539,11 @@ void idRenderSystemLocal::SetBackEndRenderer() {
 	switch( backEndRenderer ) {
 	case BE_ARB2:
 		common->Printf( "using ARB2 renderSystem\n" );
+		backEndRendererHasVertexPrograms = true;
+		backEndRendererMaxLight = 999;
+		break;
+	case BE_EACP:
+		common->Printf( "using eacp renderSystem\n" );
 		backEndRendererHasVertexPrograms = true;
 		backEndRendererMaxLight = 999;
 		break;

@@ -66,6 +66,19 @@ Suite 120, Rockville, Maryland 20850 USA.
 typedef struct srfTriangles_s srfTriangles_t;
 class idImage;
 
+// Which of the frontend's paths a backend consumes. Doom 3 had one per family
+// of hardware and has one left on OpenGL, the others having been deleted long
+// before this port; the port adds a second. It is not only a backend's own
+// business, which is why it is named out here: the *frontend* branches on
+// tr.backEndRendererHasVertexPrograms in tr_light.cpp and tr_stencilshadow.cpp
+// and builds different data accordingly, so it has to be told which one is
+// running.
+typedef enum {
+	BE_ARB2,
+	BE_EACP,
+	BE_BAD
+} backEndName_t;
+
 class idRenderBackend {
 public:
 	virtual					~idRenderBackend() {}
@@ -73,6 +86,10 @@ public:
 	// What this backend is called, for the log line R_InitOpenGL prints and for
 	// anyone reading a bug report.
 	virtual const char *	Name( void ) const = 0;
+
+	// The path above, once Init has run - BE_BAD from a backend that came up
+	// unable to draw, which R_InitOpenGL treats as fatal.
+	virtual backEndName_t	Path( void ) const = 0;
 
 	// Everything R_InitOpenGL does that belongs to the graphics API rather than
 	// to the renderer, run once the window exists: entry points, the device's

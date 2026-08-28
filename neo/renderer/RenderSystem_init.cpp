@@ -2408,16 +2408,11 @@ idRenderSystemLocal::InitOpenGL
 void idRenderSystemLocal::InitOpenGL( void ) {
 	// if OpenGL isn't started, start it now
 	if ( !glConfig.isInitialized ) {
-		int	err;
-
 		R_InitOpenGL();
 
 		globalImages->ReloadAllImages();
 
-		err = qglGetError();
-		if ( err != GL_NO_ERROR ) {
-			common->Printf( "glGetError() = 0x%x\n", err );
-		}
+		renderBackend->CheckErrors();
 	}
 }
 

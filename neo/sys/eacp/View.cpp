@@ -10,6 +10,7 @@
 
 #include "sys/platform.h"
 #include "framework/Common.h"
+#include "renderer/RenderBackend_Eacp.h"
 
 namespace dhewm3
 {
@@ -45,11 +46,16 @@ View::View()
     // The grab (Input.h, GLimp_GrabInput) needs a Window to lock the mouse, and
     // this is what it finds one through.
     Input::setView(this);
+
+    // And the renderer needs it for the one thing GLimp still answers: how big
+    // the surface it is drawing into actually is.
+    R_EacpSetView(this);
 }
 
 View::~View()
 {
     Input::setView(nullptr);
+    R_EacpSetView(nullptr);
 
     // Reached twice over, and only one of them wants a shutdown.
     //
@@ -74,20 +80,6 @@ void View::startEngine()
     for (std::size_t i = 1; i < commandLine.size(); ++i)
         arguments.push_back(commandLine[i]);
 
-    // The renderer is Phase 2 step 4, and until it exists this build has no GL
-    // context for R_InitOpenGL to want: com_skipRenderer is what stops it being
-    // asked for. sys/eacp/GLimp.cpp is the other half - every entry point that
-    // would need one is a fatal error naming this line.
-    //
-    // Appended rather than prepended, and the difference is not style:
-    // ParseCommandLine starts a new console line at each argument beginning
-    // with '+' and appends everything else to the line before it, so a leading
-    // `+set com_skipRenderer 1` would swallow a user argument that does not
-    // start with '+' into its own value list. At the end nothing can follow it.
-    arguments.push_back("+set");
-    arguments.push_back("com_skipRenderer");
-    arguments.push_back("1");
-
     auto argv = std::vector<char*> {};
 
     for (auto& argument: arguments)
@@ -98,9 +90,6 @@ void View::startEngine()
 
 void View::update(Threads::FrameTime)
 {
-    if (!engineStarted)
-        startEngine();
-
     // Shift, Ctrl and Alt arrive as state and never as key events (plan.md §5,
     // gap 9), so they are polled once a frame and the difference is turned into
     // the down/up pair the engine binds - _attack, _strafe and _speed. Read
@@ -108,21 +97,33 @@ void View::update(Threads::FrameTime)
     // is in front is not the player's.
     if (auto* host = getWindow())
         Input::syncModifiers(host->getModifiers());
-
-    // The whole of dhewm3's main loop. sys/linux/main.cpp runs this in a
-    // `while (1)` and idCommonLocal::Frame sleeps at the end of it to hold 60Hz;
-    // here the display link is the thing that waits, and the engine is told not
-    // to sleep on top of it (sys/eacp/GLimp.cpp).
-    common->Frame();
 }
 
 void View::render(GPU::Frame& frame)
 {
-    // Nothing to draw yet - the engine is running headless until step 4 - but
-    // the pass still has to be opened and closed: a frame that begins no pass
-    // presents whatever the drawable happened to contain, which on a freshly
-    // allocated one is undefined.
-    frame.beginPass({Graphics::Color {0.05f, 0.05f, 0.06f}});
+    // The engine's frame *is* a frame, which is why this is not in update().
+    //
+    // idCommonLocal::Frame ends by issuing the render commands it built, and
+    // the backend consumes them right there - inside the call, not after it. So
+    // the eacp Frame has to be open around the whole of common->Frame(), and
+    // update() is the wrong side of that: eacp hands a Frame to render() and to
+    // nothing else.
+    //
+    // What the engine sees is unchanged. sys/linux/main.cpp runs this in a
+    // `while (1)` and idCommonLocal::Frame sleeps at the end of it to hold
+    // 60Hz; here the display link is the thing that waits, and the engine is
+    // told not to sleep on top of it (sys/eacp/GLimp.cpp).
+    R_EacpSetFrame(&frame);
+
+    if (!engineStarted)
+        startEngine();
+    else
+        common->Frame();
+
+    // Null outside the frame, so that a draw issued from anywhere else - a
+    // console command, a level load's own screen update - is a no-op that says
+    // so rather than a use of a Frame that has already presented.
+    R_EacpSetFrame(nullptr);
 }
 
 /*

@@ -1,39 +1,89 @@
 /*
 ===========================================================================
 
-dhewm 3 on eacp - GLimp, stubbed.
+dhewm 3 on eacp - what is left of GLimp.
 
-The renderer is the last thing to come up (plan.md, Phase 2 step 4), so this
-build runs with com_skipRenderer 1 and R_InitOpenGL is never reached: nothing
-here opens a window or makes a context, and the two functions with real bodies
-are the two idCommonLocal::Frame calls every frame.
+GLimp is OpenGL's window and context: creating one, making it current, swapping
+it, and setting the gamma ramp on the display it is on. Here the window is
+eacp's and there is no context at all, so nearly all of this is either a
+statement about what the host is already doing (the two functions the frame
+calls) or an entry point nobody on this build can reach.
 
-The stubs stay until idRenderBackendEacp lands, at which point GLimp goes away
-rather than gets an implementation - a window is eacp's, and the seam the
-renderer will be behind is idRenderBackend, not this.
+What is real is GLimp_Init, and it does not initialize anything: it reports the
+size of the surface the view already has. That is the one thing R_InitOpenGL
+genuinely needs from the platform, and it is the reason this file did not go
+away entirely when idRenderBackendEacp landed.
 
 ===========================================================================
 */
 
+// eacp first: idlib/Str.h turns strcmp and friends into macros, which breaks
+// any standard header included after it. See RenderBackend_Eacp.cpp.
+#include <eacp/GPU/GPU.h>
+
 #include "sys/platform.h"
 #include "framework/Common.h"
 #include "renderer/tr_local.h"
+#include "renderer/RenderBackend_Eacp.h"
 
 static void GLimp_Unreachable( const char *what ) {
-	// Not a warning: reaching any of these means the renderer came up, and the
-	// renderer coming up on this build means com_skipRenderer was turned off
-	// on a host that has no GL context to turn it on for.
-	common->FatalError( "%s called on the eacp build, which has no OpenGL "
-	                    "(run with com_skipRenderer 1 until Phase 2 step 4)", what );
+	// Not a warning. Every one of these is either OpenGL's own or a window
+	// feature eacp has not grown yet (plan.md section 5, gap 8), and reaching
+	// one means something asked for a capability this build said it did not
+	// have.
+	common->FatalError( "%s called on the eacp build, which has no OpenGL", what );
 }
 
+/*
+===================
+GLimp_Init
+
+Not an initialization. The window exists before the engine does - it is what
+the engine is started from (sys/eacp/View.cpp) - so all this does is measure it.
+
+The two sizes are different and both matter. vidWidth/vidHeight are real pixels,
+which is what the renderer rasterizes into and what a scissor rect is in;
+winWidth/winHeight are logical points, which is what the window is laid out in
+and what a mouse coordinate arrives in. On a Retina display they differ by two,
+and dhewm3 grew the distinction for exactly this reason.
+
+r_mode is therefore not honoured, and neither is r_fullscreen: the window was
+sized before the cvars were read. Resizing it from here is gap 8's other half
+and is worth doing once the picture is worth looking at.
+===================
+*/
 bool GLimp_Init( glimpParms_t parms ) {
-	GLimp_Unreachable( "GLimp_Init" );
-	return false;
+	eacp::GPU::GPUView *	view = R_EacpGetView();
+
+	if ( !view ) {
+		common->FatalError( "GLimp_Init: no eacp view - the engine was started "
+		                    "from somewhere other than the view" );
+		return false;
+	}
+
+	const float	scale = view->backingScale();
+	const auto	bounds = view->getLocalBounds();
+
+	glConfig.winWidth = bounds.w;
+	glConfig.winHeight = bounds.h;
+
+	glConfig.vidWidth = (int)( bounds.w * scale );
+	glConfig.vidHeight = (int)( bounds.h * scale );
+
+	glConfig.isFullscreen = false;
+	glConfig.displayFrequency = (int)GLimp_GetDisplayRefresh();
+
+	common->Printf( "eacp view: %dx%d pixels (%.0fx%.0f points at %.2gx)\n",
+					glConfig.vidWidth, glConfig.vidHeight,
+					glConfig.winWidth, glConfig.winHeight, scale );
+
+	return true;
 }
 
 bool GLimp_SetScreenParms( glimpParms_t parms ) {
-	GLimp_Unreachable( "GLimp_SetScreenParms" );
+	// r_mode, r_fullscreen and vid_restart. The window is the host's and this
+	// build cannot resize it (gap 8), so refusing is honest - R_SetScreenParms
+	// treats a false as "the mode did not change" rather than as an error.
 	return false;
 }
 
@@ -47,7 +97,17 @@ void GLimp_SwapBuffers() {
 }
 
 void GLimp_SetGamma( unsigned short red[256], unsigned short green[256], unsigned short blue[256] ) {
-	GLimp_Unreachable( "GLimp_SetGamma" );
+	// The display's hardware ramp, which eacp does not expose and which
+	// dhewm3 stopped needing: r_gammaInShader defaults to 1 and applies
+	// r_gamma and r_brightness in the shader instead. Warned rather than
+	// fatal, because the only way here is a player turning that cvar off.
+	static bool	warned = false;
+
+	if ( !warned ) {
+		warned = true;
+		common->Warning( "r_gammaInShader 0 asks for the display's hardware gamma ramp, "
+		                 "which this build cannot set - leave it at 1" );
+	}
 }
 
 void GLimp_ResetGamma() {

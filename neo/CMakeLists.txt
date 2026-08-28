@@ -315,7 +315,6 @@ set(src_renderer
 	renderer/Model_sprite.cpp
 	renderer/RenderEntity.cpp
 	renderer/RenderSystem.cpp
-	renderer/RenderBackend_GL.cpp
 	renderer/RenderSystem_init.cpp
 	renderer/RenderWorld.cpp
 	renderer/RenderWorld_demo.cpp
@@ -746,6 +745,14 @@ set(src_core
 	${src_imgui}
 )
 
+# The one file that is a target's rather than the tree's. Both backends define
+# `renderBackend`, and each is the answer for exactly one of the two hosts: the
+# SDL/GL executable has a GL context and no eacp device, and the eacp one has
+# the reverse. So this is not a runtime choice and there is nothing to select
+# between - the linker decides, once, per target.
+set(src_renderbackend_gl	renderer/RenderBackend_GL.cpp)
+set(src_renderbackend_eacp	renderer/RenderBackend_Eacp.h renderer/RenderBackend_Eacp.cpp)
+
 if(APPLE)
 	set(osx_resources
 		"sys/osx/Doom3.icns"
@@ -810,8 +817,8 @@ if(HARDLINK_GAME)
 endif()
 
 if(CORE)
-	add_executable(dhewm3 WIN32 MACOSX_BUNDLE ${src_core} ${src_sys})
-	source_group(TREE ${CMAKE_CURRENT_SOURCE_DIR} PREFIX neo FILES ${src_core} ${src_sys})
+	add_executable(dhewm3 WIN32 MACOSX_BUNDLE ${src_core} ${src_sys} ${src_renderbackend_gl})
+	source_group(TREE ${CMAKE_CURRENT_SOURCE_DIR} PREFIX neo FILES ${src_core} ${src_sys} ${src_renderbackend_gl})
 
 	target_include_directories(dhewm3 PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/libs/imgui")
 	target_link_libraries(dhewm3 PRIVATE idlib SDL3::SDL3 OpenAL::OpenAL)
@@ -879,8 +886,8 @@ if(EACP AND APPLE)
 		sys/osx/macosx_misc.mm
 	)
 
-	add_executable(dhewm3-eacp WIN32 MACOSX_BUNDLE ${src_core} ${src_sys_eacp})
-	source_group(TREE ${CMAKE_CURRENT_SOURCE_DIR} PREFIX neo FILES ${src_core} ${src_sys_eacp})
+	add_executable(dhewm3-eacp WIN32 MACOSX_BUNDLE ${src_core} ${src_sys_eacp} ${src_renderbackend_eacp})
+	source_group(TREE ${CMAKE_CURRENT_SOURCE_DIR} PREFIX neo FILES ${src_core} ${src_sys_eacp} ${src_renderbackend_eacp})
 
 	target_include_directories(dhewm3-eacp PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/libs/imgui")
 	target_link_libraries(dhewm3-eacp PRIVATE idlib eacp-gpu OpenAL::OpenAL "-framework Cocoa")
