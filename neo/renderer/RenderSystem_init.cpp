@@ -389,7 +389,7 @@ R_CheckPortableExtensions
 
 ==================
 */
-static void R_CheckPortableExtensions( void ) {
+void R_CheckPortableExtensions( void ) {
 	glConfig.glVersion = atof( glConfig.version_string );
 
 	// GL_ARB_multitexture
@@ -771,11 +771,10 @@ and model information functions.
 ==================
 */
 void R_InitOpenGL( void ) {
-	GLint			temp;
 	glimpParms_t	parms;
 	int				i;
 
-	common->Printf( "----- Initializing OpenGL -----\n" );
+	common->Printf( "----- Initializing %s -----\n", renderBackend->Name() );
 
 	if ( glConfig.isInitialized ) {
 		common->FatalError( "R_InitOpenGL called while active" );
@@ -819,48 +818,15 @@ void R_InitOpenGL( void ) {
 		r_multiSamples.SetInteger( 0 );
 	}
 
-// load qgl function pointers
-#define QGLPROC(name, rettype, args) \
-	q##name = (rettype(APIENTRYP)args)GLimp_ExtensionPointer(#name); \
-	if (!q##name) \
-		common->FatalError("Unable to initialize OpenGL (%s)", #name);
-
-#include "renderer/qgl_proc.h"
-
 	// input and sound systems need to be tied to the new window
 	Sys_InitInput();
 	soundSystem->InitHW();
 
-	// get our config strings
-	glConfig.vendor_string = (const char *)qglGetString(GL_VENDOR);
-	glConfig.renderer_string = (const char *)qglGetString(GL_RENDERER);
-	glConfig.version_string = (const char *)qglGetString(GL_VERSION);
-	glConfig.extensions_string = (const char *)qglGetString(GL_EXTENSIONS);
-
-	// OpenGL driver constants
-	qglGetIntegerv( GL_MAX_TEXTURE_SIZE, &temp );
-	glConfig.maxTextureSize = temp;
-
-	// stubbed or broken drivers may have reported 0...
-	if ( glConfig.maxTextureSize <= 0 ) {
-		glConfig.maxTextureSize = 256;
-	}
-
-	glConfig.isInitialized = true;
-
-	common->Printf("OpenGL vendor: %s\n", glConfig.vendor_string );
-	common->Printf("OpenGL renderer: %s\n", glConfig.renderer_string );
-	common->Printf("OpenGL version: %s\n", glConfig.version_string );
-
-	// recheck all the extensions (FIXME: this might be dangerous)
-	R_CheckPortableExtensions();
-
-	// parse our vertex and fragment programs, possibly disably support for
-	// one of the paths if there was an error
-	R_ARB2_Init();
-
-	cmdSystem->AddCommand( "reloadARBprograms", R_ReloadARBPrograms_f, CMD_FL_RENDERER, "reloads ARB programs" );
-	R_ReloadARBPrograms_f( idCmdArgs() );
+	// everything from here down that is the graphics API's rather than the
+	// renderer's - the entry points, what the device says about itself, the
+	// programs the backend draws with - and glConfig.isInitialized at the end
+	// of it, which is the backend saying it is ready
+	renderBackend->Init();
 
 	// allocate the vertex array range or vertex objects
 	vertexCache.Init();
@@ -2463,6 +2429,10 @@ idRenderSystemLocal::ShutdownOpenGL
 void idRenderSystemLocal::ShutdownOpenGL( void ) {
 
 	R_ShutdownFrameData();
+
+	// before GLimp_Shutdown takes the window away, because anything the backend
+	// is holding onto - a device, a surface, a swapchain - is attached to it
+	renderBackend->Shutdown();
 
 	// as the input is tied to the window, it should be shut down when the window
 	// is destroyed (relevant when starting a mod which also recreates window)

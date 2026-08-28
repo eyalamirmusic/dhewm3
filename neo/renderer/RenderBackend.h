@@ -69,6 +69,41 @@ class idRenderBackend {
 public:
 	virtual					~idRenderBackend() {}
 
+	// What this backend is called, for the log line R_InitOpenGL prints and for
+	// anyone reading a bug report.
+	virtual const char *	Name( void ) const = 0;
+
+	// Everything R_InitOpenGL does that belongs to the graphics API rather than
+	// to the renderer, run once the window exists: entry points, the device's
+	// own limits into glConfig, and whatever programs the backend draws with.
+	//
+	// Setting glConfig.isInitialized is the backend's last act here, because it
+	// is the backend saying it is ready - nothing above it can tell.
+	virtual void			Init( void ) = 0;
+
+	// Release whatever Init acquired. Called before GLimp_Shutdown takes the
+	// window away, so anything holding a device or a surface has to go here.
+	virtual void			Shutdown( void ) = 0;
+
+	// One view - the world, a mirror, a subview or the 2D pass - rendered from
+	// backEnd.viewDef, which RB_DrawView has already set along with the frame
+	// bookkeeping that goes with it.
+	//
+	// This is the whole of a backend's drawing and it is deliberately not
+	// broken down further. What Doom 3 does inside a view - fill depth, add
+	// each light's interactions through the stencil, blend the shader passes,
+	// fog - is a sequence of ideas rather than a sequence of API calls, and
+	// every one of them is expressed in fixed-function terms that a modern API
+	// has no counterpart for. So a second backend reimplements the sequence
+	// rather than reimplementing calls underneath it.
+	virtual void			DrawView( void ) = 0;
+
+	// The frame's last act, and the mirror of SetDefaultState below: hand the
+	// API back to whatever else in the program touches it. Doom 3 shares its
+	// context with the editor, so a texture left bound by the last draw is a
+	// texture the editor can corrupt.
+	virtual void			ReleaseTextures( void ) = 0;
+
 	// Reset everything the rest of the program might have left dirty. Doom 3
 	// hands the context to the editor and to ImGui, so the backend cannot
 	// assume it is the only thing that touched the API.

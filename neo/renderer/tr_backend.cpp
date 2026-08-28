@@ -305,8 +305,7 @@ void RB_ExecuteBackEndCommands( const emptyCommand_t *cmds ) {
 	}
 
 	// go back to the default texture so the editor doesn't mess up a bound image
-	qglBindTexture( GL_TEXTURE_2D, 0 );
-	backEnd.glState.tmu[0].current2DMap = -1;
+	renderBackend->ReleaseTextures();
 
 	// stop rendering on this thread
 	backEndFinishTime = Sys_Milliseconds();

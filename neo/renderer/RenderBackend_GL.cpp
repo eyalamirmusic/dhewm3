@@ -62,6 +62,11 @@ static idCVar r_fillWindowAlphaChan( "r_fillWindowAlphaChan", "-1", CVAR_SYSTEM 
 
 class idRenderBackendGL : public idRenderBackend {
 public:
+	virtual const char *Name( void ) const { return "OpenGL"; }
+	virtual void	Init( void );
+	virtual void	Shutdown( void );
+	virtual void	DrawView( void );
+	virtual void	ReleaseTextures( void );
 	virtual void	SetDefaultState( void );
 	virtual void	SetDrawBuffer( int buffer );
 	virtual void	SwapBuffers( void );
@@ -76,6 +81,91 @@ public:
 
 static idRenderBackendGL	renderBackendGL;
 idRenderBackend *			renderBackend = &renderBackendGL;
+
+/*
+======================
+idRenderBackendGL::Init
+
+The API half of R_InitOpenGL: the entry points, what the driver says about
+itself, and the ARB programs the interaction pass is written in. Everything the
+renderer does with the answers - the vertex cache, the frame data, the gamma
+ramp - stays above the seam, because none of it is OpenGL's.
+======================
+*/
+void idRenderBackendGL::Init( void ) {
+	GLint	temp;
+
+// load qgl function pointers
+#define QGLPROC(name, rettype, args) \
+	q##name = (rettype(APIENTRYP)args)GLimp_ExtensionPointer(#name); \
+	if (!q##name) \
+		common->FatalError("Unable to initialize OpenGL (%s)", #name);
+
+#include "renderer/qgl_proc.h"
+
+	// get our config strings
+	glConfig.vendor_string = (const char *)qglGetString(GL_VENDOR);
+	glConfig.renderer_string = (const char *)qglGetString(GL_RENDERER);
+	glConfig.version_string = (const char *)qglGetString(GL_VERSION);
+	glConfig.extensions_string = (const char *)qglGetString(GL_EXTENSIONS);
+
+	// OpenGL driver constants
+	qglGetIntegerv( GL_MAX_TEXTURE_SIZE, &temp );
+	glConfig.maxTextureSize = temp;
+
+	// stubbed or broken drivers may have reported 0...
+	if ( glConfig.maxTextureSize <= 0 ) {
+		glConfig.maxTextureSize = 256;
+	}
+
+	glConfig.isInitialized = true;
+
+	common->Printf("OpenGL vendor: %s\n", glConfig.vendor_string );
+	common->Printf("OpenGL renderer: %s\n", glConfig.renderer_string );
+	common->Printf("OpenGL version: %s\n", glConfig.version_string );
+
+	// recheck all the extensions (FIXME: this might be dangerous)
+	R_CheckPortableExtensions();
+
+	// parse our vertex and fragment programs, possibly disably support for
+	// one of the paths if there was an error
+	R_ARB2_Init();
+
+	cmdSystem->AddCommand( "reloadARBprograms", R_ReloadARBPrograms_f, CMD_FL_RENDERER, "reloads ARB programs" );
+	R_ReloadARBPrograms_f( idCmdArgs() );
+}
+
+/*
+======================
+idRenderBackendGL::Shutdown
+
+Nothing. The context owns every object this backend made and GLimp_Shutdown
+destroys the context, which is the one thing a GL backend gets for free and the
+one thing the eacp backend will not.
+======================
+*/
+void idRenderBackendGL::Shutdown( void ) {
+}
+
+/*
+======================
+idRenderBackendGL::DrawView
+======================
+*/
+void idRenderBackendGL::DrawView( void ) {
+	RB_STD_DrawView();
+}
+
+/*
+======================
+idRenderBackendGL::ReleaseTextures
+======================
+*/
+void idRenderBackendGL::ReleaseTextures( void ) {
+	// go back to the default texture so the editor doesn't mess up a bound image
+	qglBindTexture( GL_TEXTURE_2D, 0 );
+	backEnd.glState.tmu[0].current2DMap = -1;
+}
 
 /*
 ======================

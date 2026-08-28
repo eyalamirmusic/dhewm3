@@ -1311,6 +1311,7 @@ DRAW_*
 ============================================================
 */
 
+void	R_CheckPortableExtensions( void );
 void	R_ARB2_Init( void );
 void	RB_ARB2_DrawInteractions( void );
 void	R_ReloadARBPrograms_f( const idCmdArgs &args );
