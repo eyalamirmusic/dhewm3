@@ -77,6 +77,30 @@ public:
 	virtual void	SelectTexture( int unit );
 	virtual void	DrawIndexed( const srfTriangles_t *tri, int numIndexes );
 	virtual void	CheckErrors( void );
+
+	virtual void	AllocImage( idImage *image );
+	virtual void	FreeImage( idImage *image );
+	virtual void	BindImage( idImage *image );
+	virtual void	BindImageFragment( idImage *image );
+	virtual void	BindNoImage( void );
+	virtual void	UploadImageLevel( idImage *image, int face, int level, int internalFormat,
+									  int width, int height, int externalFormat,
+									  const byte *pixels );
+	virtual void	UploadCompressedImageLevel( idImage *image, int level, int internalFormat,
+												int width, int height, int numBytes,
+												const byte *data );
+	virtual void	SetImageMaxLevel( idImage *image, int maxLevel );
+	virtual void	UploadScratchImage( idImage *image, const byte *data, int cols, int rows );
+	virtual void	SetImageFilterAndRepeat( const idImage *image );
+	virtual void	SetCubeImageFilterAndRepeat( const idImage *image );
+	virtual void	RefreshImageFilter( const idImage *image );
+	virtual void	SetImageBorderColor( const idImage *image, const float rgba[4] );
+	virtual void	CopyFramebufferToImage( idImage *image, int x, int y,
+											int imageWidth, int imageHeight,
+											bool useOversizedBuffer );
+	virtual void	CopyDepthbufferToImage( idImage *image, int x, int y,
+											int imageWidth, int imageHeight,
+											bool useOversizedBuffer );
 };
 
 static idRenderBackendGL	renderBackendGL;
@@ -685,4 +709,504 @@ void idRenderBackendGL::CheckErrors( void ) {
 			common->Printf( "GL_CheckErrors: %s\n", s );
 		}
 	}
+}
+
+/*
+===============================================================================
+
+	Images.
+
+	Moved from Image_load.cpp and Image_init.cpp unchanged. What stayed behind
+	is every decision - which pixels, at what size, in what format, and when to
+	throw them away.
+
+	Five image paths were deliberately not moved, because none of them can run
+	on a backend that is not OpenGL and each is already switched off by
+	something the port controls rather than by a new flag:
+
+	  Generate3DImage            never called at all - idImage::TT_3D does not
+	                             happen (plan.md, section 5)
+	  GenerateCubeImage          glConfig.cubeMapAvailable
+	  UploadCompressedNormalMap  glConfig.sharedTexturePaletteAvailable
+	  idImageManager::SetNormalPalette   the same
+	  WritePrecompressedImage    image_useOfflineCompression, which is 0 and is
+	                             a content tool rather than a rendering path
+
+	They stay in the image layer with their qgl calls in them. A backend that
+	wants cube maps takes GenerateCubeImage then, with something to map it
+	onto; moving it now would only produce an entry point nothing can call.
+
+===============================================================================
+*/
+
+/*
+====================
+idRenderBackendGL::AllocImage / FreeImage
+====================
+*/
+void idRenderBackendGL::AllocImage( idImage *image ) {
+	qglGenTextures( 1, &image->texnum );
+}
+
+void idRenderBackendGL::FreeImage( idImage *image ) {
+	qglDeleteTextures( 1, &image->texnum );
+}
+
+/*
+====================
+idRenderBackendGL::BindImage
+
+Automatically enables 2D mapping, cube mapping, or 3D texturing if needed.
+====================
+*/
+void idRenderBackendGL::BindImage( idImage *image ) {
+	tmu_t	*tmu = &backEnd.glState.tmu[backEnd.glState.currenttmu];
+
+	// enable or disable apropriate texture modes
+	if ( tmu->textureType != image->type && ( backEnd.glState.currenttmu <	glConfig.maxTextureUnits ) ) {
+		if ( tmu->textureType == TT_CUBIC ) {
+			qglDisable( GL_TEXTURE_CUBE_MAP_EXT );
+		} else if ( tmu->textureType == TT_3D ) {
+			qglDisable( GL_TEXTURE_3D );
+		} else if ( tmu->textureType == TT_2D ) {
+			qglDisable( GL_TEXTURE_2D );
+		}
+
+		if ( image->type == TT_CUBIC ) {
+			qglEnable( GL_TEXTURE_CUBE_MAP_EXT );
+		} else if ( image->type == TT_3D ) {
+			qglEnable( GL_TEXTURE_3D );
+		} else if ( image->type == TT_2D ) {
+			qglEnable( GL_TEXTURE_2D );
+		}
+		tmu->textureType = image->type;
+	}
+
+	// bind the texture
+	if ( image->type == TT_2D ) {
+		if ( tmu->current2DMap != (int)image->texnum ) {
+			tmu->current2DMap = image->texnum;
+			qglBindTexture( GL_TEXTURE_2D, image->texnum );
+		}
+	} else if ( image->type == TT_CUBIC ) {
+		if ( tmu->currentCubeMap != (int)image->texnum ) {
+			tmu->currentCubeMap = image->texnum;
+			qglBindTexture( GL_TEXTURE_CUBE_MAP_EXT, image->texnum );
+		}
+	} else if ( image->type == TT_3D ) {
+		if ( tmu->current3DMap != (int)image->texnum ) {
+			tmu->current3DMap = image->texnum;
+			qglBindTexture( GL_TEXTURE_3D, image->texnum );
+		}
+	}
+
+	if ( com_purgeAll.GetBool() ) {
+		GLclampf priority = 1.0f;
+		qglPrioritizeTextures( 1, &image->texnum, &priority );
+	}
+}
+
+/*
+====================
+idRenderBackendGL::BindImageFragment
+
+Fragment programs explicitly say which type of map they want, so we don't need
+to do any enable / disable changes.
+====================
+*/
+void idRenderBackendGL::BindImageFragment( idImage *image ) {
+	if ( image->type == TT_2D ) {
+		qglBindTexture( GL_TEXTURE_2D, image->texnum );
+	} else if ( image->type == TT_RECT ) {
+		qglBindTexture( GL_TEXTURE_RECTANGLE_NV, image->texnum );
+	} else if ( image->type == TT_CUBIC ) {
+		qglBindTexture( GL_TEXTURE_CUBE_MAP_EXT, image->texnum );
+	} else if ( image->type == TT_3D ) {
+		qglBindTexture( GL_TEXTURE_3D, image->texnum );
+	}
+}
+
+/*
+====================
+idRenderBackendGL::BindNoImage
+====================
+*/
+void idRenderBackendGL::BindNoImage( void ) {
+	tmu_t	*tmu = &backEnd.glState.tmu[backEnd.glState.currenttmu];
+
+	if ( tmu->textureType == TT_CUBIC ) {
+		qglDisable( GL_TEXTURE_CUBE_MAP_EXT );
+	} else if ( tmu->textureType == TT_3D ) {
+		qglDisable( GL_TEXTURE_3D );
+	} else if ( tmu->textureType == TT_2D ) {
+		qglDisable( GL_TEXTURE_2D );
+	}
+	tmu->textureType = TT_DISABLED;
+}
+
+/*
+====================
+idRenderBackendGL::UploadImageLevel
+====================
+*/
+void idRenderBackendGL::UploadImageLevel( idImage *image, int face, int level, int internalFormat,
+										  int width, int height, int externalFormat,
+										  const byte *pixels ) {
+	GLenum	target = ( image->type == TT_CUBIC )
+					  ? ( GL_TEXTURE_CUBE_MAP_POSITIVE_X_EXT + face )
+					  : GL_TEXTURE_2D;
+
+	qglTexImage2D( target, level, internalFormat, width, height, 0,
+				   externalFormat, GL_UNSIGNED_BYTE, pixels );
+}
+
+/*
+====================
+idRenderBackendGL::UploadCompressedImageLevel
+====================
+*/
+void idRenderBackendGL::UploadCompressedImageLevel( idImage *image, int level, int internalFormat,
+													int width, int height, int numBytes,
+													const byte *data ) {
+	qglCompressedTexImage2DARB( GL_TEXTURE_2D, level, internalFormat, width, height, 0, numBytes, data );
+}
+
+/*
+====================
+idRenderBackendGL::SetImageMaxLevel
+====================
+*/
+void idRenderBackendGL::SetImageMaxLevel( idImage *image, int maxLevel ) {
+	qglTexParameteri( GL_TEXTURE_2D, GL_TEXTURE_MAX_LEVEL, maxLevel );
+}
+
+/*
+====================
+idRenderBackendGL::UploadScratchImage
+
+If rows = cols * 6, assume it is a cube map animation.
+====================
+*/
+void idRenderBackendGL::UploadScratchImage( idImage *image, const byte *data, int cols, int rows ) {
+	int			i;
+
+	// if rows = cols * 6, assume it is a cube map animation
+	if ( rows == cols * 6 ) {
+		if ( image->type != TT_CUBIC ) {
+			image->type = TT_CUBIC;
+			image->uploadWidth = -1;	// for a non-sub upload
+		}
+
+		image->Bind();
+
+		rows /= 6;
+		// if the scratchImage isn't in the format we want, specify it as a new texture
+		if ( cols != image->uploadWidth || rows != image->uploadHeight ) {
+			image->uploadWidth = cols;
+			image->uploadHeight = rows;
+
+			// upload the base level
+			for ( i = 0 ; i < 6 ; i++ ) {
+				qglTexImage2D( GL_TEXTURE_CUBE_MAP_POSITIVE_X_EXT+i, 0, GL_RGB8, cols, rows, 0,
+					GL_RGBA, GL_UNSIGNED_BYTE, data + cols*rows*4*i );
+			}
+		} else {
+			// otherwise, just subimage upload it so that drivers can tell we are going to be changing
+			// it and don't try and do a texture compression
+			for ( i = 0 ; i < 6 ; i++ ) {
+				qglTexSubImage2D( GL_TEXTURE_CUBE_MAP_POSITIVE_X_EXT+i, 0, 0, 0, cols, rows,
+					GL_RGBA, GL_UNSIGNED_BYTE, data + cols*rows*4*i );
+			}
+		}
+		qglTexParameterf( GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR );
+		qglTexParameterf( GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR );
+		// no other clamp mode makes sense
+		qglTexParameteri(GL_TEXTURE_CUBE_MAP_EXT, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+		qglTexParameteri(GL_TEXTURE_CUBE_MAP_EXT, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+	} else {
+		// otherwise, it is a 2D image
+		if ( image->type != TT_2D ) {
+			image->type = TT_2D;
+			image->uploadWidth = -1;	// for a non-sub upload
+		}
+
+		image->Bind();
+
+		// if the scratchImage isn't in the format we want, specify it as a new texture
+		if ( cols != image->uploadWidth || rows != image->uploadHeight ) {
+			image->uploadWidth = cols;
+			image->uploadHeight = rows;
+			qglTexImage2D( GL_TEXTURE_2D, 0, GL_RGB8, cols, rows, 0, GL_RGBA, GL_UNSIGNED_BYTE, data );
+		} else {
+			// otherwise, just subimage upload it so that drivers can tell we are going to be changing
+			// it and don't try and do a texture compression
+			qglTexSubImage2D( GL_TEXTURE_2D, 0, 0, 0, cols, rows, GL_RGBA, GL_UNSIGNED_BYTE, data );
+		}
+		qglTexParameterf( GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR );
+		qglTexParameterf( GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR );
+		// these probably should be clamp, but we have a lot of issues with editor
+		// geometry coming out with texcoords slightly off one side, resulting in
+		// a smear across the entire polygon
+#if 1
+		qglTexParameterf( GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_REPEAT );
+		qglTexParameterf( GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_REPEAT );
+#else
+		qglTexParameterf( GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE );
+		qglTexParameterf( GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE );
+#endif
+	}
+}
+
+/*
+====================
+idRenderBackendGL::SetImageFilterAndRepeat
+====================
+*/
+void idRenderBackendGL::SetImageFilterAndRepeat( const idImage *image ) {
+	// set the minimize / maximize filtering
+	switch( image->filter ) {
+	case TF_DEFAULT:
+		qglTexParameterf(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, globalImages->textureMinFilter );
+		qglTexParameterf(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, globalImages->textureMaxFilter );
+		break;
+	case TF_LINEAR:
+		qglTexParameterf(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR );
+		qglTexParameterf(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR );
+		break;
+	case TF_NEAREST:
+		qglTexParameterf(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST );
+		qglTexParameterf(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST );
+		break;
+	default:
+		common->FatalError( "R_CreateImage: bad texture filter" );
+	}
+
+	if ( glConfig.anisotropicAvailable ) {
+		// only do aniso filtering on mip mapped images
+		if ( image->filter == TF_DEFAULT ) {
+			qglTexParameterf(GL_TEXTURE_2D, GL_TEXTURE_MAX_ANISOTROPY_EXT, globalImages->textureAnisotropy );
+		} else {
+			qglTexParameterf(GL_TEXTURE_2D, GL_TEXTURE_MAX_ANISOTROPY_EXT, 1 );
+		}
+	}
+	if ( glConfig.textureLODBiasAvailable ) {
+		qglTexParameterf(GL_TEXTURE_2D, GL_TEXTURE_LOD_BIAS_EXT, globalImages->textureLODBias );
+	}
+
+	// set the wrap/clamp modes
+	switch( image->repeat ) {
+	case TR_REPEAT:
+		qglTexParameterf( GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_REPEAT );
+		qglTexParameterf( GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_REPEAT );
+		break;
+	case TR_CLAMP_TO_BORDER:
+		qglTexParameterf( GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_BORDER );
+		qglTexParameterf( GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_BORDER );
+		break;
+	case TR_CLAMP_TO_ZERO:
+	case TR_CLAMP_TO_ZERO_ALPHA:
+	case TR_CLAMP:
+		qglTexParameterf( GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE );
+		qglTexParameterf( GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE );
+		break;
+	default:
+		common->FatalError( "R_CreateImage: bad texture repeat" );
+	}
+}
+
+/*
+====================
+idRenderBackendGL::SetCubeImageFilterAndRepeat
+
+The cube map's own, and not the same as the 2D one: the wrap is forced to clamp
+because no other mode makes sense across a seam, and neither the anisotropy nor
+the LOD bias is applied.
+====================
+*/
+void idRenderBackendGL::SetCubeImageFilterAndRepeat( const idImage *image ) {
+	// no other clamp mode makes sense
+	qglTexParameteri(GL_TEXTURE_CUBE_MAP_EXT, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+	qglTexParameteri(GL_TEXTURE_CUBE_MAP_EXT, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+
+	// set the minimize / maximize filtering
+	switch( image->filter ) {
+	case TF_DEFAULT:
+		qglTexParameterf(GL_TEXTURE_CUBE_MAP_EXT, GL_TEXTURE_MIN_FILTER, globalImages->textureMinFilter );
+		qglTexParameterf(GL_TEXTURE_CUBE_MAP_EXT, GL_TEXTURE_MAG_FILTER, globalImages->textureMaxFilter );
+		break;
+	case TF_LINEAR:
+		qglTexParameterf(GL_TEXTURE_CUBE_MAP_EXT, GL_TEXTURE_MIN_FILTER, GL_LINEAR );
+		qglTexParameterf(GL_TEXTURE_CUBE_MAP_EXT, GL_TEXTURE_MAG_FILTER, GL_LINEAR );
+		break;
+	case TF_NEAREST:
+		qglTexParameterf(GL_TEXTURE_CUBE_MAP_EXT, GL_TEXTURE_MIN_FILTER, GL_NEAREST );
+		qglTexParameterf(GL_TEXTURE_CUBE_MAP_EXT, GL_TEXTURE_MAG_FILTER, GL_NEAREST );
+		break;
+	default:
+		common->FatalError( "R_CreateImage: bad texture filter" );
+	}
+}
+
+/*
+====================
+idRenderBackendGL::RefreshImageFilter
+====================
+*/
+void idRenderBackendGL::RefreshImageFilter( const idImage *image ) {
+	unsigned int	texEnum = GL_TEXTURE_2D;
+
+	switch( image->type ) {
+	case TT_2D:
+		texEnum = GL_TEXTURE_2D;
+		break;
+	case TT_3D:
+		texEnum = GL_TEXTURE_3D;
+		break;
+	case TT_CUBIC:
+		texEnum = GL_TEXTURE_CUBE_MAP_EXT;
+		break;
+	default:
+		break;
+	}
+
+	if ( image->filter == TF_DEFAULT ) {
+		qglTexParameterf(texEnum, GL_TEXTURE_MIN_FILTER, globalImages->textureMinFilter );
+		qglTexParameterf(texEnum, GL_TEXTURE_MAG_FILTER, globalImages->textureMaxFilter );
+	}
+	if ( glConfig.anisotropicAvailable ) {
+		qglTexParameterf(texEnum, GL_TEXTURE_MAX_ANISOTROPY_EXT, globalImages->textureAnisotropy );
+	}
+	if ( glConfig.textureLODBiasAvailable ) {
+		qglTexParameterf(texEnum, GL_TEXTURE_LOD_BIAS_EXT, globalImages->textureLODBias );
+	}
+}
+
+/*
+====================
+idRenderBackendGL::SetImageBorderColor
+====================
+*/
+void idRenderBackendGL::SetImageBorderColor( const idImage *image, const float rgba[4] ) {
+	qglTexParameterfv( GL_TEXTURE_2D, GL_TEXTURE_BORDER_COLOR, rgba );
+}
+
+/*
+====================
+idRenderBackendGL::CopyFramebufferToImage
+====================
+*/
+void idRenderBackendGL::CopyFramebufferToImage( idImage *image, int x, int y,
+												int imageWidth, int imageHeight,
+												bool useOversizedBuffer ) {
+	image->Bind();
+
+	if ( cvarSystem->GetCVarBool( "g_lowresFullscreenFX" ) ) {
+		imageWidth = 512;
+		imageHeight = 512;
+	}
+
+	// if the size isn't a power of 2, the image must be increased in size
+	int	potWidth, potHeight;
+
+	potWidth = MakePowerOfTwo( imageWidth );
+	potHeight = MakePowerOfTwo( imageHeight );
+
+	image->GetDownsize( imageWidth, imageHeight );
+	image->GetDownsize( potWidth, potHeight );
+
+	qglReadBuffer( GL_BACK );
+
+	// only resize if the current dimensions can't hold it at all,
+	// otherwise subview renderings could thrash this
+	if ( ( useOversizedBuffer && ( image->uploadWidth < potWidth || image->uploadHeight < potHeight ) )
+		|| ( !useOversizedBuffer && ( image->uploadWidth != potWidth || image->uploadHeight != potHeight ) ) ) {
+		image->uploadWidth = potWidth;
+		image->uploadHeight = potHeight;
+		if ( potWidth == imageWidth && potHeight == imageHeight ) {
+			qglCopyTexImage2D( GL_TEXTURE_2D, 0, GL_RGB8, x, y, imageWidth, imageHeight, 0 );
+		} else {
+			byte	*junk;
+			// we need to create a dummy image with power of two dimensions,
+			// then do a qglCopyTexSubImage2D of the data we want
+			// this might be a 16+ meg allocation, which could fail on _alloca
+			junk = (byte *)Mem_Alloc( potWidth * potHeight * 4 );
+			memset( junk, 0, potWidth * potHeight * 4 );		//!@#
+#if 0 // Disabling because it's unnecessary and introduces a green strip on edge of _currentRender
+			for ( int i = 0 ; i < potWidth * potHeight * 4 ; i+=4 ) {
+				junk[i+1] = 255;
+			}
+#endif
+			qglTexImage2D( GL_TEXTURE_2D, 0, GL_RGB, potWidth, potHeight, 0, GL_RGBA, GL_UNSIGNED_BYTE, junk );
+			Mem_Free( junk );
+
+			qglCopyTexSubImage2D( GL_TEXTURE_2D, 0, 0, 0, x, y, imageWidth, imageHeight );
+		}
+	} else {
+		// otherwise, just subimage upload it so that drivers can tell we are going to be changing
+		// it and don't try and do a texture compression or some other silliness
+		qglCopyTexSubImage2D( GL_TEXTURE_2D, 0, 0, 0, x, y, imageWidth, imageHeight );
+	}
+
+	// if the image isn't a full power of two, duplicate an extra row and/or column to fix bilerps
+	if ( imageWidth != potWidth ) {
+		qglCopyTexSubImage2D( GL_TEXTURE_2D, 0, imageWidth, 0, x+imageWidth-1, y, 1, imageHeight );
+	}
+	if ( imageHeight != potHeight ) {
+		qglCopyTexSubImage2D( GL_TEXTURE_2D, 0, 0, imageHeight, x, y+imageHeight-1, imageWidth, 1 );
+	}
+
+	qglTexParameterf( GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR );
+	qglTexParameterf( GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR );
+
+	qglTexParameterf( GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE );
+	qglTexParameterf( GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE );
+
+	backEnd.c_copyFrameBuffer++;
+}
+
+/*
+====================
+idRenderBackendGL::CopyDepthbufferToImage
+
+This should just be part of CopyFramebufferToImage once we have a proper image
+type field.
+====================
+*/
+void idRenderBackendGL::CopyDepthbufferToImage( idImage *image, int x, int y,
+												int imageWidth, int imageHeight,
+												bool useOversizedBuffer ) {
+	image->Bind();
+
+	// if the size isn't a power of 2, the image must be increased in size
+	int	potWidth, potHeight;
+
+	potWidth = MakePowerOfTwo( imageWidth );
+	potHeight = MakePowerOfTwo( imageHeight );
+	image->GetDownsize( imageWidth, imageHeight );
+	image->GetDownsize( potWidth, potHeight );
+	// Ensure we are reading from the back buffer:
+	qglReadBuffer( GL_BACK );
+	// only resize if the current dimensions can't hold it at all,
+	// otherwise subview renderings could thrash this
+	if ( ( useOversizedBuffer && ( image->uploadWidth < potWidth || image->uploadHeight < potHeight ) ) || ( !useOversizedBuffer && ( image->uploadWidth != potWidth || image->uploadHeight != potHeight ) ) )
+	{
+		image->uploadWidth = potWidth;
+		image->uploadHeight = potHeight;
+		// This bit runs once only at map start, because it tests whether the image is too small to hold the screen.
+		// It resizes the texture to a power of two that can hold the screen,
+		// and then subsequent captures to the texture put the depth component into the RGB channels
+		qglTexImage2D( GL_TEXTURE_2D, 0, GL_DEPTH_COMPONENT24_ARB, potWidth, potHeight, 0, GL_DEPTH_COMPONENT, GL_UNSIGNED_BYTE, NULL );
+		qglCopyTexSubImage2D( GL_TEXTURE_2D, 0, 0, 0, x, y, imageWidth, imageHeight );
+
+	} else {
+		// otherwise, just subimage upload it so that drivers can tell we are going to be changing
+		// it and don't try and do a texture compression or some other silliness
+		qglCopyTexSubImage2D( GL_TEXTURE_2D, 0, 0, 0, x, y, imageWidth, imageHeight );
+	}
+
+	qglTexParameterf( GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST );
+	qglTexParameterf( GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST );
+
+	qglTexParameterf( GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE );
+	qglTexParameterf( GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE );
 }

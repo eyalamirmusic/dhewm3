@@ -64,6 +64,7 @@ Suite 120, Rockville, Maryland 20850 USA.
 */
 
 typedef struct srfTriangles_s srfTriangles_t;
+class idImage;
 
 class idRenderBackend {
 public:
@@ -146,6 +147,98 @@ public:
 	// Report anything the API has queued up against us. A no-op on backends
 	// that report errors as they happen instead.
 	virtual void			CheckErrors( void ) = 0;
+
+	/*
+	-------------------------------------------------------------------------
+		Images
+
+		idImage decides which pixels reach the GPU - the downsizing, the
+		format choice, the mip chain, the LRU that keeps a texture resident
+		and the purge that does not. None of that is repeated per backend.
+		What is below is the part that puts them there and takes them away.
+
+		The formats are OpenGL's names for things - GL_RGBA8, GL_ALPHA8,
+		GL_COMPRESSED_RGBA_S3TC_DXT5_EXT - and that is deliberate rather than
+		unfinished. Doom 3's format decision is written in them from
+		SelectInternalFormat down through BitsForInternalFormat, the .dds
+		reader and the precompressed-file writer, and the .dds files in the
+		pk4s are the reason: half of that enum is a file format's as much as
+		an API's. A second backend maps them onto what it has, which is much
+		the smaller job than moving the decision.
+	-------------------------------------------------------------------------
+	*/
+
+	// A name for a texture that does not exist yet, and its release. The
+	// release is the ONLY place a texture is ever destroyed.
+	virtual void			AllocImage( idImage *image ) = 0;
+	virtual void			FreeImage( idImage *image ) = 0;
+
+	// Make this image the one the current texture unit samples. Bind goes
+	// through the fixed-function texture enables, which the paths that predate
+	// programs still need; BindFragment does not, because a program says for
+	// itself which kind of map it wants.
+	//
+	// Both are the tail of idImage::Bind and idImage::BindFragment. The LRU
+	// bookkeeping and the load-on-demand above them are the image layer's and
+	// stay there.
+	virtual void			BindImage( idImage *image ) = 0;
+	virtual void			BindImageFragment( idImage *image ) = 0;
+
+	// Nothing on this unit.
+	virtual void			BindNoImage( void ) = 0;
+
+	// One mip level of one face of the bound image. `pixels` is tightly packed
+	// bytes in externalFormat's channel order - GL_RGBA for anything the engine
+	// generated, GL_BGRA_EXT or GL_ALPHA for an uncompressed .dds - whatever
+	// internalFormat asks the GPU to keep them as.
+	//
+	// `face` is 0 for a 2D image and 0..5 for a cube map's six. Which of the
+	// two this is comes from image->type, which the caller has already set.
+	virtual void			UploadImageLevel( idImage *image, int face, int level, int internalFormat,
+											  int width, int height, int externalFormat,
+											  const byte *pixels ) = 0;
+
+	// The same for texels that arrive already compressed out of a .dds, where
+	// the level's size in bytes is not implied by its dimensions.
+	virtual void			UploadCompressedImageLevel( idImage *image, int level, int internalFormat,
+														int width, int height, int numBytes,
+														const byte *data ) = 0;
+
+	// A .dds whose mip chain stops before 1x1 - the level below which nothing
+	// was written, so that sampling does not fall off the end of it and come
+	// back black.
+	virtual void			SetImageMaxLevel( idImage *image, int maxLevel ) = 0;
+
+	// The video and cinematic path: a whole image replaced every frame at a
+	// size that usually has not changed, which is worth telling the API
+	// because it is what lets it keep the storage it already has.
+	virtual void			UploadScratchImage( idImage *image, const byte *data, int cols, int rows ) = 0;
+
+	// The filtering and wrapping the image asks for. Two entry points rather
+	// than one because Doom 3 sets them differently on a cube map - forced
+	// clamp, and none of the anisotropy or LOD bias - and folding the two
+	// together would be a change of behaviour hiding inside a move.
+	virtual void			SetImageFilterAndRepeat( const idImage *image ) = 0;
+	virtual void			SetCubeImageFilterAndRepeat( const idImage *image ) = 0;
+
+	// Re-read the global filtering cvars into every already-uploaded image,
+	// which is what image_filter and image_anisotropy do when they change.
+	virtual void			RefreshImageFilter( const idImage *image ) = 0;
+
+	// The border a TR_CLAMP_TO_BORDER image samples outside itself. One user,
+	// the generated _borderClamp image, whose own edge texels are already zero.
+	virtual void			SetImageBorderColor( const idImage *image, const float rgba[4] ) = 0;
+
+	// The frame, into an image: _currentRender for the post-process and
+	// mirror passes, _currentDepth for soft particles. Whether the image has
+	// to be reallocated to hold it is the backend's, because only the backend
+	// knows what it already has.
+	virtual void			CopyFramebufferToImage( idImage *image, int x, int y,
+													int imageWidth, int imageHeight,
+													bool useOversizedBuffer ) = 0;
+	virtual void			CopyDepthbufferToImage( idImage *image, int x, int y,
+													int imageWidth, int imageHeight,
+													bool useOversizedBuffer ) = 0;
 };
 
 extern idRenderBackend *	renderBackend;

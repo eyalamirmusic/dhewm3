@@ -369,13 +369,13 @@ static void R_BorderClampImage( idImage *image ) {
 		TF_LINEAR /* TF_NEAREST */, false, TR_CLAMP_TO_BORDER, TD_DEFAULT );
 
 	if ( !glConfig.isInitialized ) {
-		// can't call qglTexParameterfv yet
+		// can't set the border colour before there is anything to set it on
 		return;
 	}
 	// explicit zero border
 	float	color[4];
 	color[0] = color[1] = color[2] = color[3] = 0;
-	qglTexParameterfv(GL_TEXTURE_2D, GL_TEXTURE_BORDER_COLOR, color );
+	renderBackend->SetImageBorderColor( image, color );
 }
 
 static void R_RGBA8Image( idImage *image ) {
@@ -999,37 +999,14 @@ static const filterName_t textureFilters[] = {
 	// change all the existing mipmap texture objects with default filtering
 
 	for ( i = 0 ; i < images.Num() ; i++ ) {
-		unsigned int	texEnum = GL_TEXTURE_2D;
-
 		glt = images[ i ];
-
-		switch( glt->type ) {
-		case TT_2D:
-			texEnum = GL_TEXTURE_2D;
-			break;
-		case TT_3D:
-			texEnum = GL_TEXTURE_3D;
-			break;
-		case TT_CUBIC:
-			texEnum = GL_TEXTURE_CUBE_MAP_EXT;
-			break;
-		}
 
 		// make sure we don't start a background load
 		if ( glt->texnum == idImage::TEXTURE_NOT_LOADED ) {
 			continue;
 		}
 		glt->Bind();
-		if ( glt->filter == TF_DEFAULT ) {
-			qglTexParameterf(texEnum, GL_TEXTURE_MIN_FILTER, globalImages->textureMinFilter );
-			qglTexParameterf(texEnum, GL_TEXTURE_MAG_FILTER, globalImages->textureMaxFilter );
-		}
-		if ( glConfig.anisotropicAvailable ) {
-			qglTexParameterf(texEnum, GL_TEXTURE_MAX_ANISOTROPY_EXT, globalImages->textureAnisotropy );
-		}
-		if ( glConfig.textureLODBiasAvailable ) {
-			qglTexParameterf(texEnum, GL_TEXTURE_LOD_BIAS_EXT, globalImages->textureLODBias );
-		}
+		renderBackend->RefreshImageFilter( glt );
 	}
 }
 
@@ -1951,18 +1928,7 @@ BindNull
 ===============
 */
 void idImageManager::BindNull() {
-	tmu_t			*tmu;
-
-	tmu = &backEnd.glState.tmu[backEnd.glState.currenttmu];
-
-	if ( tmu->textureType == TT_CUBIC ) {
-		qglDisable( GL_TEXTURE_CUBE_MAP_EXT );
-	} else if ( tmu->textureType == TT_3D ) {
-		qglDisable( GL_TEXTURE_3D );
-	} else if ( tmu->textureType == TT_2D ) {
-		qglDisable( GL_TEXTURE_2D );
-	}
-	tmu->textureType = TT_DISABLED;
+	renderBackend->BindNoImage();
 }
 
 /*
