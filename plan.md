@@ -6,12 +6,12 @@ app lifecycle and message loop first, GPU rendering (Metal / D3D12) as the real 
 **Status: Phase 0 is done and merged. Phase 1 has landed its gate and its seam.
 Phase 2 is under way: the app shell, the threading, the boot, the input and the
 renderer are in, and the renderer now draws. `dhewm3-eacp` puts **Doom 3's main
-menu on screen through Metal** — every 2D element of it, out of one generic
-material-stage program in eacp's shader EDSL, five compiled pipelines and a
-streaming vertex pool — and now **loads a level and fills its depth buffer**, so
-the world occludes correctly and its ambient stages draw over a black
-silhouette. What is missing from both pictures is the light: the interaction
-program and the stencil shadow pass, steps 4d.2 and 4d.3.**
+menu on screen through Metal**, **loads a level**, and now **lights it** —
+`interaction.vfp` ported into the EDSL, bump, diffuse and specular against each
+light's projection and falloff, at 114 draws and 6332 triangles on a pinned
+camera in `demo_mars_city1`, which is the SDL/GL build's count exactly. What is
+missing is the shadow: nothing occludes a light yet, which is step 4d.3, the
+last of the three the world was broken into.**
 
 Reference implementation for almost everything on the platform side:
 `~/Code/PureDOOM/examples/EACP` — a complete engine hosted on eacp, with its own
@@ -292,10 +292,11 @@ Re-verified against `main` at `be7a749` rather than carried forward on trust.
 *starting* Phase 2 — each degrades the picture or has a workaround, and the list is
 better driven by real content than guessed at now.
 
-That last sentence has now been tested. 12 and 17 are what it turned up — the
-first gaps this port found by walking real content rather than by reading eacp,
-and the first that stopped the next step rather than degrading it — and both are
-closed, in §6 under step 4b′.
+That last sentence has now been tested. 12, 17 and 19 are what it turned up —
+the gaps this port found by walking real content rather than by reading eacp.
+12 and 17 stopped the next step rather than degrading it, and both are closed,
+in §6 under step 4b′. 19 does not stop anything today, because it is D3D12's
+alone and the eacp host is macOS-only for other reasons; it stops Windows.
 
 Numbers are never reused, so a hole is an entry that closed.
 
@@ -392,6 +393,30 @@ Numbers are never reused, so a hole is an entry that closed.
     than a thing that nearly works. Worth knowing that the eacp build draws at
     4x MSAA either way — `GPUView`'s default, which `r_multiSamples` does not
     reach.
+
+19. **A shader can bind four textures on D3D12, and Doom 3's interaction program
+    needs five.** `Lib/eacp/GPU/Windows/D3D12Types.h:25` is
+    `constexpr int maxTextureSlots = 4`, and the render root signature is built
+    out of it: one single-descriptor table per slot, with the storage-buffer
+    registers starting immediately above at `RenderPass::bufferRegisterBase`,
+    which is 4 and is `static_assert`ed to be no lower. `RenderPass-Windows.cpp`
+    drops a `setFragmentTexture` past the fourth without an error. Metal has no
+    such limit — 31 slots on every device eacp runs on — so this is one backend's
+    ceiling rather than a shape both share.
+
+    The interaction program's five are the bump map, the light's falloff, the
+    light's projected image, the diffuse map and the specular map, and none of
+    them can be folded into another: two belong to the light and three to the
+    material, and every one is sampled at its own coordinate. Two of the ARB
+    program's seven *did* fold away — the normalization cube map and the
+    specular ramp are arithmetic now — and five is what is left.
+
+    **Found by writing step 4d.2, which is macOS-only until this is raised.**
+    That is not a delay: the eacp host has been macOS-only since step 2b for a
+    different reason (§8, the Windows host), so this joins the list of things
+    that must be true before Windows rather than blocking anything now. Raising
+    the constant moves `bufferRegisterBase` with it, which is why it is a change
+    to eacp rather than a number to edit.
 
 ### Checked, and *not* gaps
 
@@ -1166,13 +1191,113 @@ and 5.
 shared files — `RenderBackend.h`, `RenderBackend_GL.cpp` and `RenderSystem.cpp`.
 **297 of 297 frames identical** to the step 4b baseline.
 
+#### Step 4d.2 — the interaction program, and the world is lit — **done**
+
+`interaction.vfp` ported into the EDSL as `idEacpInteractionProgram`, driven by
+`RB_CreateSingleDrawInteractions` through a `DrawInteractions` /
+`CreateDrawInteractions` / `DrawInteraction` trio that is
+`RB_ARB2_DrawInteractions` and its two companions rewritten. At
+`GLS_SRCBLEND_ONE | GLS_DSTBLEND_ONE | GLS_DEPTHMASK` and
+`GLS_DEPTHFUNC_EQUAL` over exactly what 4d.1 filled.
+
+**The measurement is the whole result: 114 draws and 6332 triangles on both
+backends, at a pinned camera in `demo_mars_city1`.** The comparison is the
+SDL/GL build at `r_shadows 0`, `r_skipFogLights 1` and `r_skipBlendLights 1` —
+which is what this backend can draw — and it needs no correction term. That is
+worth saying next to 4d.1's, where the same counters read three times apart
+until the shadow half was subtracted out of one side: with `r_shadows 0` there
+are no shadow volumes on either side, so `c_shadowIndexes` is zero and the two
+numbers are the same numbers.
+
+**Two of the ARB program's seven textures do not survive the port, and neither
+is a simplification of what is drawn.** Both exist because an ARB fragment
+program cannot compute what they hold:
+
+- **the normalization cube map**, sampled to turn the interpolated vector to the
+  light into a unit one. `normalize()` does that, and `interaction.vfp` already
+  says so — the half-angle half of its own shader takes the arithmetic road,
+  with the cube map commented out above it.
+- **the specular lookup table**, a 256×1 ramp of `max(0, (d − 0.75) × 4)²`.
+  `R_SpecularTableImage`'s comment says it is "the behavior of the hacked up
+  fragment programs that can't really do a power function". Two multiplies here,
+  and exact rather than quantized to the table's eight bits. The `min(d, 1)` in
+  front of it is the sampler's clamp, which the curve needs and does not have.
+
+**The fifth texture is what makes this step macOS-only, and it is eacp gap 19
+(§5): `maxTextureSlots` is 4 on D3D12.** Bump, falloff, projection, diffuse and
+specular is five, none foldable. Metal has 31.
+
+**An ambient light's direction is a constant, and reproducing it faithfully
+meant reproducing a bug.** The ARB path handles ambient lights by swapping one
+texture — the normalization cube map becomes `_ambient`, whose every texel is
+`tr.ambientLightVector`, so the "direction to the light" comes out the same
+everywhere. There is no cube map here (gap 5) and none is needed, the whole
+point of the substitution being that the answer does not depend on the lookup;
+the constant is a uniform, with `w` selecting it.
+
+What the constant *is*, though, is not `tr.ambientLightVector`.
+`R_AmbientNormalImage` writes the vector's x into the channel a compressed
+normal map keeps x in, which is alpha — and the fragment program applies that
+swizzle to the bump map and not to this one, so what the shader has received
+since 2004 is the texel's rgb with 1.0 where x should be. The uniform is
+computed by encoding and decoding the same way rather than from the vector
+directly, because the game's ambient lighting is what that produces.
+
+**The decomposition is now shared rather than duplicated, and that took a shared
+file.** `RB_CreateSingleDrawInteractions` turns one surface under one light into
+the sequence of primitive interactions a program can draw — multi-stage lights,
+multi-layer surfaces, the nospecular parm, the colour registers — and its own
+comment says it "can be used by different draw_\* backends". It could not be:
+four `qgl` calls sat in the middle of it, setting the modelview matrix, the
+scissor rectangle and the two depth hacks. Those moved out to the two callers,
+each saying them in its own terms — `qglLoadMatrixf` and `glDepthRange` on one
+side, one `SetSpace` on the other, the depth hack being a modified projection
+matrix and a depth range here rather than three pieces of context state.
+
+**Two things this leaves undone and one it cannot do.** There is no stencil
+shadow pass, so a light shines through whatever should be shadowing it — 4d.3,
+warned once. There is no stencil clear either, which is the same step. And
+`r_gammaInShader` has no counterpart: dhewm3 injects `r_brightness` and
+`r_gamma` into every ARB fragment program, and no eacp program applies them.
+At the defaults both are 1 and the injected code is the identity, so it costs
+nothing today and is worth a line in 4e.
+
+**Verified three ways.** The run is clean under `MTL_DEBUG_LAYER=1` with
+`MTL_SHADER_VALIDATION=1`, loading the level and quitting without an assert, at
+**6 programs and 26 pipelines** against 4d.1's 4 and 23 — so the level's whole
+content reaches two of the interaction program's 1024 possible sampling tuples.
+The counters match, above. And the picture matches: the same corridor, the same
+specular on the panel edges, the same normal-mapped floor.
+
+**That last comparison is by eye and has to be, which is worth stating
+precisely.** The eacp build has no screenshot — `R_ReadTiledPixels` reads the
+front buffer, and 4e's render target is what a modern API can offer instead — so
+its frame can only be captured off the screen, while the GL build's comes out of
+the framebuffer. **Those two paths do not agree**: the *same* GL frame reads a
+mean RGB of (27.6, 32.3, 27.1) out of the framebuffer and (35.5, 41.1, 36.8) off
+the screen, a 29% lift from the display's colour management. Against the eacp
+build's own screen grab at (33.7, 39.0, 34.7) that leaves about 5%, over two
+runs that are not on the same animation frame and one of which is at 4× MSAA.
+Which is to say: the tone comparison says nothing yet, and knowing *why* it says
+nothing is the useful part. The counters are the instrument until 4e.
+
+The plan's own stated first result for this step landed too: **the Mars globe on
+the main menu**, which is a `renderDef` with a light on it and the one thing on
+that screen 4c did not draw. It is there, with its terminator and its surface
+relief, and the menu run reports no eacp warnings at all.
+
 ### Shader inventory for Phase 2
 
 Roughly 10–15 EDSL programs, each in the sampling variants §4.3 sizes — 8 worst case
 for interaction, 8 for the generic stage now that the alpha test is a variant of it
 rather than a program beside it, compiled lazily:
 
-- interaction (bump / diffuse / specular) — the port of `interaction.vfp`
+- ~~interaction (bump / diffuse / specular) — the port of `interaction.vfp`~~ —
+  **done**, step 4d.2. Its variants are keyed on *five* samplings rather than the
+  three §4.3 counted, because a light's projected image and its falloff are
+  declared by the light material and vary with it — 1024 combinations, of which
+  the demo's first level reaches two. Not an array, therefore, but a list keyed
+  on the five indices packed two bits apiece.
 - ~~depth fill, with alpha test~~ — **not a program of its own**, which step 4d.1
   found rather than assumed: the depth fill is the generic material stage with the
   colour black and a `setDiscardBelow`, so it is one more *variant* of that one
@@ -1277,21 +1402,30 @@ Phase 2 is the first work that compiles against eacp. In rough order:
        after it can test against it. 89 draws and 4041 triangles at a pinned
        camera, which is the SDL/GL build's count exactly once its shadow half
        is subtracted.
-     - **4d.2. The interaction program.** ← **next.** The port of
-       `interaction.vfp` into the EDSL — bump, diffuse and specular against
-       one light's projection and falloff — driven by
-       `RB_CreateSingleDrawInteractions`, at `GLS_DEPTHFUNC_EQUAL` over what
-       4d.1 filled. The first thing it buys is visible without leaving the
-       main menu: the lit Mars globe, which is a `renderDef` and the one part
-       of that screen 4c does not draw.
-     - **4d.3. The stencil shadow pass.** `RB_StencilShadowPass` and the
-       two-sided depth-fail count. `Apps/GPU/StencilShadows` is the worked
-       example and exists for exactly this moment.
+     - ~~**4d.2. The interaction program.**~~ — **done**, §6.
+       `interaction.vfp` in the EDSL, driven by
+       `RB_CreateSingleDrawInteractions` — which had to stop making `qgl` calls
+       of its own first — at `GLS_DEPTHFUNC_EQUAL` over what 4d.1 filled. 114
+       draws and 6332 triangles at a pinned camera, which is the SDL/GL
+       build's count with no correction term. Two of the ARB program's seven
+       textures became arithmetic; the five that remain are eacp gap 19 on
+       D3D12, which is why this step is macOS-only. The Mars globe on the main
+       menu is lit.
+     - **4d.3. The stencil shadow pass.** ← **next.** `RB_StencilShadowPass`
+       and the two-sided depth-fail count, with the per-light stencil clear
+       that goes with it — `DrawInteractions` says where both belong and warns
+       once that a light currently shines through whatever should be shadowing
+       it. `Apps/GPU/StencilShadows` is the worked example and exists for
+       exactly this moment.
    - **4e. What is left.** Fog and blend lights, the texgen variants
-     (reflect, skybox, wobblesky), subviews and mirrors, and `_currentRender` —
-     which needs the composited frame to live in an app-owned render target
-     that the drawable is blitted from, because a texture cannot be sampled by
-     the pass rendering into it. PureDOOM's `captureTarget`, §3.
+     (reflect, skybox, wobblesky), subviews and mirrors, `r_gammaInShader`
+     (step 4d.2 — the identity at the default settings, and nothing at any
+     other), and `_currentRender` — which needs the composited frame to live in
+     an app-owned render target that the drawable is blitted from, because a
+     texture cannot be sampled by the pass rendering into it. PureDOOM's
+     `captureTarget`, §3. That render target is also what gives the eacp build a
+     `ReadPixels` and so a frame comparable to the GL one's; step 4d.2 measured
+     how far off a screen grab is instead.
 5. **Delete** `glimp.cpp`, `events.cpp`, `threads.cpp`, `neo/sys/linux/`, SDL,
    and fold `dhewm3-eacp` back into `dhewm3`.
 

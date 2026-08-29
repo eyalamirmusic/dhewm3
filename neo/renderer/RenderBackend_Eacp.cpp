@@ -277,6 +277,21 @@ private:
 	void			FillDepthBuffer( drawSurf_t **drawSurfs, int numDrawSurfs );
 	void			FillDepthBufferSurface( const drawSurf_t *surf );
 
+	// RB_ARB2_DrawInteractions, RB_ARB2_CreateDrawInteractions and
+	// RB_ARB2_DrawInteraction. The light half of a view: every light in turn,
+	// each of its surfaces decomposed into the primitive interactions
+	// RB_CreateSingleDrawInteractions produces, added to the frame.
+	void			DrawInteractions( void );
+	void			CreateDrawInteractions( const drawSurf_t *surf );
+
+public:
+	// Reached through R_EacpDrawInteraction below, because
+	// RB_CreateSingleDrawInteractions takes a plain function pointer - it was
+	// written to be shared by the four backends Doom 3 shipped with, and a
+	// member function is not what it asks for.
+	void			DrawInteraction( const drawInteraction_t *din );
+
+private:
 	// RB_STD_DrawShaderPasses and RB_STD_T_RenderShaderPasses, rewritten. Not
 	// ported: what they do with two texture units and six combiner calls is one
 	// expression in idEacpStageProgram, and what they do with a matrix stack is
@@ -308,10 +323,14 @@ private:
 	// GL state sets these instead and DrawIndexed reads them.
 	//
 	// Null means nothing has been prepared, which is what makes a draw arriving
-	// from a path this backend has not written yet - the depth fill, the
-	// interactions, the debug tools - a no-op rather than a draw against
-	// whatever the last one left bound.
-	idEacpStageProgram *				drawProgram;
+	// from a path this backend has not written yet - the shadow volumes, the
+	// fog, the debug tools - a no-op rather than a draw against whatever the
+	// last one left bound.
+	//
+	// The program is a GPU::ShaderProgram rather than either of the two
+	// concrete ones, because a draw is issued the same way whichever wrote it:
+	// setUniforms and bindTextures are the base's.
+	GPU::ShaderProgram *				drawProgram;
 	const GPU::RenderPipeline *			drawPipeline;
 	const GPU::Buffer *					drawVertices;
 
@@ -342,10 +361,25 @@ private:
 	bool				warnedClipPlanes;
 	bool				warnedSubviewPass;
 	bool				warnedReadPixels;
+	bool				warnedShadows;
 };
 
 static idRenderBackendEacp	renderBackendEacp;
 idRenderBackend *			renderBackend = &renderBackendEacp;
+
+/*
+====================
+R_EacpDrawInteraction
+
+The trampoline RB_CreateSingleDrawInteractions calls back through. It takes a
+plain function pointer - it was written to be shared by the four backends Doom 3
+shipped with, and a member function is not what it asks for - so this is here,
+where there is a backend to call.
+====================
+*/
+static void R_EacpDrawInteraction( const drawInteraction_t *din ) {
+	renderBackendEacp.DrawInteraction( din );
+}
 
 idRenderBackendEacp::idRenderBackendEacp() {
 	pass = NULL;
@@ -365,6 +399,7 @@ idRenderBackendEacp::idRenderBackendEacp() {
 	warnedClipPlanes = false;
 	warnedSubviewPass = false;
 	warnedReadPixels = false;
+	warnedShadows = false;
 }
 
 /*
@@ -688,7 +723,8 @@ idRenderBackendEacp::DrawView
 
 RB_STD_DrawView. The sequence rather than the calls: fill the depth buffer, add
 each light through the stencil, blend the passes that do not depend on a light,
-fog. Two of those four are still missing and each says so where it would be.
+fog. Three of the four are here; the stencil half of the second is 4d.3 and the
+fourth is 4e, and each says so where it would be.
 ======================
 */
 void idRenderBackendEacp::DrawView( void ) {
@@ -718,8 +754,7 @@ void idRenderBackendEacp::DrawView( void ) {
 
 	FillDepthBuffer( drawSurfs, numDrawSurfs );
 
-	// The lights are 4d.2 and 4d.3: the interaction program and the stencil
-	// shadow pass. Until then a lit surface is the black the depth fill left.
+	DrawInteractions();
 
 	const int	processed = DrawShaderPasses( drawSurfs, numDrawSurfs );
 
@@ -1030,6 +1065,315 @@ void idRenderBackendEacp::FillDepthBufferSurface( const drawSurf_t *surf ) {
 
 		DrawStage( tri, draw );
 	}
+}
+
+/*
+================================================================================
+
+	The lights.
+
+	Step 4d.2. What the depth fill was for: every fragment is now in the depth
+	buffer at exactly its own depth, so a light can be added at
+	GLS_DEPTHFUNC_EQUAL and touch the surface that survived and nothing behind
+	it.
+
+	The decomposition is shared with the OpenGL backend and deliberately so.
+	RB_CreateSingleDrawInteractions turns one surface under one light into the
+	sequence of primitive (bump, diffuse, specular) interactions the program can
+	draw, which is a hundred lines of material semantics - multi-stage lights,
+	multi-layer surfaces, the nospecular parm, the colour registers - and none
+	of it is about an API. It was written to be shared by the four backends
+	Doom 3 shipped with, and this port is the first thing to take it up on that.
+
+================================================================================
+*/
+
+/*
+====================
+R_EacpAmbientLightVector
+
+An ambient light's direction, which is a constant because an ambient light has
+none.
+
+The ARB path expresses that by swapping one texture: the normalization cube map
+that turns the interpolated vector to the light into a unit one becomes
+_ambient, whose every texel is the same value, so the "direction to the light"
+comes out the same everywhere on every surface. This backend has no cube map
+(gap 5) and needs none - the whole point of the substitution is that the answer
+does not depend on the lookup - so the constant is computed here and handed over
+as a uniform.
+
+It is read *back out of* R_AmbientNormalImage rather than taken from
+tr.ambientLightVector directly, and the difference is not rounding. That
+generator writes the vector's x into the channel a compressed normal map keeps x
+in, which is alpha; the fragment program applies that swizzle to the bump map
+and not to this one, so what the shader has always received is the texel's rgb
+with 1.0 where x should be. Reproducing the vector faithfully means reproducing
+that, because it is what the game has looked like since 2004.
+====================
+*/
+static Float4 R_EacpAmbientLightVector( bool ambientLight ) {
+	if ( !ambientLight ) {
+		// w = 0: the shader keeps the direction it computed.
+		return asFloat4( 0.0f, 0.0f, 0.0f, 0.0f );
+	}
+
+	const int	red = ( globalImages->image_useNormalCompression.GetInteger() == 1 ) ? 0 : 3;
+	const int	alpha = ( red == 0 ) ? 3 : 0;
+
+	byte	texel[4];
+
+	texel[red] = (byte)( 255 * tr.ambientLightVector[0] );
+	texel[1] = (byte)( 255 * tr.ambientLightVector[1] );
+	texel[2] = (byte)( 255 * tr.ambientLightVector[2] );
+	texel[alpha] = 255;
+
+	// The MAD that decodes a normal map's [0, 1] into a direction's [-1, 1].
+	return asFloat4( texel[0] / 255.0f * 2.0f - 1.0f,
+					 texel[1] / 255.0f * 2.0f - 1.0f,
+					 texel[2] / 255.0f * 2.0f - 1.0f,
+					 1.0f );
+}
+
+/*
+======================
+idRenderBackendEacp::DrawInteractions
+
+RB_ARB2_DrawInteractions: every light in the view, added to the frame.
+
+Two of its parts are missing and both are step 4d.3's. There is no stencil
+shadow pass, so a light lights everything inside its volume whether or not
+something stands between - and there is therefore no stencil clear either, which
+is the other half of the same step. What is here is the light itself.
+======================
+*/
+void idRenderBackendEacp::DrawInteractions( void ) {
+	// A 2D view has no lights, and the loop below would find none - but it also
+	// has no depth buffer filled to test against, so saying so is clearer than
+	// relying on the list being empty.
+	if ( !backEnd.viewDef->viewEntitys ) {
+		return;
+	}
+
+	for ( viewLight_t *vLight = backEnd.viewDef->viewLights ; vLight ; vLight = vLight->next ) {
+		backEnd.vLight = vLight;
+
+		// Both are 4e: a fog light is a volume of two blended passes and a
+		// blend light a projected multiply, and neither goes through the
+		// interaction program.
+		if ( vLight->lightShader->IsFogLight() ) {
+			continue;
+		}
+
+		if ( vLight->lightShader->IsBlendLight() ) {
+			continue;
+		}
+
+		if ( !vLight->localInteractions && !vLight->globalInteractions
+			 && !vLight->translucentInteractions ) {
+			continue;
+		}
+
+		// 4d.3: RB_StencilShadowPass( vLight->globalShadows ) runs here and
+		// again between the two lists below, with the stencil buffer cleared
+		// over the light's scissor rectangle ahead of both. Until it does, a
+		// shadow-casting light is drawn as if nothing cast one.
+		if ( ( vLight->globalShadows || vLight->localShadows ) && !warnedShadows ) {
+			warnedShadows = true;
+			common->Warning( "eacp: the stencil shadow pass is not implemented, so a "
+							 "light shines through whatever should be shadowing it" );
+		}
+
+		CreateDrawInteractions( vLight->localInteractions );
+		CreateDrawInteractions( vLight->globalInteractions );
+
+		// A translucent surface is never in the depth buffer the fill wrote, so
+		// it cannot be added at EQUAL - and it is never stencil shadowed
+		// either, which is why it comes after both shadow passes rather than
+		// between them.
+		if ( r_skipTranslucent.GetBool() ) {
+			continue;
+		}
+
+		backEnd.depthFunc = GLS_DEPTHFUNC_LESS;
+		CreateDrawInteractions( vLight->translucentInteractions );
+		backEnd.depthFunc = GLS_DEPTHFUNC_EQUAL;
+	}
+}
+
+/*
+======================
+idRenderBackendEacp::CreateDrawInteractions
+
+RB_ARB2_CreateDrawInteractions: one light's list of surfaces.
+
+Everything the OpenGL version does to bind a program and enable five vertex
+attribute arrays is gone - the program is looked up per draw and the attributes
+are the vertex layout the shader pulled out of eacpDrawVert_t - and what is left
+is the two things that really are per surface: where it is, and where its
+vertices went.
+======================
+*/
+void idRenderBackendEacp::CreateDrawInteractions( const drawSurf_t *surf ) {
+	if ( !surf ) {
+		return;
+	}
+
+	// Constant for every draw in this list, and read back off backEnd.glState
+	// by DrawInteraction - which is how the state reaches a pipeline on this
+	// backend, SetState having nothing to set.
+	SetState( GLS_SRCBLEND_ONE | GLS_DSTBLEND_ONE | GLS_DEPTHMASK | backEnd.depthFunc );
+
+	for ( ; surf ; surf = surf->nextOnLight ) {
+		if ( !surf->geo || !surf->geo->ambientCache ) {
+			continue;
+		}
+
+		// The three things RB_CreateSingleDrawInteractions used to do with GL
+		// calls of its own, and now leaves to whoever is driving it: the space,
+		// the scissor and the depth hack. The last is the whole of SetSpace on
+		// this backend - a hacked projection matrix and the depth range that
+		// goes with it, rather than three pieces of context state - so there is
+		// nothing here for an RB_EnterWeaponDepthHack to be, and nothing to
+		// leave afterwards either.
+		SetSpace( surf->space, surf->space->modelDepthHack );
+
+		if ( r_useScissor.GetBool() && !backEnd.currentScissor.Equals( surf->scissorRect ) ) {
+			backEnd.currentScissor = surf->scissorRect;
+			SetScissor( backEnd.currentScissor );
+		}
+
+		// Once per surface, however many primitive interactions it decomposes
+		// into: a two-layer material under a two-stage light is four draws over
+		// one piece of geometry.
+		const idDrawVert *	vertices =
+			(const idDrawVert *)vertexCache.Position( surf->geo->ambientCache );
+
+		drawVertices = &eacpRenderProgs.StreamVertices(
+			vertices, (std::size_t)surf->geo->numVerts * sizeof( idDrawVert ) );
+
+		RB_CreateSingleDrawInteractions( surf, R_EacpDrawInteraction );
+	}
+
+	drawProgram = NULL;
+	drawPipeline = NULL;
+	drawVertices = NULL;
+}
+
+/*
+======================
+idRenderBackendEacp::DrawInteraction
+
+RB_ARB2_DrawInteraction: one bump map, one diffuse map and one specular map,
+under one stage of one light.
+
+The OpenGL version is sixteen glProgramEnvParameter4fvARB calls against numbered
+program environment slots and five texture binds, with two more textures bound
+once per light list around it. Here every parameter has a name and the seven
+textures are five, because the two the ARB program could not compute without -
+the normalization cube map and the specular ramp - are arithmetic in a language
+that has none of that shader's limits.
+======================
+*/
+void idRenderBackendEacp::DrawInteraction( const drawInteraction_t *din ) {
+	idEacpRenderProgs::interactionDraw_t	draw =
+		eacpRenderProgs.InteractionDraw( din->bumpImage, din->lightFalloffImage,
+										 din->lightImage, din->diffuseImage,
+										 din->specularImage,
+										 backEnd.glState.glStateBits,
+										 backEnd.glState.faceCulling );
+
+	if ( !draw.pipeline ) {
+		return;
+	}
+
+	const idImage *	images[5] = { din->bumpImage, din->lightFalloffImage, din->lightImage,
+								  din->diffuseImage, din->specularImage };
+	GPU::Texture *	textures[5];
+
+	for ( int i = 0 ; i < 5 ; i++ ) {
+		textures[i] = images[i] ? TextureFor( images[i] ) : NULL;
+
+		if ( !textures[i] ) {
+			// An image the upload path turned away, exactly as in DrawStage -
+			// and one more likely here, since a light's projected image is
+			// often a .dds this build cannot read.
+			if ( !warnedMissingTexture ) {
+				warnedMissingTexture = true;
+				common->Warning( "eacp: '%s' has no texture on the GPU, so a surface will not draw",
+								 images[i] ? images[i]->imgName.c_str() : "(none)" );
+			}
+			return;
+		}
+	}
+
+	idEacpInteractionProgram *	program = draw.program;
+
+	program->modelViewProjection = asFloat4x4( modelViewProjection );
+
+	program->localLightOrigin = asFloat4( din->localLightOrigin[0], din->localLightOrigin[1],
+										  din->localLightOrigin[2], din->localLightOrigin[3] );
+	program->localViewOrigin = asFloat4( din->localViewOrigin[0], din->localViewOrigin[1],
+										 din->localViewOrigin[2], din->localViewOrigin[3] );
+
+	// The four planes of the light's projection, in the surface's own
+	// coordinates and with the light stage's texture matrix already baked in by
+	// RB_BakeTextureMatrixIntoTexgen.
+	const idVec4 *	project = din->lightProjection;
+
+	program->lightProjectionS = asFloat4( project[0][0], project[0][1], project[0][2], project[0][3] );
+	program->lightProjectionT = asFloat4( project[1][0], project[1][1], project[1][2], project[1][3] );
+	program->lightProjectionQ = asFloat4( project[2][0], project[2][1], project[2][2], project[2][3] );
+	program->lightFalloffS = asFloat4( project[3][0], project[3][1], project[3][2], project[3][3] );
+
+	program->bumpMatrixS = asFloat4( din->bumpMatrix[0][0], din->bumpMatrix[0][1],
+									 din->bumpMatrix[0][2], din->bumpMatrix[0][3] );
+	program->bumpMatrixT = asFloat4( din->bumpMatrix[1][0], din->bumpMatrix[1][1],
+									 din->bumpMatrix[1][2], din->bumpMatrix[1][3] );
+	program->diffuseMatrixS = asFloat4( din->diffuseMatrix[0][0], din->diffuseMatrix[0][1],
+										din->diffuseMatrix[0][2], din->diffuseMatrix[0][3] );
+	program->diffuseMatrixT = asFloat4( din->diffuseMatrix[1][0], din->diffuseMatrix[1][1],
+										din->diffuseMatrix[1][2], din->diffuseMatrix[1][3] );
+	program->specularMatrixS = asFloat4( din->specularMatrix[0][0], din->specularMatrix[0][1],
+										 din->specularMatrix[0][2], din->specularMatrix[0][3] );
+	program->specularMatrixT = asFloat4( din->specularMatrix[1][0], din->specularMatrix[1][1],
+										 din->specularMatrix[1][2], din->specularMatrix[1][3] );
+
+	// The same (modulate, add) pair the generic material stage uses, and here it
+	// is ±1 and 0 rather than a colour: the constant colour is not folded in,
+	// because it is already the diffuse and specular uniforms below.
+	switch ( din->vertexColor ) {
+	case SVC_MODULATE:
+		program->colorModulate = asFloat4( 1.0f, 1.0f, 1.0f, 1.0f );
+		program->colorAdd = asFloat4( 0.0f, 0.0f, 0.0f, 0.0f );
+		break;
+	case SVC_INVERSE_MODULATE:
+		program->colorModulate = asFloat4( -1.0f, -1.0f, -1.0f, -1.0f );
+		program->colorAdd = asFloat4( 1.0f, 1.0f, 1.0f, 1.0f );
+		break;
+	default:
+		program->colorModulate = asFloat4( 0.0f, 0.0f, 0.0f, 0.0f );
+		program->colorAdd = asFloat4( 1.0f, 1.0f, 1.0f, 1.0f );
+		break;
+	}
+
+	program->diffuseColor = asFloat4( din->diffuseColor[0], din->diffuseColor[1],
+									  din->diffuseColor[2], din->diffuseColor[3] );
+	program->specularColor = asFloat4( din->specularColor[0], din->specularColor[1],
+									   din->specularColor[2], din->specularColor[3] );
+
+	program->ambientLightVector = R_EacpAmbientLightVector( din->ambientLight != 0 );
+
+	program->bumpImage = *textures[0];
+	program->lightFalloffImage = *textures[1];
+	program->lightImage = *textures[2];
+	program->diffuseImage = *textures[3];
+	program->specularImage = *textures[4];
+
+	drawProgram = program;
+	drawPipeline = draw.pipeline;
+
+	RB_DrawElementsWithCounters( din->surf->geo );
 }
 
 /*

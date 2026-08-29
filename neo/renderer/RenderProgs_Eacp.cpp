@@ -60,6 +60,13 @@ static_assert( sizeof( eacpDrawVert_t ) == sizeof( idDrawVert ),
 			   "eacpDrawVert_t must be idDrawVert's layout exactly" );
 static_assert( offsetof( eacpDrawVert_t, st ) == offsetof( idDrawVert, st ),
 			   "eacpDrawVert_t::st must sit where idDrawVert::st does" );
+static_assert( offsetof( eacpDrawVert_t, normal ) == offsetof( idDrawVert, normal ),
+			   "eacpDrawVert_t::normal must sit where idDrawVert::normal does" );
+static_assert( offsetof( eacpDrawVert_t, tangent ) == offsetof( idDrawVert, tangents ),
+			   "eacpDrawVert_t::tangent must sit where idDrawVert::tangents[0] does" );
+static_assert( offsetof( eacpDrawVert_t, bitangent )
+			   == offsetof( idDrawVert, tangents ) + sizeof( idVec3 ),
+			   "eacpDrawVert_t::bitangent must sit where idDrawVert::tangents[1] does" );
 static_assert( offsetof( eacpDrawVert_t, color ) == offsetof( idDrawVert, color ),
 			   "eacpDrawVert_t::color must sit where idDrawVert::color does" );
 
@@ -127,6 +134,157 @@ void idEacpStageProgram::define( void ) {
 	}
 
 	setFragment( fragment );
+}
+
+/*
+================================================================================
+
+	idEacpInteractionProgram
+
+================================================================================
+*/
+
+idEacpInteractionProgram::idEacpInteractionProgram( const sampling_t &sampling ) {
+	// Before compile(), for the same reason the stage program does it: the
+	// build walk reads each texture's sampling to place the static sampler the
+	// generated source points at.
+	bumpImage.sampling = sampling.bump;
+	lightFalloffImage.sampling = sampling.falloff;
+	lightImage.sampling = sampling.projection;
+	diffuseImage.sampling = sampling.diffuse;
+	specularImage.sampling = sampling.specular;
+
+	compile();
+}
+
+/*
+====================
+idEacpInteractionProgram::define
+
+interaction.vfp, both halves of it, as one expression.
+
+The vertex half is a change of coordinates: the vectors to the light and to the
+eye, rotated into the surface's tangent space by the three basis vectors the
+vertex carries, plus six texture coordinates that are each two dot products.
+Nothing there is a matrix multiply, which is why the uniforms are rows rather
+than matrices - the original is written in DP4s for the same reason.
+
+The fragment half is the lighting: a bump-mapped N.L, modulated by the light's
+projected image and its falloff, times a diffuse term and a specular one.
+====================
+*/
+void idEacpInteractionProgram::define( void ) {
+	auto	position = vertexInput( &eacpDrawVert_t::xyz );
+	auto	texcoord = vertexInput( &eacpDrawVert_t::st );
+	auto	normal = vertexInput( &eacpDrawVert_t::normal );
+	auto	tangent = vertexInput( &eacpDrawVert_t::tangent );
+	auto	bitangent = vertexInput( &eacpDrawVert_t::bitangent );
+	auto	vertexColor = vertexInput( &eacpDrawVert_t::color );
+
+	auto	model = GPU::float4( position, 1.0f );
+
+	setPosition( modelViewProjection * model );
+
+	// The two vectors the lighting is made of, in model space. localLightOrigin
+	// carries w = 0 and localViewOrigin w = 1, which the ARB program relies on
+	// and this does not: the subtraction is over xyz here and says so.
+	auto	toLight = localLightOrigin.xyz() - position;
+	auto	toView = localViewOrigin.xyz() - position;
+
+	// Tangent space is (tangent, bitangent, normal), which is idDrawVert's
+	// tangents[0], tangents[1] and normal - and *not* the order the comment at
+	// the top of interaction.vfp gives for its vertex attributes. The comment
+	// is stale; RB_ARB2_CreateDrawInteractions is where the attributes are
+	// really bound, and this follows that.
+	auto	inTangentSpace = [&]( const GPU::Float3 &v ) {
+		return GPU::float3( GPU::dot( tangent, v ),
+							GPU::dot( bitangent, v ),
+							GPU::dot( normal, v ) );
+	};
+
+	// The half-angle vector, which is the sum of the two unit vectors and is
+	// deliberately left unnormalized here: the original normalizes it in the
+	// fragment shader, where the interpolated sum is what needs the length
+	// taken out of it.
+	auto	halfAngle = GPU::normalize( toLight ) + GPU::normalize( toView );
+
+	// (s, t, 0, 1) - a two-component vertex attribute read by a DP4, which is
+	// what fills in the z and the w the material's matrix rows are written
+	// against.
+	auto	surfaceCoord = GPU::float4( texcoord, 0.0f, 1.0f );
+
+	auto	textureCoord = [&]( const GPU::Float4 &s, const GPU::Float4 &t ) {
+		return GPU::float2( GPU::dot( surfaceCoord, s ), GPU::dot( surfaceCoord, t ) );
+	};
+
+	auto	tangentLight = varying( inTangentSpace( toLight ) );
+	auto	tangentHalf = varying( inTangentSpace( halfAngle ) );
+
+	auto	bumpCoord = varying( textureCoord( bumpMatrixS, bumpMatrixT ) );
+	auto	diffuseCoord = varying( textureCoord( diffuseMatrixS, diffuseMatrixT ) );
+	auto	specularCoord = varying( textureCoord( specularMatrixS, specularMatrixT ) );
+
+	// The falloff is a one-dimensional ramp read down the middle of a 2D image,
+	// which is where the 0.5 comes from: it is the t of interaction.vfp's
+	// defaultTexCoord, the constant the vertex program fills every unset
+	// coordinate with.
+	auto	falloffCoord = GPU::float2( varying( GPU::dot( model, lightFalloffS ) ), 0.5f );
+
+	// The projected image, still homogeneous - the divide is the fragment's,
+	// because that is what a projective texture read is.
+	auto	projected = varying( GPU::float3( GPU::dot( model, lightProjectionS ),
+											  GPU::dot( model, lightProjectionT ),
+											  GPU::dot( model, lightProjectionQ ) ) );
+
+	auto	surfaceColor = varying( vertexColor * colorModulate + colorAdd );
+
+	// The bump map, with x read out of the alpha channel. That is not a format
+	// quirk this port is working around: idImage::GenerateImage swaps red and
+	// alpha for every normal map it uploads, compressed or not, "so we only
+	// have to use one fragment program" - so alpha is where x lives on every
+	// bump map the engine has, including the generated flat one.
+	auto	bumpTexel = GPU::sample( bumpImage, bumpCoord );
+	auto	localNormal = bumpTexel.wyz() * 2.0f - 1.0f;
+
+	// The direction to the light in tangent space, per fragment. The original
+	// gets this by sampling a cube map whose texels are a normalize(), which is
+	// the one thing an ARB fragment program cannot compute; the .vfp keeps the
+	// arithmetic version beside it, commented out, and this is that version.
+	//
+	// An ambient light has no direction at all - the ARB path swaps that cube
+	// map for one whose every texel is the same vector - so w selects a
+	// constant instead. It is 0 or 1, which makes this a choice rather than a
+	// blend.
+	auto	lightVector = GPU::normalize( tangentLight ) * ( 1.0f - ambientLightVector.w() )
+		+ ambientLightVector.xyz() * ambientLightVector.w();
+
+	auto	lightAmount = GPU::dot( lightVector, localNormal );
+
+	auto	projection = GPU::sample( lightImage, projected.xy() / projected.z() );
+	auto	falloff = GPU::sample( lightFalloffImage, falloffCoord );
+
+	auto	light = projection * falloff * lightAmount;
+
+	auto	diffuse = GPU::sample( diffuseImage, diffuseCoord ) * diffuseColor;
+
+	// The specular ramp, which is a texture in the original and two multiplies
+	// here. R_SpecularTableImage tabulates max( 0, (d - 0.75) * 4 )^2 into a
+	// 256x1 clamped image, and says in its own comment that it exists because
+	// the fragment program "can't really do a power function" - so the curve is
+	// the intent and the table is the workaround.
+	//
+	// The min is the clamp the sampler was doing: a table read past its end
+	// repeats the last texel, and the curve does not stop climbing.
+	auto	specularDot = GPU::dot( GPU::normalize( tangentHalf ), localNormal );
+	auto	ramp = GPU::max( ( GPU::min( specularDot, 1.0f ) - 0.75f ) * 4.0f, 0.0f );
+
+	auto	specularTexel = GPU::sample( specularImage, specularCoord );
+
+	// Twice the specular map, which is the ADD in the original: the maps are
+	// authored half-bright so that a highlight has somewhere to go.
+	auto	specular = ramp * ramp * specularColor * ( specularTexel + specularTexel );
+
+	setFragment( light * ( diffuse + specular ) * surfaceColor );
 }
 
 /*
@@ -317,6 +475,18 @@ void idEacpRenderProgs::Shutdown( void ) {
 			variant.program.reset();
 		}
 	}
+
+	for ( int i = 0 ; i < interactions.size() ; i++ ) {
+		interactionVariant_t *	variant = interactions[i];
+
+		for ( int j = 0 ; j < variant->pipelines.size() ; j++ ) {
+			delete variant->pipelines[j].pipeline;
+		}
+
+		delete variant;
+	}
+
+	interactions.clear();
 }
 
 int idEacpRenderProgs::NumPrograms( void ) const {
@@ -327,6 +497,12 @@ int idEacpRenderProgs::NumPrograms( void ) const {
 			if ( variants[i][test].program.has_value() ) {
 				total++;
 			}
+		}
+	}
+
+	for ( int i = 0 ; i < interactions.size() ; i++ ) {
+		if ( interactions[i]->program.has_value() ) {
+			total++;
 		}
 	}
 
@@ -342,7 +518,74 @@ int idEacpRenderProgs::NumPipelines( void ) const {
 		}
 	}
 
+	for ( int i = 0 ; i < interactions.size() ; i++ ) {
+		total += interactions[i]->pipelines.size();
+	}
+
 	return total;
+}
+
+/*
+====================
+idEacpRenderProgs::BuildPipeline
+
+Doom 3's state, compiled. Both programs come through here because the state is
+the material's rather than the program's: an interaction is (ONE, ONE) with the
+depth write off and the generic stage is whatever the .mtr asked for, but what
+either one *is* to the API is the same object built the same way.
+
+The two things a pipeline needs that are not state - the source it runs and the
+vertices it reads - are the arguments, because they are the only part that
+differs between the two callers.
+====================
+*/
+GPU::RenderPipeline *idEacpRenderProgs::BuildPipeline( const GPU::ShaderLibrary &library,
+													   const GPU::VertexLayout &layout,
+													   int stateBits, int cullType ) {
+	eacp::GPU::GPUView *	view = R_EacpGetView();
+
+	if ( !view ) {
+		return NULL;
+	}
+
+	GPU::RenderPipelineDescriptor	descriptor;
+
+	descriptor.library = &library;
+	descriptor.vertexLayout = layout;
+	descriptor.topology = GPU::PrimitiveTopology::Triangles;
+
+	// The drawable's, and the view's own multisampling. Both backends reject a
+	// draw whose pipeline disagrees with the pass it is issued into.
+	descriptor.colorFormat = GPU::PixelFormat::BGRA8Unorm;
+	descriptor.sampleCount = view->sampleCount();
+
+	descriptor.blend = R_EacpBlendState( stateBits );
+	descriptor.colorWriteMask = R_EacpColorWriteMask( stateBits );
+
+	// The attachment carries both planes, so every pipeline drawing into it has
+	// to say so - including one that only wants the depth test, and including
+	// one that wants neither. What decides whether the test runs is the
+	// comparison: a 2D view is Always with no write, which is what
+	// RB_BeginDrawingView's glDisable( GL_DEPTH_TEST ) means.
+	descriptor.depth = true;
+	descriptor.depthCompare = R_EacpDepthCompare( stateBits );
+	descriptor.depthWrite = !( stateBits & GLS_DEPTHMASK );
+
+	// StencilFace's defaults are always-test, never-write, which is exactly
+	// glDisable( GL_STENCIL_TEST ). The shadow pass sets them; step 4d.3.
+	descriptor.stencil = true;
+
+	descriptor.cullMode = R_EacpCullMode( cullType );
+
+	GPU::RenderPipeline *	pipeline = new GPU::RenderPipeline( GPU::Device::shared(), descriptor );
+
+	if ( !pipeline->isValid() ) {
+		common->Warning( "eacp: no pipeline for state 0x%x, cull %i", stateBits, cullType );
+		delete pipeline;
+		return NULL;
+	}
+
+	return pipeline;
 }
 
 /*
@@ -397,54 +640,119 @@ idEacpRenderProgs::stageDraw_t idEacpRenderProgs::StageDraw( const idImage *imag
 		}
 	}
 
-	eacp::GPU::GPUView *	view = R_EacpGetView();
+	statePipeline_t	entry;
 
-	if ( !view ) {
+	entry.stateBits = pipelineBits;
+	entry.cullType = cullType;
+	entry.pipeline = BuildPipeline( *variant.library, variant.program->vertexLayout(),
+									pipelineBits, cullType );
+
+	variant.pipelines.add( entry );
+
+	draw.pipeline = entry.pipeline;
+
+	return draw;
+}
+
+/*
+====================
+idEacpRenderProgs::InteractionDraw
+
+The same two lookups for one light against one surface, keyed on all five of the
+program's textures at once.
+
+Five two-bit sampling indices is a key space of 1024, which is why this is a
+list searched linearly rather than the array the stage program's cache is: a
+level reaches a handful of the thousand, and the search is a comparison of one
+int against a vector that never grows past what the content contains.
+
+That the *light's* two images count is not an oversight of plan.md section 4.3,
+which sized the interaction program at eight on its three material-controlled
+maps - it is the part that section did not look at. A light's projected image
+and its falloff are declared by the light material, so a light that repeats
+where its neighbour clamps is a second program, and a projection sampled with
+the wrong address mode tiles a light across a level rather than dimming it.
+====================
+*/
+idEacpRenderProgs::interactionDraw_t
+idEacpRenderProgs::InteractionDraw( const idImage *bump, const idImage *falloff,
+									const idImage *projection, const idImage *diffuse,
+									const idImage *specular,
+									int stateBits, int cullType ) {
+	interactionDraw_t	draw;
+
+	draw.program = NULL;
+	draw.pipeline = NULL;
+
+	idEacpInteractionProgram::sampling_t	sampling;
+
+	sampling.bump = R_EacpSampling( bump );
+	sampling.falloff = R_EacpSampling( falloff );
+	sampling.projection = R_EacpSampling( projection );
+	sampling.diffuse = R_EacpSampling( diffuse );
+	sampling.specular = R_EacpSampling( specular );
+
+	const int	key = GPU::samplingIndex( sampling.bump )
+		| ( GPU::samplingIndex( sampling.falloff ) << 2 )
+		| ( GPU::samplingIndex( sampling.projection ) << 4 )
+		| ( GPU::samplingIndex( sampling.diffuse ) << 6 )
+		| ( GPU::samplingIndex( sampling.specular ) << 8 );
+
+	interactionVariant_t *	variant = NULL;
+
+	for ( int i = 0 ; i < interactions.size() ; i++ ) {
+		if ( interactions[i]->key == key ) {
+			variant = interactions[i];
+			break;
+		}
+	}
+
+	if ( !variant ) {
+		variant = new interactionVariant_t;
+		variant->key = key;
+		variant->program.emplace( sampling );
+		variant->library.emplace( GPU::Device::shared(), variant->program->source() );
+
+		interactions.add( variant );
+
+		if ( !variant->library->isValid() ) {
+			common->Warning( "eacp: the interaction shader failed to compile" );
+			variant->program.reset();
+			return draw;
+		}
+	}
+
+	if ( !variant->program.has_value() ) {
 		return draw;
 	}
 
-	GPU::RenderPipelineDescriptor	descriptor;
+	draw.program = &*variant->program;
 
-	descriptor.library = &*variant.library;
-	descriptor.vertexLayout = variant.program->vertexLayout();
-	descriptor.topology = GPU::PrimitiveTopology::Triangles;
+	// Only two states ever reach here - GLS_DEPTHFUNC_EQUAL over what the depth
+	// fill wrote, and GLS_DEPTHFUNC_LESS for the translucent surfaces that were
+	// never in it - but they are masked out of the bitfield the same way the
+	// stage program's are, because the caller passes GL_State's whole word.
+	const int	pipelineBits = stateBits
+		& ( GLS_SRCBLEND_BITS | GLS_DSTBLEND_BITS
+			| GLS_DEPTHMASK | GLS_REDMASK | GLS_GREENMASK | GLS_BLUEMASK | GLS_ALPHAMASK
+			| GLS_DEPTHFUNC_ALWAYS | GLS_DEPTHFUNC_EQUAL );
 
-	// The drawable's, and the view's own multisampling. Both backends reject a
-	// draw whose pipeline disagrees with the pass it is issued into.
-	descriptor.colorFormat = GPU::PixelFormat::BGRA8Unorm;
-	descriptor.sampleCount = view->sampleCount();
-
-	descriptor.blend = R_EacpBlendState( pipelineBits );
-	descriptor.colorWriteMask = R_EacpColorWriteMask( pipelineBits );
-
-	// The attachment carries both planes, so every pipeline drawing into it has
-	// to say so - including one that only wants the depth test, and including
-	// one that wants neither. What decides whether the test runs is the
-	// comparison: a 2D view is Always with no write, which is what
-	// RB_BeginDrawingView's glDisable( GL_DEPTH_TEST ) means.
-	descriptor.depth = true;
-	descriptor.depthCompare = R_EacpDepthCompare( pipelineBits );
-	descriptor.depthWrite = !( pipelineBits & GLS_DEPTHMASK );
-
-	// StencilFace's defaults are always-test, never-write, which is exactly
-	// glDisable( GL_STENCIL_TEST ). The shadow pass sets them; step 4d.3.
-	descriptor.stencil = true;
-
-	descriptor.cullMode = R_EacpCullMode( cullType );
+	for ( int i = 0 ; i < variant->pipelines.size() ; i++ ) {
+		if ( variant->pipelines[i].stateBits == pipelineBits
+			 && variant->pipelines[i].cullType == cullType ) {
+			draw.pipeline = variant->pipelines[i].pipeline;
+			return draw;
+		}
+	}
 
 	statePipeline_t	entry;
 
 	entry.stateBits = pipelineBits;
 	entry.cullType = cullType;
-	entry.pipeline = new GPU::RenderPipeline( GPU::Device::shared(), descriptor );
+	entry.pipeline = BuildPipeline( *variant->library, variant->program->vertexLayout(),
+									pipelineBits, cullType );
 
-	if ( !entry.pipeline->isValid() ) {
-		common->Warning( "eacp: no pipeline for state 0x%x, cull %i", pipelineBits, cullType );
-		delete entry.pipeline;
-		entry.pipeline = NULL;
-	}
-
-	variant.pipelines.add( entry );
+	variant->pipelines.add( entry );
 
 	draw.pipeline = entry.pipeline;
 

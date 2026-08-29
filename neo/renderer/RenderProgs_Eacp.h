@@ -82,6 +82,12 @@ inline Float4x4 asFloat4x4( const float m[16] ) {
 	four bytes read as 0..1, which is what UNorm8x4 declares and what a plain
 	byte[4] would have been taken for four separate floats.
 
+	idDrawVert's tangents are one idVec3[2] and here they are two members,
+	because a vertex attribute is pulled out of this struct by a pointer to the
+	field it comes from - and a pointer to float[2][3] names both tangents at
+	once, which is not an attribute. Same twenty-four bytes at the same two
+	offsets, said as the two things the interaction program actually reads.
+
 	RenderProgs_Eacp.cpp static_asserts this against idDrawVert, so a change to
 	either is a compile error rather than geometry that comes out scrambled.
 
@@ -92,7 +98,8 @@ struct eacpDrawVert_t {
 	float					xyz[3];
 	float					st[2];
 	float					normal[3];
-	float					tangents[2][3];
+	float					tangent[3];		// idDrawVert::tangents[0]
+	float					bitangent[3];	// idDrawVert::tangents[1]
 	eacp::GPU::UNorm8x4		color;
 };
 
@@ -162,6 +169,116 @@ private:
 /*
 ================================================================================
 
+	idEacpInteractionProgram
+
+	interaction.vfp, which is the whole of Doom 3's lighting: one light against
+	one surface, bump-mapped, with a diffuse and a specular term, modulated by
+	the light's projection and its falloff.
+
+	The original is two hand-written ARB programs in one file - a vertex program
+	that puts the light and the half-angle vector into the surface's tangent
+	space and runs six texture matrices, and a fragment program that samples
+	five textures plus two lookup tables. This is that expression, once, in a
+	language that compiles to both MSL and HLSL.
+
+	Two of the seven textures do not survive the move, and neither is a
+	simplification of what is drawn:
+
+	  - the normalization cube map, which exists because an ARB fragment program
+	    cannot normalize a vector. normalize() can, and the .vfp says so itself:
+	    the half-angle half of the shader already takes that road, with the cube
+	    map sitting commented out above it.
+	  - the specular lookup table, which is a 256x1 ramp of
+	    max( 0, (d - 0.75) * 4 )^2 - a curve tabulated because the ARB program
+	    "can't really do a power function", in the words of the comment over the
+	    generator. Two multiplies here, and exact rather than quantized to the
+	    table's eight bits.
+
+	What does not go away is the fifth texture, and it is the reason this
+	program is macOS-only for now: eacp's D3D12 root signature has four texture
+	slots (plan.md section 5, gap 19), and bump, falloff, projection, diffuse
+	and specular are five.
+
+================================================================================
+*/
+
+class idEacpInteractionProgram : public eacp::GPU::ShaderProgram {
+public:
+	// The five samplings, in the order the textures are declared below. One
+	// program per distinct tuple - see idEacpRenderProgs::InteractionDraw.
+	struct sampling_t {
+		eacp::GPU::TextureSampling	bump;
+		eacp::GPU::TextureSampling	falloff;
+		eacp::GPU::TextureSampling	projection;
+		eacp::GPU::TextureSampling	diffuse;
+		eacp::GPU::TextureSampling	specular;
+	};
+
+							idEacpInteractionProgram( const sampling_t &sampling );
+
+	virtual void			define( void ) override;
+
+	// Clip from model, as everywhere else. The ARB vertex program got this for
+	// free from OPTION ARB_position_invariant, which is to say from the
+	// fixed-function matrix stack it shared with the rest of the frame.
+	eacp::GPU::Uniform<eacp::GPU::Float4x4>		modelViewProjection;
+
+	// The light and the eye in the surface's own coordinates, which is what
+	// lets the whole shader work in model space and never build a matrix.
+	eacp::GPU::Uniform<eacp::GPU::Float4>		localLightOrigin;
+	eacp::GPU::Uniform<eacp::GPU::Float4>		localViewOrigin;
+
+	// The light's projection, as four planes dotted with the model-space
+	// position: three for the projected image's (s, t, q) and one for the
+	// falloff's single coordinate.
+	eacp::GPU::Uniform<eacp::GPU::Float4>		lightProjectionS;
+	eacp::GPU::Uniform<eacp::GPU::Float4>		lightProjectionT;
+	eacp::GPU::Uniform<eacp::GPU::Float4>		lightProjectionQ;
+	eacp::GPU::Uniform<eacp::GPU::Float4>		lightFalloffS;
+
+	// Each map's own texture matrix, as the two rows R_SetDrawInteraction
+	// fills: (a, b, 0, c) dotted with (s, t, 0, 1).
+	eacp::GPU::Uniform<eacp::GPU::Float4>		bumpMatrixS;
+	eacp::GPU::Uniform<eacp::GPU::Float4>		bumpMatrixT;
+	eacp::GPU::Uniform<eacp::GPU::Float4>		diffuseMatrixS;
+	eacp::GPU::Uniform<eacp::GPU::Float4>		diffuseMatrixT;
+	eacp::GPU::Uniform<eacp::GPU::Float4>		specularMatrixS;
+	eacp::GPU::Uniform<eacp::GPU::Float4>		specularMatrixT;
+
+	// stageVertexColor_t as (modulate, add), exactly as the generic material
+	// stage says it - and here it is the ARB program's own spelling too, which
+	// is where that trick comes from.
+	eacp::GPU::Uniform<eacp::GPU::Float4>		colorModulate;
+	eacp::GPU::Uniform<eacp::GPU::Float4>		colorAdd;
+
+	// The light's colour times the stage's, one for each term.
+	eacp::GPU::Uniform<eacp::GPU::Float4>		diffuseColor;
+	eacp::GPU::Uniform<eacp::GPU::Float4>		specularColor;
+
+	// An ambient light has no direction: the ARB path swaps the normalization
+	// cube map for _ambient, whose every texel is the same vector, so the
+	// tangent-space light direction becomes a constant. xyz is that constant
+	// and w selects it - 1 for an ambient light, 0 for every other kind.
+	eacp::GPU::Uniform<eacp::GPU::Float4>		ambientLightVector;
+
+	eacp::GPU::Uniform<eacp::GPU::Texture2D>	bumpImage;
+	eacp::GPU::Uniform<eacp::GPU::Texture2D>	lightFalloffImage;
+	eacp::GPU::Uniform<eacp::GPU::Texture2D>	lightImage;
+	eacp::GPU::Uniform<eacp::GPU::Texture2D>	diffuseImage;
+	eacp::GPU::Uniform<eacp::GPU::Texture2D>	specularImage;
+
+	EACP_SHADER( modelViewProjection, localLightOrigin, localViewOrigin,
+				 lightProjectionS, lightProjectionT, lightProjectionQ, lightFalloffS,
+				 bumpMatrixS, bumpMatrixT, diffuseMatrixS, diffuseMatrixT,
+				 specularMatrixS, specularMatrixT,
+				 colorModulate, colorAdd, diffuseColor, specularColor,
+				 ambientLightVector,
+				 bumpImage, lightFalloffImage, lightImage, diffuseImage, specularImage )
+};
+
+/*
+================================================================================
+
 	idEacpRenderProgs
 
 	The two caches and the streaming pools, in one place because they are asked
@@ -190,17 +307,30 @@ public:
 	stageDraw_t				StageDraw( const idImage *image, int stateBits, int cullType,
 									   bool alphaTest );
 
+	// The same for one light against one surface. Its five images arrive
+	// together because the program samples all five and its sampling variant is
+	// the tuple of what they ask for, not any one of them.
+	struct interactionDraw_t {
+		idEacpInteractionProgram *				program;
+		const eacp::GPU::RenderPipeline *		pipeline;
+	};
+
+	interactionDraw_t		InteractionDraw( const idImage *bump, const idImage *falloff,
+											 const idImage *projection, const idImage *diffuse,
+											 const idImage *specular,
+											 int stateBits, int cullType );
+
 	// Geometry for one draw, in a buffer no frame still in flight is reading.
 	// The reference is good until this frame's pool comes round again, which is
 	// several frames after the draw that bound it was submitted.
 	const eacp::GPU::Buffer &	StreamVertices( const void *data, std::size_t bytes );
 	const eacp::GPU::Buffer &	StreamIndices( const void *data, std::size_t bytes );
 
-	// How many programs and pipelines have been compiled, for the log line that
-	// says what a level's content actually cost. Both numbers are the content's
-	// answer to a question plan.md only sized: the first is how many of the
-	// eight (sampling, alpha test) combinations a level reaches, and the second
-	// how many pieces of Doom 3 state it draws them in.
+	// How many programs and pipelines have been compiled, over both caches, for
+	// the log line that says what a level's content actually cost. Both numbers
+	// are the content's answer to a question plan.md only sized: how many of
+	// the sampling combinations a level reaches, and how many pieces of Doom 3
+	// state it draws them in.
 	int						NumPrograms( void ) const;
 	int						NumPipelines( void ) const;
 
@@ -227,6 +357,30 @@ private:
 	// rather than set beside it: how its texture is sampled (GPU/SAMPLERS.md)
 	// and whether it discards.
 	programVariant_t		variants[eacp::GPU::samplingConfigurations][2];
+
+	// The interaction program's variants, and they are a list rather than an
+	// array because there are five textures: four ways of sampling each is
+	// 1024 combinations, of which a level reaches a handful. The key is those
+	// five sampling indices packed two bits apiece, which is what makes a
+	// lookup a comparison of one int.
+	struct interactionVariant_t {
+		int											key;
+		std::optional<idEacpInteractionProgram>		program;
+		std::optional<eacp::GPU::ShaderLibrary>		library;
+		eacp::Vector<statePipeline_t>				pipelines;
+	};
+
+	// By pointer, because a ShaderProgram is pinned in place - its uniform
+	// members hold nodes in the graph it owns - so it can neither be copied nor
+	// moved, and a vector that grows does one or the other.
+	eacp::Vector<interactionVariant_t *>	interactions;
+
+	// The pipeline both caches build, from the state Doom 3 asks for and the
+	// program that is going to be drawn with it. NULL if it would not compile,
+	// which the caller answers by skipping the draw.
+	eacp::GPU::RenderPipeline *	BuildPipeline( const eacp::GPU::ShaderLibrary &library,
+											   const eacp::GPU::VertexLayout &layout,
+											   int stateBits, int cullType );
 
 	eacp::GPU::StreamingBuffers	vertexStream;
 	eacp::GPU::StreamingBuffers	indexStream;

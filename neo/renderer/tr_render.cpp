@@ -660,6 +660,15 @@ RB_CreateSingleDrawInteractions
 
 This can be used by different draw_* backends to decompose a complex light / surface
 interaction into primitive interactions
+
+Where the surface *is* - its matrix, its scissor rectangle and its depth hack -
+is the caller's rather than this function's, and that is a change this port made
+rather than the shape it inherited. Those three were four calls at the top of
+this decomposition and one undoing them at the bottom, in a function otherwise
+entirely about material semantics; a backend with no matrix stack has to say all
+three differently, and a shared function that is supposed to serve "different
+draw_* backends" cannot say them at all. Both callers now set them before they
+call, and each says them in its own terms.
 =============
 */
 void RB_CreateSingleDrawInteractions( const drawSurf_t *surf, void (*DrawInteraction)(const drawInteraction_t *) ) {
@@ -686,30 +695,6 @@ void RB_CreateSingleDrawInteractions( const drawSurf_t *surf, void (*DrawInterac
 		// it in the worldspawn by setting "allow_nospecular" "1"
 		// the value of that is saved in tr.allowNoSpecular by idRenderSystemLocal::EndLevelLoad()
 		allowNoSpecular = tr.allowNoSpecular;
-	}
-
-	// change the matrix and light projection vectors if needed
-	if ( surf->space != backEnd.currentSpace ) {
-		backEnd.currentSpace = surf->space;
-		qglLoadMatrixf( surf->space->modelViewMatrix );
-	}
-
-	// change the scissor if needed
-	if ( r_useScissor.GetBool() && !backEnd.currentScissor.Equals( surf->scissorRect ) ) {
-		backEnd.currentScissor = surf->scissorRect;
-		qglScissor( backEnd.viewDef->viewport.x1 + backEnd.currentScissor.x1,
-			backEnd.viewDef->viewport.y1 + backEnd.currentScissor.y1,
-			backEnd.currentScissor.x2 + 1 - backEnd.currentScissor.x1,
-			backEnd.currentScissor.y2 + 1 - backEnd.currentScissor.y1 );
-	}
-
-	// hack depth range if needed
-	if ( surf->space->weaponDepthHack ) {
-		RB_EnterWeaponDepthHack();
-	}
-
-	if ( surf->space->modelDepthHack ) {
-		RB_EnterModelDepthHack( surf->space->modelDepthHack );
 	}
 
 	inter.surf = surf;
@@ -824,11 +809,6 @@ void RB_CreateSingleDrawInteractions( const drawSurf_t *surf, void (*DrawInterac
 
 		// draw the final interaction
 		RB_SubmittInteraction( &inter, DrawInteraction );
-	}
-
-	// unhack depth range if needed
-	if ( surf->space->weaponDepthHack || surf->space->modelDepthHack != 0.0f ) {
-		RB_LeaveDepthHack();
 	}
 }
 

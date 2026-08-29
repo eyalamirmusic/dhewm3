@@ -143,6 +143,47 @@ void	RB_ARB2_DrawInteraction( const drawInteraction_t *din ) {
 
 
 /*
+==================
+RB_ARB2_SetupInteractionSurface
+
+Where the surface is, said in OpenGL: the modelview matrix, the scissor
+rectangle and the depth hack.
+
+These used to live inside RB_CreateSingleDrawInteractions, which is otherwise
+entirely about decomposing a material under a light and is meant to be shared by
+every backend. A backend with no matrix stack has to say all three of them
+differently, so they moved out to the callers - and this is the OpenGL caller's
+half of that move, the same calls in the same order. RB_LeaveDepthHack, which
+undid the last of them, is in the loop below where the surface ends.
+==================
+*/
+static void RB_ARB2_SetupInteractionSurface( const drawSurf_t *surf ) {
+	// change the matrix and light projection vectors if needed
+	if ( surf->space != backEnd.currentSpace ) {
+		backEnd.currentSpace = surf->space;
+		qglLoadMatrixf( surf->space->modelViewMatrix );
+	}
+
+	// change the scissor if needed
+	if ( r_useScissor.GetBool() && !backEnd.currentScissor.Equals( surf->scissorRect ) ) {
+		backEnd.currentScissor = surf->scissorRect;
+		qglScissor( backEnd.viewDef->viewport.x1 + backEnd.currentScissor.x1,
+			backEnd.viewDef->viewport.y1 + backEnd.currentScissor.y1,
+			backEnd.currentScissor.x2 + 1 - backEnd.currentScissor.x1,
+			backEnd.currentScissor.y2 + 1 - backEnd.currentScissor.y1 );
+	}
+
+	// hack depth range if needed
+	if ( surf->space->weaponDepthHack ) {
+		RB_EnterWeaponDepthHack();
+	}
+
+	if ( surf->space->modelDepthHack ) {
+		RB_EnterModelDepthHack( surf->space->modelDepthHack );
+	}
+}
+
+/*
 =============
 RB_ARB2_CreateDrawInteractions
 
@@ -194,6 +235,7 @@ void RB_ARB2_CreateDrawInteractions( const drawSurf_t *surf ) {
 
 	for ( ; surf ; surf=surf->nextOnLight ) {
 		// perform setup here that will not change over multiple interaction passes
+		RB_ARB2_SetupInteractionSurface( surf );
 
 		// set the vertex pointers
 		idDrawVert	*ac = (idDrawVert *)vertexCache.Position( surf->geo->ambientCache );
@@ -207,6 +249,11 @@ void RB_ARB2_CreateDrawInteractions( const drawSurf_t *surf ) {
 		// this may cause RB_ARB2_DrawInteraction to be exacuted multiple
 		// times with different colors and images if the surface or light have multiple layers
 		RB_CreateSingleDrawInteractions( surf, RB_ARB2_DrawInteraction );
+
+		// unhack depth range if needed
+		if ( surf->space->weaponDepthHack || surf->space->modelDepthHack != 0.0f ) {
+			RB_LeaveDepthHack();
+		}
 	}
 
 	qglDisableVertexAttribArrayARB( 8 );
