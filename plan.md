@@ -6,12 +6,14 @@ app lifecycle and message loop first, GPU rendering (Metal / D3D12) as the real 
 **Status: Phase 0 is done and merged. Phase 1 has landed its gate and its seam.
 Phase 2 is under way: the app shell, the threading, the boot, the input and the
 renderer are in, and the renderer now draws. `dhewm3-eacp` puts **Doom 3's main
-menu on screen through Metal**, **loads a level**, and now **lights it** —
-`interaction.vfp` ported into the EDSL, bump, diffuse and specular against each
-light's projection and falloff, at 114 draws and 6332 triangles on a pinned
-camera in `demo_mars_city1`, which is the SDL/GL build's count exactly. What is
-missing is the shadow: nothing occludes a light yet, which is step 4d.3, the
-last of the three the world was broken into.**
+menu on screen through Metal**, **loads a level**, **lights it** and now
+**shadows it** — the world is done, all three of the steps 4d was broken into.
+`interaction.vfp` and `shadow.vp` are in the EDSL, the stencil shadow volumes
+are counted two-sided in one pass over each volume, and at a pinned camera in
+`demo_mars_city1` the two backends draw **the same 71 draws, 1644 triangles and
+2376 shadow triangles**, volume for volume. What is left is 4e: fog and blend
+lights, the texgen variants, subviews, and the render target `_currentRender`
+and a frame-exact gate both need.**
 
 Reference implementation for almost everything on the platform side:
 `~/Code/PureDOOM/examples/EACP` — a complete engine hosted on eacp, with its own
@@ -321,7 +323,13 @@ Numbers are never reused, so a hole is an entry that closed.
    on an ambient light with it — that one becoming a uniform, since the whole
    point of the substitution is that the answer does not vary with the lookup.
    What is left needs real cube sampling.
-6. **Depth bias / polygon offset** — decals z-fight without it.
+6. **Depth bias / polygon offset** — decals z-fight without it, and step 4d.3
+   found the second user: a shadow volume's near cap is the occluder's own
+   triangles rebuilt through the extrusion, so it lands within an ulp of the
+   depth that surface wrote and Doom 3 biases it a unit away
+   (`r_shadowPolygonOffset -1`) to settle which side of the test it falls on.
+   Nothing in the frames measured shows the difference, so this is the gap
+   growing a user rather than becoming urgent.
 7. **Mip filter selection and anisotropy** — currently `Linear|Nearest` ×
    `Clamp|Repeat` only. Doom 3 exposes trilinear and aniso as cvars.
 ### Platform-side, smaller
@@ -1301,6 +1309,134 @@ the main menu**, which is a `renderDef` with a light on it and the one thing on
 that screen 4c did not draw. It is there, with its terminator and its surface
 relief, and the menu run reports no eacp warnings at all.
 
+#### Step 4d.3 — the stencil shadow pass, and the world is done — **done**
+
+`RB_StencilShadowPass` and `RB_T_Shadow` rewritten into
+`StencilShadowPass` / `ShadowSurface`, `shadow.vp` ported into the EDSL as
+`idEacpShadowProgram`, and `DrawInteractions` given the four calls in the order
+Doom 3 makes them — global shadows, local interactions, local shadows, global
+interactions, which is what makes `MF_NOSELFSHADOW` mean anything.
+
+**The two facings are one pipeline, and that deletes most of the original.**
+`RB_T_Shadow` is a four-way branch — Carmack's reverse or not, crossed with
+`glStencilOpSeparate` being available or not — and the two halves without it
+draw the volume two or four times to say what per-face stencil state says once.
+eacp has per-face state on both backends (Phase 0, §4.1), so the port is one of
+the four: the depth-fail count with the faces separate, in a single draw.
+`r_useStencilOpSeparate` therefore has nothing to choose between and is not read;
+`r_useCarmacksReverse 0` is not implemented and warns once, its difference being
+a third pair of stencil ops for a "preload" nothing has run since the patent
+expired in 2019.
+
+**A pass cannot be cleared once it has begun, so the per-light clear is a
+draw.** Doom 3 empties the stencil buffer inside each light's scissor rectangle
+with `qglClear( GL_STENCIL_BUFFER_BIT )`; on both of eacp's backends the clear
+is a property of the attachment being loaded, decided as the pass opens, and
+this port has one pass per frame (4d.1). So the clear is a quad with
+`StencilOp::Replace` writing the pass's reference value, scissored to the light —
+and it goes through the *shadow* program rather than one of its own, because
+with an identity transform and the light at the origin that program's extrusion
+is the identity too.
+
+**The stencil is a second key on the pipeline cache**, since what OpenGL leaves
+in the context between two draws is compiled into an object here. Five
+configurations cover Doom 3 — ignore, clear, count depth-fail, count depth-pass,
+and the `GL_GEQUAL` mask the interactions are drawn through — with the two
+counting ones in mirrored pairs, a mirror being what reverses which winding
+faces the viewer. The reference value is *not* part of the key: it is pass state
+on both backends, so it is set once per pass, which is right because Doom 3 uses
+one value for the whole frame.
+
+**Neither convention needed flipping, and it is worth saying why not.**
+eacp's front face is the counter-clockwise winding in clip space,
+which is also OpenGL's default, so `GL_FRONT` is `stencilFront`; that Doom 3's
+increments look inverted against a textbook depth-fail volume is its own winding,
+the same fact behind `CT_FRONT_SIDED` culling `GL_FRONT`. And `GL_GEQUAL` puts
+the reference on the left of the comparison, as Metal and D3D12 both do — so
+`ES_LIT` keeps the fragments whose count came back down to 128, which is the
+ones no volume closed over.
+
+**The measurement needed a camera the *world* holds still under, not just one
+the player does.** At `demo_mars_city1`'s first stop the two builds agreed on
+every drawing counter — 6332 triangles, 9763 vertices — and disagreed on the
+shadow half by one draw, which took an hour to explain and is worth the
+paragraph:
+
+- **A shadow volume's triangle count is a silhouette, so it depends on the
+  pose; a surface's does not.** Two builds looking at the same animating NPC
+  from the same camera draw the same triangles and *different* volumes, and
+  `R_CreateShadowVolume` returns nothing at all when no face of a model faces
+  the light — so a pose difference can add or remove a whole draw. That is why
+  4d.1 and 4d.2 could be measured at a camera with people in it and this could
+  not.
+- **`g_stopTime 1` freezes the world but not at a reproducible moment.** Printing
+  `viewDef->renderView.time` at the shadow draws showed the two builds frozen 44
+  seconds apart: `wait N` in a cfg counts command-buffer executions, the buffer
+  runs a different number of times per frame in each host, and `com_fixedTic 1`
+  does not close that. Two runs of *one* build are identical; two builds are not.
+- **So the camera moved to one with no animating entity in view**
+  (`setviewpos -3148 -2776 204 180`), where the answer is exact:
+
+| | views | draws | tris | shdw tris | shdw verts |
+| --- | --- | --- | --- | --- | --- |
+| SDL/GL, fog and blend lights skipped | 1 | 71 | 1644 | 2376 | 5458 |
+| eacp | 1 | 71 | 1644 | 2376 | 5458 |
+
+  and the fourteen shadow volumes match **one for one on every field** —
+  vertices, indexes drawn, indexes held, and both cap-skipping alternatives —
+  which is a stronger statement than the totals, because it says the caps
+  decision agreed surface by surface and not merely in sum.
+
+**The picture agrees at 0.3 of 255.** Both builds' windows grabbed off the same
+screen at that camera come out at a mean RGB of (62.4, 47.5, 34.9) and
+(62.5, 47.6, 35.0), with a mean absolute difference of 0.3 per channel; amplified
+sixteen times, what is left is a thin line along every geometric edge, which is
+eacp drawing at 4× MSAA against GL's none. That is a much sharper comparison than
+4d.2 could make — not because anything improved, but because the scene holds
+still: 4d.2 was comparing a framebuffer read against a screen grab, two runs, and
+two animation frames.
+
+**And the shadows are visibly there**, which is worth checking rather than
+assuming when the instrument is agreement with another backend: the same eacp
+frame at `r_shadows 0` differs from itself at `r_shadows 1` by ten times as much
+as it differs from the GL build — (3.1, 1.5, 0.5) per channel — and the
+difference has a shape, the hard-edged wedge a machine casts across a lit floor.
+
+**Three things it leaves, and one of them is new.**
+
+- **The polygon offset is eacp gap 6, and the shadow pass is its second user
+  after the decals.** A volume's near cap is the occluder's own triangles put
+  through the extrusion's subtract-and-add rather than copied, so it lands
+  within an ulp of the depth that surface wrote and which side of `LessEqual`
+  it falls on is decided by rounding. Doom 3 biases it one unit away
+  (`r_shadowPolygonOffset -1`) and settles the question. Nothing in the frames
+  measured shows it, and the eacp-versus-GL difference image has no speckle in
+  it at all, so this is logged rather than worked around.
+- **`r_showShadows` is not implemented** — two of its three values draw the
+  volumes as lines, and `GLS_POLYMODE_LINE` has no eacp counterpart any more
+  than `r_showTris`' does. Warned once.
+- **`r_useShadowVertexProgram 0` has no counterpart**: the extrusion is the only
+  way this backend projects a volume, and the frontend builds the doubled cache
+  for it because `backEndRendererHasVertexPrograms` is true for `BE_EACP`.
+  Warned once.
+
+**Verified the same three ways as 4d.2.** Clean under `MTL_DEBUG_LAYER=1` with
+`MTL_SHADER_VALIDATION=1` and GPU validation, loading the level and quitting
+without an assert, at **8 programs and 32 pipelines**. What the shadow costs is
+measured rather than counted off the source: the same run at `r_shadows 0`
+compiles **7 and 27**, so it is one program and five pipelines — its stencil
+configurations, plus the masked variant of each interaction program the level
+reaches. The counters match, above. And the main menu is untouched, which is the
+check that the stencil dimension did not disturb the 2D path: no world, no
+volumes, and the same picture 4c drew.
+
+**The gate was not re-run, and this time that is a statement rather than an
+omission.** The three files this step touched — `RenderBackend_Eacp.cpp`,
+`RenderProgs_Eacp.{h,cpp}` — are compiled into `dhewm3-eacp` alone
+(`neo/CMakeLists.txt`, `src_renderbackend_eacp`), so the SDL/GL build is byte
+for byte the one the last capture was taken from. Unlike 4d.2, which edited
+three shared files and re-ran it at 297/297.
+
 ### Shader inventory for Phase 2
 
 Roughly 10–15 EDSL programs, each in the sampling variants §4.3 sizes — 8 worst case
@@ -1317,7 +1453,12 @@ rather than a program beside it, compiled lazily:
   found rather than assumed: the depth fill is the generic material stage with the
   colour black and a `setDiscardBelow`, so it is one more *variant* of that one
   and the count below moves from 4 to 8 rather than the list growing an entry
-- shadow volume extrude (stencil) — `Apps/GPU/StencilShadows` is the worked example
+- ~~shadow volume extrude (stencil) — `Apps/GPU/StencilShadows` is the worked
+  example~~ — **done**, step 4d.3. `shadow.vp`, which is two instructions and no
+  fragment program at all. It is the one program here with *no* sampling
+  variants — it reads no texture — and the most pipelines per program, because
+  what varies is the stencil rather than the sampler: the count in its two
+  forms, the clear, and the mirrored pair of the count.
 - generic material stage, in its texgen variants: normal, reflect, skybox, wobblesky
 - fog
 - light blend
@@ -1409,7 +1550,8 @@ Phase 2 is the first work that compiles against eacp. In rough order:
      the state bitfield translated into a pipeline, the variant cache §4.3
      sizes, geometry streamed through `GPU::StreamingBuffers`, a texture per
      stage.
-   - **4d. The world**, in three, because it is three ideas rather than one.
+   - ~~**4d. The world**, in three, because it is three ideas rather than
+     one.~~ — **done**, all three.
      - ~~**4d.1. The depth fill.**~~ — **done**, §6. Every opaque and
        perforated surface into the depth buffer at its own depth, and the
        ambient passes now running over a 3D view. What it draws is the level
@@ -1426,21 +1568,25 @@ Phase 2 is the first work that compiles against eacp. In rough order:
        textures became arithmetic; the five that remain are eacp gap 19 on
        D3D12, which is why this step is macOS-only. The Mars globe on the main
        menu is lit.
-     - **4d.3. The stencil shadow pass.** ← **next.** `RB_StencilShadowPass`
-       and the two-sided depth-fail count, with the per-light stencil clear
-       that goes with it — `DrawInteractions` says where both belong and warns
-       once that a light currently shines through whatever should be shadowing
-       it. `Apps/GPU/StencilShadows` is the worked example and exists for
-       exactly this moment.
-   - **4e. What is left.** Fog and blend lights, the texgen variants
+     - ~~**4d.3. The stencil shadow pass.**~~ — **done**, §6.
+       `RB_StencilShadowPass` and `RB_T_Shadow` rewritten, `shadow.vp` in the
+       EDSL, the count taken two-sided in one pass over each volume — which is
+       what per-face stencil state buys and what deletes three of the
+       original's four branches. The per-light clear is a scissored quad,
+       because a pass cannot be cleared once it has begun. 71 draws, 1644
+       triangles and 2376 shadow triangles at a camera with nothing animating
+       in it, which is the SDL/GL build's count exactly, volume for volume —
+       and the picture agrees at 0.3 of 255.
+   - **4e. What is left.** ← **next.** Fog and blend lights, the texgen variants
      (reflect, skybox, wobblesky), subviews and mirrors, `r_gammaInShader`
      (step 4d.2 — the identity at the default settings, and nothing at any
      other), and `_currentRender` — which needs the composited frame to live in
      an app-owned render target that the drawable is blitted from, because a
      texture cannot be sampled by the pass rendering into it. PureDOOM's
      `captureTarget`, §3. That render target is also what gives the eacp build a
-     `ReadPixels` and so a frame comparable to the GL one's; step 4d.2 measured
-     how far off a screen grab is instead.
+     `ReadPixels` and so a frame the gate could hash; two screen grabs of a
+     scene that holds still get within 0.3 of 255 of each other (step 4d.3),
+     which is enough to compare a picture by and not enough to hash one.
 5. **Delete** `glimp.cpp`, `events.cpp`, `threads.cpp`, `neo/sys/linux/`, SDL,
    and fold `dhewm3-eacp` back into `dhewm3`.
 

@@ -70,6 +70,11 @@ static_assert( offsetof( eacpDrawVert_t, bitangent )
 static_assert( offsetof( eacpDrawVert_t, color ) == offsetof( idDrawVert, color ),
 			   "eacpDrawVert_t::color must sit where idDrawVert::color does" );
 
+// And the same for the shadow volume's, which is one homogeneous position: the
+// vertex cache's own bytes are what a draw streams.
+static_assert( sizeof( eacpShadowVert_t ) == sizeof( shadowCache_t ),
+			   "eacpShadowVert_t must be shadowCache_t's layout exactly" );
+
 /*
 ================================================================================
 
@@ -290,6 +295,58 @@ void idEacpInteractionProgram::define( void ) {
 /*
 ================================================================================
 
+	idEacpShadowProgram
+
+================================================================================
+*/
+
+idEacpShadowProgram::idEacpShadowProgram() {
+	compile();
+}
+
+/*
+====================
+idEacpShadowProgram::define
+
+shadow.vp, whole:
+
+	SUB	R0, vertex.position, program.env[4];
+	MAD	R0, R0.wwww, program.env[4], R0;
+
+	DP4	result.position.x, R0, state.matrix.mvp.row[0];
+	... and the other three rows
+
+The light's w is zero, which the first line relies on twice: it leaves the
+vertex's own w alone through the subtraction, and it makes the second line add
+the light back for a vertex whose w is 1 while leaving it subtracted for one
+whose w is 0. That is the extrusion - the near copy of a vertex stays on the
+surface, and the far copy becomes the direction away from the light with w = 0,
+which is a point at infinity.
+
+The DP4s are the fixed-function matrix stack, which is a uniform here.
+====================
+*/
+void idEacpShadowProgram::define( void ) {
+	auto	position = vertexInput( &eacpShadowVert_t::xyzw );
+
+	auto	light = localLightOrigin.xyz();
+
+	auto	extruded = GPU::float4( position.xyz() - light + light * position.w(),
+									position.w() );
+
+	setPosition( modelViewProjection * extruded );
+
+	// Never read. Every pipeline this program is drawn through masks off all
+	// four colour channels - a shadow volume exists to be rasterized so that
+	// the stencil ops fire, and the original has no fragment program at all.
+	// Something has to be written here because a fragment stage without an
+	// output is not a shader, so this is the smallest thing that is one.
+	setFragment( GPU::float4( constant( 0.0f ), 0.0f, 0.0f, 0.0f ) );
+}
+
+/*
+================================================================================
+
 	State, translated.
 
 	The GLS_* bitfield is the one piece of Doom 3's backend that was already
@@ -395,6 +452,77 @@ static GPU::CompareFunction R_EacpDepthCompare( int stateBits ) {
 
 /*
 ====================
+R_EacpStencilFaces
+
+The two facings, from the one name for what a draw is doing to the count.
+
+Every line here is a qglStencilOpSeparate or a qglStencilFunc in
+draw_common.cpp's RB_T_Shadow and RB_StencilShadowPass, and the translation is
+literal on both counts:
+
+  - **The faces line up directly.** eacp's front face is the counter-clockwise
+    winding in clip space, which is also OpenGL's default, so GL_FRONT is
+    stencilFront and GL_BACK is stencilBack. That the increments look inverted
+    against a textbook depth-fail volume is Doom 3's winding, not a translation
+    error: its CT_FRONT_SIDED culls GL_FRONT for the same reason.
+
+  - **The comparison takes the reference on the left.** GL_GEQUAL passes when
+    the reference is at least the buffer's value, and Metal and D3D12 order it
+    the same way - so ES_LIT keeps a fragment whose count came back down to 128
+    or below, which is exactly the fragments no volume closed over.
+
+The wrapping increments are what the buffer being unsigned and 8 bits deep
+asks for: a pixel inside more volumes than the buffer can count still comes back
+to the right number, because an overflow and the underflow that answers it
+cancel. GL only has them as an extension (EXT_stencil_wrap, checked for in
+R_CheckPortableExtensions); both of eacp's backends have them outright.
+====================
+*/
+static void R_EacpStencilFaces( eacpStencil_t stencil,
+								GPU::StencilFace &front, GPU::StencilFace &back ) {
+	// The defaults are always-test and never-write, which is glDisable(
+	// GL_STENCIL_TEST ) - so ES_IGNORE is the two faces left alone.
+	front = GPU::StencilFace();
+	back = GPU::StencilFace();
+
+	switch ( stencil ) {
+	case ES_CLEAR:
+		front.pass = GPU::StencilOp::Replace;
+		back.pass = GPU::StencilOp::Replace;
+		break;
+
+	case ES_COUNT_DEPTH_FAIL:
+		back.depthFail = GPU::StencilOp::DecrementWrap;
+		front.depthFail = GPU::StencilOp::IncrementWrap;
+		break;
+
+	case ES_COUNT_DEPTH_FAIL_MIRRORED:
+		front.depthFail = GPU::StencilOp::DecrementWrap;
+		back.depthFail = GPU::StencilOp::IncrementWrap;
+		break;
+
+	case ES_COUNT_DEPTH_PASS:
+		back.pass = GPU::StencilOp::IncrementWrap;
+		front.pass = GPU::StencilOp::DecrementWrap;
+		break;
+
+	case ES_COUNT_DEPTH_PASS_MIRRORED:
+		front.pass = GPU::StencilOp::IncrementWrap;
+		back.pass = GPU::StencilOp::DecrementWrap;
+		break;
+
+	case ES_LIT:
+		front.compare = GPU::CompareFunction::GreaterEqual;
+		back.compare = GPU::CompareFunction::GreaterEqual;
+		break;
+
+	default:
+		break;
+	}
+}
+
+/*
+====================
 R_EacpCullMode
 
 Doom 3's CT_FRONT_SIDED culls GL_FRONT, which reads backwards until you know its
@@ -487,6 +615,14 @@ void idEacpRenderProgs::Shutdown( void ) {
 	}
 
 	interactions.clear();
+
+	for ( int i = 0 ; i < shadowPipelines.size() ; i++ ) {
+		delete shadowPipelines[i].pipeline;
+	}
+
+	shadowPipelines.clear();
+	shadowLibrary.reset();
+	shadowProgram.reset();
 }
 
 int idEacpRenderProgs::NumPrograms( void ) const {
@@ -506,6 +642,10 @@ int idEacpRenderProgs::NumPrograms( void ) const {
 		}
 	}
 
+	if ( shadowProgram.has_value() ) {
+		total++;
+	}
+
 	return total;
 }
 
@@ -522,6 +662,8 @@ int idEacpRenderProgs::NumPipelines( void ) const {
 		total += interactions[i]->pipelines.size();
 	}
 
+	total += shadowPipelines.size();
+
 	return total;
 }
 
@@ -529,19 +671,21 @@ int idEacpRenderProgs::NumPipelines( void ) const {
 ====================
 idEacpRenderProgs::BuildPipeline
 
-Doom 3's state, compiled. Both programs come through here because the state is
-the material's rather than the program's: an interaction is (ONE, ONE) with the
-depth write off and the generic stage is whatever the .mtr asked for, but what
-either one *is* to the API is the same object built the same way.
+Doom 3's state, compiled. All three programs come through here because the state
+is the material's rather than the program's: an interaction is (ONE, ONE) with
+the depth write off, a shadow volume writes no channel at all, and the generic
+stage is whatever the .mtr asked for - but what any of them *is* to the API is
+the same object built the same way.
 
-The two things a pipeline needs that are not state - the source it runs and the
-vertices it reads - are the arguments, because they are the only part that
-differs between the two callers.
+The three things a pipeline needs that are not the GLS_* bits - the source it
+runs, the vertices it reads and what it does to the stencil - are the arguments,
+because they are the only part that differs between the callers.
 ====================
 */
 GPU::RenderPipeline *idEacpRenderProgs::BuildPipeline( const GPU::ShaderLibrary &library,
 													   const GPU::VertexLayout &layout,
-													   int stateBits, int cullType ) {
+													   int stateBits, int cullType,
+													   eacpStencil_t stencil ) {
 	eacp::GPU::GPUView *	view = R_EacpGetView();
 
 	if ( !view ) {
@@ -571,21 +715,68 @@ GPU::RenderPipeline *idEacpRenderProgs::BuildPipeline( const GPU::ShaderLibrary 
 	descriptor.depthCompare = R_EacpDepthCompare( stateBits );
 	descriptor.depthWrite = !( stateBits & GLS_DEPTHMASK );
 
-	// StencilFace's defaults are always-test, never-write, which is exactly
-	// glDisable( GL_STENCIL_TEST ). The shadow pass sets them; step 4d.3.
 	descriptor.stencil = true;
+	R_EacpStencilFaces( stencil, descriptor.stencilFront, descriptor.stencilBack );
 
 	descriptor.cullMode = R_EacpCullMode( cullType );
 
 	GPU::RenderPipeline *	pipeline = new GPU::RenderPipeline( GPU::Device::shared(), descriptor );
 
 	if ( !pipeline->isValid() ) {
-		common->Warning( "eacp: no pipeline for state 0x%x, cull %i", stateBits, cullType );
+		common->Warning( "eacp: no pipeline for state 0x%x, cull %i, stencil %i",
+						 stateBits, cullType, stencil );
 		delete pipeline;
 		return NULL;
 	}
 
 	return pipeline;
+}
+
+/*
+====================
+idEacpRenderProgs::PipelineFor
+
+The lookup all three caches share: what a program has already been compiled to
+draw in, searched linearly and extended when the state asked for is new.
+
+Linear because the list is short and stays short - the whole of the demo's first
+level is 32 pipelines over every program in it - and because what is being
+compared is three integers, which is cheaper than anything that would index them.
+====================
+*/
+const GPU::RenderPipeline *
+idEacpRenderProgs::PipelineFor( eacp::Vector<statePipeline_t> &pipelines,
+								const GPU::ShaderLibrary &library,
+								const GPU::VertexLayout &layout,
+								int stateBits, int cullType, eacpStencil_t stencil ) {
+	// The bits a pipeline is compiled against. Two of GL_State's are not here:
+	// GLS_POLYMODE_LINE, which is r_showTris' wireframe and has no eacp
+	// counterpart, and GLS_ATEST_BITS, which has zero call sites in this tree -
+	// the alpha test Doom 3 actually uses is shaderStage_t::hasAlphaTest, and it
+	// reaches StageDraw as its own argument rather than in the bitfield.
+	const int	pipelineBits = stateBits
+		& ( GLS_SRCBLEND_BITS | GLS_DSTBLEND_BITS
+			| GLS_DEPTHMASK | GLS_REDMASK | GLS_GREENMASK | GLS_BLUEMASK | GLS_ALPHAMASK
+			| GLS_DEPTHFUNC_ALWAYS | GLS_DEPTHFUNC_EQUAL );
+
+	for ( int i = 0 ; i < pipelines.size() ; i++ ) {
+		if ( pipelines[i].stateBits == pipelineBits
+			 && pipelines[i].cullType == cullType
+			 && pipelines[i].stencil == stencil ) {
+			return pipelines[i].pipeline;
+		}
+	}
+
+	statePipeline_t	entry;
+
+	entry.stateBits = pipelineBits;
+	entry.cullType = cullType;
+	entry.stencil = stencil;
+	entry.pipeline = BuildPipeline( library, layout, pipelineBits, cullType, stencil );
+
+	pipelines.add( entry );
+
+	return entry.pipeline;
 }
 
 /*
@@ -622,34 +813,13 @@ idEacpRenderProgs::stageDraw_t idEacpRenderProgs::StageDraw( const idImage *imag
 
 	draw.program = &*variant.program;
 
-	// The bits a pipeline is compiled against. Two of GL_State's are not here:
-	// GLS_POLYMODE_LINE, which is r_showTris' wireframe and has no eacp
-	// counterpart, and GLS_ATEST_BITS, which has zero call sites in this tree -
-	// the alpha test Doom 3 actually uses is shaderStage_t::hasAlphaTest, and
-	// it arrives here as the alphaTest argument rather than in the bitfield.
-	const int	pipelineBits = stateBits
-		& ( GLS_SRCBLEND_BITS | GLS_DSTBLEND_BITS
-			| GLS_DEPTHMASK | GLS_REDMASK | GLS_GREENMASK | GLS_BLUEMASK | GLS_ALPHAMASK
-			| GLS_DEPTHFUNC_ALWAYS | GLS_DEPTHFUNC_EQUAL );
-
-	for ( int i = 0 ; i < variant.pipelines.size() ; i++ ) {
-		if ( variant.pipelines[i].stateBits == pipelineBits
-			 && variant.pipelines[i].cullType == cullType ) {
-			draw.pipeline = variant.pipelines[i].pipeline;
-			return draw;
-		}
-	}
-
-	statePipeline_t	entry;
-
-	entry.stateBits = pipelineBits;
-	entry.cullType = cullType;
-	entry.pipeline = BuildPipeline( *variant.library, variant.program->vertexLayout(),
-									pipelineBits, cullType );
-
-	variant.pipelines.add( entry );
-
-	draw.pipeline = entry.pipeline;
+	// Everything drawn through this program is drawn outside the shadow half of
+	// a view - the depth fill, the ambient passes, the whole of the 2D - and
+	// none of it reads or writes the stencil. That is Doom 3's own arrangement:
+	// RB_ARB2_DrawInteractions leaves the buffer on GL_ALWAYS as it finishes.
+	draw.pipeline = PipelineFor( variant.pipelines, *variant.library,
+								 variant.program->vertexLayout(),
+								 stateBits, cullType, ES_IGNORE );
 
 	return draw;
 }
@@ -678,7 +848,7 @@ idEacpRenderProgs::interactionDraw_t
 idEacpRenderProgs::InteractionDraw( const idImage *bump, const idImage *falloff,
 									const idImage *projection, const idImage *diffuse,
 									const idImage *specular,
-									int stateBits, int cullType ) {
+									int stateBits, int cullType, eacpStencil_t stencil ) {
 	interactionDraw_t	draw;
 
 	draw.program = NULL;
@@ -730,31 +900,52 @@ idEacpRenderProgs::InteractionDraw( const idImage *bump, const idImage *falloff,
 
 	// Only two states ever reach here - GLS_DEPTHFUNC_EQUAL over what the depth
 	// fill wrote, and GLS_DEPTHFUNC_LESS for the translucent surfaces that were
-	// never in it - but they are masked out of the bitfield the same way the
-	// stage program's are, because the caller passes GL_State's whole word.
-	const int	pipelineBits = stateBits
-		& ( GLS_SRCBLEND_BITS | GLS_DSTBLEND_BITS
-			| GLS_DEPTHMASK | GLS_REDMASK | GLS_GREENMASK | GLS_BLUEMASK | GLS_ALPHAMASK
-			| GLS_DEPTHFUNC_ALWAYS | GLS_DEPTHFUNC_EQUAL );
+	// never in it - and only two stencils: the mask, under a light whose shadow
+	// volumes have just been counted, and nothing at all under one with no
+	// shadow-casting surface in view.
+	draw.pipeline = PipelineFor( variant->pipelines, *variant->library,
+								 variant->program->vertexLayout(),
+								 stateBits, cullType, stencil );
 
-	for ( int i = 0 ; i < variant->pipelines.size() ; i++ ) {
-		if ( variant->pipelines[i].stateBits == pipelineBits
-			 && variant->pipelines[i].cullType == cullType ) {
-			draw.pipeline = variant->pipelines[i].pipeline;
+	return draw;
+}
+
+/*
+====================
+idEacpRenderProgs::ShadowDraw
+
+One program, compiled the first time a shadow is drawn, and a pipeline per way
+the stencil is counted.
+
+There is no sampling dimension because there is no texture, and no alpha test
+because there is nothing to test - so where the other two caches are a search
+for the right *program* and then for the right pipeline, this is only the
+second half.
+====================
+*/
+idEacpRenderProgs::shadowDraw_t idEacpRenderProgs::ShadowDraw( int stateBits, int cullType,
+															   eacpStencil_t stencil ) {
+	shadowDraw_t	draw;
+
+	draw.program = NULL;
+	draw.pipeline = NULL;
+
+	if ( !shadowProgram.has_value() ) {
+		shadowProgram.emplace();
+		shadowLibrary.emplace( GPU::Device::shared(), shadowProgram->source() );
+
+		if ( !shadowLibrary->isValid() ) {
+			common->Warning( "eacp: the shadow volume shader failed to compile" );
+			shadowProgram.reset();
 			return draw;
 		}
 	}
 
-	statePipeline_t	entry;
+	draw.program = &*shadowProgram;
 
-	entry.stateBits = pipelineBits;
-	entry.cullType = cullType;
-	entry.pipeline = BuildPipeline( *variant->library, variant->program->vertexLayout(),
-									pipelineBits, cullType );
-
-	variant->pipelines.add( entry );
-
-	draw.pipeline = entry.pipeline;
+	draw.pipeline = PipelineFor( shadowPipelines, *shadowLibrary,
+								 shadowProgram->vertexLayout(),
+								 stateBits, cullType, stencil );
 
 	return draw;
 }

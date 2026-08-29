@@ -106,6 +106,77 @@ struct eacpDrawVert_t {
 /*
 ================================================================================
 
+	shadowCache_t, said in eacp's terms.
+
+	A shadow volume's vertex is one homogeneous position and nothing else: the
+	same xyz twice over, once with w = 1 and once with w = 0, so that a vertex
+	program can leave the first where it is and send the second to infinity away
+	from the light. That is the whole of the geometry a stencil shadow needs and
+	the whole of what R_CreateVertexProgramShadowCache writes.
+
+	Sixteen bytes, checked against idVec4 in RenderProgs_Eacp.cpp, because the
+	engine's own buffer is what gets streamed rather than a repacked copy of it.
+
+================================================================================
+*/
+
+struct eacpShadowVert_t {
+	float					xyzw[4];
+};
+
+/*
+================================================================================
+
+	What a draw does with the stencil buffer.
+
+	On OpenGL this is three calls left in the context - glStencilFunc,
+	glStencilOpSeparate twice - and here it is part of a pipeline, so it is a
+	second key on the cache beside the GLS_* bits. The reference value is not:
+	it is pass state on both of eacp's backends, set once per pass, which is
+	right because Doom 3 uses one value for the whole frame.
+
+	Doom 3 reaches five configurations and no more, all of them in the shadow
+	half of a view. The two counting ones come in mirrored pairs because a
+	mirror reverses which winding faces the viewer, and which face increments is
+	the whole of what the count is.
+
+================================================================================
+*/
+
+enum eacpStencil_t {
+	// Always test, never write: glDisable( GL_STENCIL_TEST ). Everything drawn
+	// outside the shadow half of a view.
+	ES_IGNORE,
+
+	// The per-light clear, which on OpenGL is glClear( GL_STENCIL_BUFFER_BIT )
+	// inside the light's scissor and here is a quad that replaces what it
+	// covers with the pass's reference value. A pass cannot be cleared once it
+	// has begun on either of eacp's backends - the clear is a property of the
+	// attachment being loaded - so the only way to empty a rectangle of the
+	// stencil buffer mid-frame is to draw over it.
+	ES_CLEAR,
+
+	// Carmack's reverse: the shadow volume's count taken on the fragments the
+	// depth test rejected, both facings in one pass over the geometry. This is
+	// what glStencilOpSeparate buys and what a one-face-at-a-time API pays for
+	// twice.
+	ES_COUNT_DEPTH_FAIL,
+	ES_COUNT_DEPTH_FAIL_MIRRORED,
+
+	// The same count on the fragments the depth test kept, which is what a
+	// volume the view is outside of can use instead - no caps needed, and no
+	// near plane to fall through.
+	ES_COUNT_DEPTH_PASS,
+	ES_COUNT_DEPTH_PASS_MIRRORED,
+
+	// The mask the count is read through: glStencilFunc( GL_GEQUAL, 128, 255 ),
+	// which keeps the fragments no shadow volume closed over.
+	ES_LIT
+};
+
+/*
+================================================================================
+
 	idEacpStageProgram
 
 	The generic material stage: a texture sampled at a transformed coordinate,
@@ -279,11 +350,56 @@ public:
 /*
 ================================================================================
 
+	idEacpShadowProgram
+
+	shadow.vp, which is two instructions and the only vertex program Doom 3
+	ships that has no fragment program beside it - because a shadow volume is
+	rasterized so that the stencil ops fire and for no other reason. Nothing it
+	computes is ever written.
+
+	What the two instructions do is the extrusion: a shadow volume's vertices
+	come in pairs, the same position with w = 1 and with w = 0, and the second
+	of each pair is sent to infinity in the direction away from the light. That
+	is why the volume can be built once per surface and reused for every frame
+	the surface and the light are both still there - the projection is the
+	shader's, not the geometry's.
+
+	It is also the reason the *frontend* has to know which backend is running:
+	tr.backEndRendererHasVertexPrograms is what makes R_CreateShadowVolume build
+	the doubled cache this reads rather than a volume already projected on the
+	CPU, and it is true for BE_EACP.
+
+	This program has no variants at all. It samples nothing, so there is no
+	sampling to bake in; it discards nothing, so there is no branch to compile
+	twice. One program, and a pipeline per way the stencil is counted.
+
+================================================================================
+*/
+
+class idEacpShadowProgram : public eacp::GPU::ShaderProgram {
+public:
+							idEacpShadowProgram();
+
+	virtual void			define( void ) override;
+
+	eacp::GPU::Uniform<eacp::GPU::Float4x4>		modelViewProjection;
+
+	// The light in the surface's own coordinates, with w = 0 - which the
+	// extrusion relies on, and which R_GlobalPointToLocal does not set, so the
+	// caller does.
+	eacp::GPU::Uniform<eacp::GPU::Float4>		localLightOrigin;
+
+	EACP_SHADER( modelViewProjection, localLightOrigin )
+};
+
+/*
+================================================================================
+
 	idEacpRenderProgs
 
-	The two caches and the streaming pools, in one place because they are asked
-	for together: a draw wants the program its texture is sampled through, the
-	pipeline its state compiles to, and somewhere to put its geometry.
+	The three caches and the streaming pools, in one place because they are
+	asked for together: a draw wants the program its texture is sampled through,
+	the pipeline its state compiles to, and somewhere to put its geometry.
 
 ================================================================================
 */
@@ -310,6 +426,11 @@ public:
 	// The same for one light against one surface. Its five images arrive
 	// together because the program samples all five and its sampling variant is
 	// the tuple of what they ask for, not any one of them.
+	//
+	// The stencil is here and not in the state bits because that is where a
+	// modern API keeps it: a light whose shadows have been counted is drawn
+	// through a pipeline that tests the count, and one with no shadow-casting
+	// surface through a pipeline that does not.
 	struct interactionDraw_t {
 		idEacpInteractionProgram *				program;
 		const eacp::GPU::RenderPipeline *		pipeline;
@@ -318,7 +439,19 @@ public:
 	interactionDraw_t		InteractionDraw( const idImage *bump, const idImage *falloff,
 											 const idImage *projection, const idImage *diffuse,
 											 const idImage *specular,
-											 int stateBits, int cullType );
+											 int stateBits, int cullType,
+											 eacpStencil_t stencil );
+
+	// One shadow volume, or the quad that clears the count before them. Both go
+	// through the one program - the clear being that program with an identity
+	// transform and the light at the origin, which makes its extrusion the
+	// identity too - so what tells them apart is entirely the pipeline.
+	struct shadowDraw_t {
+		idEacpShadowProgram *					program;
+		const eacp::GPU::RenderPipeline *		pipeline;
+	};
+
+	shadowDraw_t			ShadowDraw( int stateBits, int cullType, eacpStencil_t stencil );
 
 	// Geometry for one draw, in a buffer no frame still in flight is reading.
 	// The reference is good until this frame's pool comes round again, which is
@@ -326,11 +459,11 @@ public:
 	const eacp::GPU::Buffer &	StreamVertices( const void *data, std::size_t bytes );
 	const eacp::GPU::Buffer &	StreamIndices( const void *data, std::size_t bytes );
 
-	// How many programs and pipelines have been compiled, over both caches, for
-	// the log line that says what a level's content actually cost. Both numbers
-	// are the content's answer to a question plan.md only sized: how many of
-	// the sampling combinations a level reaches, and how many pieces of Doom 3
-	// state it draws them in.
+	// How many programs and pipelines have been compiled, over all three
+	// caches, for the log line that says what a level's content actually cost.
+	// Both numbers are the content's answer to a question plan.md only sized:
+	// how many of the sampling combinations a level reaches, and how many
+	// pieces of Doom 3 state it draws them in.
 	int						NumPrograms( void ) const;
 	int						NumPipelines( void ) const;
 
@@ -341,6 +474,7 @@ private:
 	struct statePipeline_t {
 		int									stateBits;
 		int									cullType;
+		eacpStencil_t						stencil;
 		eacp::GPU::RenderPipeline *			pipeline;
 	};
 
@@ -375,12 +509,31 @@ private:
 	// moved, and a vector that grows does one or the other.
 	eacp::Vector<interactionVariant_t *>	interactions;
 
-	// The pipeline both caches build, from the state Doom 3 asks for and the
-	// program that is going to be drawn with it. NULL if it would not compile,
-	// which the caller answers by skipping the draw.
+	// The shadow program, which has no variants - see the class. What it does
+	// have is more pipelines than either of the others per program: the count
+	// in its two forms, the clear, and the mirrored pair of the count.
+	std::optional<idEacpShadowProgram>		shadowProgram;
+	std::optional<eacp::GPU::ShaderLibrary>	shadowLibrary;
+	eacp::Vector<statePipeline_t>			shadowPipelines;
+
+	// The pipeline all three caches build, from the state Doom 3 asks for and
+	// the program that is going to be drawn with it. NULL if it would not
+	// compile, which the caller answers by skipping the draw.
 	eacp::GPU::RenderPipeline *	BuildPipeline( const eacp::GPU::ShaderLibrary &library,
 											   const eacp::GPU::VertexLayout &layout,
-											   int stateBits, int cullType );
+											   int stateBits, int cullType,
+											   eacpStencil_t stencil );
+
+	// The one lookup all three caches do: a linear search of the pipelines
+	// already compiled for a program, and a compile when it is not there. The
+	// list never grows past what the content contains, which is 26 pipelines
+	// over every program in the demo's first level.
+	const eacp::GPU::RenderPipeline *
+							PipelineFor( eacp::Vector<statePipeline_t> &pipelines,
+										 const eacp::GPU::ShaderLibrary &library,
+										 const eacp::GPU::VertexLayout &layout,
+										 int stateBits, int cullType,
+										 eacpStencil_t stencil );
 
 	eacp::GPU::StreamingBuffers	vertexStream;
 	eacp::GPU::StreamingBuffers	indexStream;

@@ -65,14 +65,20 @@ Suite 120, Rockville, Maryland 20850 USA.
 	Step 4c drew the 2D view - the menus, the console, the HUD, the loading
 	screens - which is one path: shader passes over a viewDef with no
 	viewEntitys. Step 4d is the world, in three: the depth fill, the interaction
-	program and the stencil shadow pass. The first of the three is in, so a 3D
-	view now occludes correctly and draws its ambient stages; DrawView says
-	where the other two would go.
+	program and the stencil shadow pass. All three are in, so a 3D view occludes
+	correctly, is lit by every light in it, and is shadowed by whatever stands
+	between the two.
 
 ===============================================================================
 */
 
 using namespace eacp;
+
+// Declared in RenderSystem_init.cpp and not in tr_local.h, the same way
+// draw_common.cpp reaches it. r_useStencilOpSeparate is its neighbour there and
+// is deliberately not here: both of eacp's backends carry per-face stencil state
+// outright, so there is no one-face-at-a-time path for it to choose between.
+extern idCVar r_useCarmacksReverse;
 
 /*
 ================================================================================
@@ -284,6 +290,17 @@ private:
 	void			DrawInteractions( void );
 	void			CreateDrawInteractions( const drawSurf_t *surf );
 
+	// RB_StencilShadowPass and RB_T_Shadow, rewritten. What stands between a
+	// light and a surface, counted into the stencil buffer so that the
+	// interactions after it can be masked by the count.
+	void			StencilShadowPass( const drawSurf_t *drawSurfs );
+	void			ShadowSurface( const drawSurf_t *surf );
+
+	// The qglClear( GL_STENCIL_BUFFER_BIT ) each light does before its own
+	// volumes are counted, which a pass that has already begun cannot do - so
+	// it is a quad drawn over the light's scissor rectangle instead.
+	void			ClearStencil( void );
+
 public:
 	// Reached through R_EacpDrawInteraction below, because
 	// RB_CreateSingleDrawInteractions takes a plain function pointer - it was
@@ -351,6 +368,13 @@ private:
 	// same space does not.
 	float				appliedDepthHack;
 
+	// How the light being drawn reads the stencil buffer: the mask, if its
+	// shadow volumes have just been counted into it, and nothing if it has
+	// none. On OpenGL this is a glStencilFunc left in the context between the
+	// shadow pass and the interactions; here it is part of the pipeline each
+	// interaction is drawn through, so it has to be carried to the draw.
+	eacpStencil_t		lightStencil;
+
 	// One warning per unimplemented path rather than one per frame, which is
 	// the difference between a note and an unusable console.
 	bool				warnedCopyFramebuffer;
@@ -361,7 +385,9 @@ private:
 	bool				warnedClipPlanes;
 	bool				warnedSubviewPass;
 	bool				warnedReadPixels;
-	bool				warnedShadows;
+	bool				warnedShowShadows;
+	bool				warnedDepthPassShadows;
+	bool				warnedShadowVertexProgram;
 };
 
 static idRenderBackendEacp	renderBackendEacp;
@@ -391,6 +417,7 @@ idRenderBackendEacp::idRenderBackendEacp() {
 	depthRangeNear = 0.0f;
 	depthRangeFar = 1.0f;
 	appliedDepthHack = 0.0f;
+	lightStencil = ES_IGNORE;
 	warnedCopyFramebuffer = false;
 	warnedCompressed = false;
 	warnedExternalFormat = false;
@@ -399,7 +426,9 @@ idRenderBackendEacp::idRenderBackendEacp() {
 	warnedClipPlanes = false;
 	warnedSubviewPass = false;
 	warnedReadPixels = false;
-	warnedShadows = false;
+	warnedShowShadows = false;
+	warnedDepthPassShadows = false;
+	warnedShadowVertexProgram = false;
 }
 
 /*
@@ -520,7 +549,7 @@ void idRenderBackendEacp::Shutdown( void ) {
 
 	// What the content actually cost, rather than what plan.md section 4.3
 	// sized it at: two numbers, at the one moment the whole run is known.
-	common->Printf( "eacp: %i material-stage programs and %i pipelines compiled\n",
+	common->Printf( "eacp: %i programs and %i pipelines compiled\n",
 					eacpRenderProgs.NumPrograms(), eacpRenderProgs.NumPipelines() );
 
 	eacpRenderProgs.Shutdown();
@@ -556,6 +585,14 @@ void idRenderBackendEacp::BeginPass( bool clearColor ) {
 	descriptor.clearStencil = (unsigned char)( 1 << ( glConfig.stencilBits - 1 ) );
 
 	pass = new GPU::RenderPass( eacpFrame->beginPass( descriptor ) );
+
+	// The one value every stencil comparison in the frame is against, and the
+	// one StencilOp::Replace writes - which is why it can be said once here
+	// rather than per draw. Doom 3 passes 128 to every glStencilFunc that
+	// matters and 1 to the one that does not: RB_StencilShadowPass sets
+	// GL_ALWAYS while the count is being taken, where the reference is not
+	// read at all.
+	pass->setStencilReference( (unsigned int)descriptor.clearStencil );
 }
 
 void idRenderBackendEacp::EndPass( void ) {
@@ -723,8 +760,8 @@ idRenderBackendEacp::DrawView
 
 RB_STD_DrawView. The sequence rather than the calls: fill the depth buffer, add
 each light through the stencil, blend the passes that do not depend on a light,
-fog. Three of the four are here; the stencil half of the second is 4d.3 and the
-fourth is 4e, and each says so where it would be.
+fog. Three of the four are here whole; the fourth is 4e and says so where it
+would be.
 ======================
 */
 void idRenderBackendEacp::DrawView( void ) {
@@ -1141,10 +1178,12 @@ idRenderBackendEacp::DrawInteractions
 
 RB_ARB2_DrawInteractions: every light in the view, added to the frame.
 
-Two of its parts are missing and both are step 4d.3's. There is no stencil
-shadow pass, so a light lights everything inside its volume whether or not
-something stands between - and there is therefore no stencil clear either, which
-is the other half of the same step. What is here is the light itself.
+The order of the four calls inside the loop is not a detail. Doom 3 counts the
+shadows a light casts onto *other* entities, adds the surfaces of the entity
+casting them, counts the shadows it casts onto itself, and adds everything else
+- which is what lets a monster's own shadow miss its own face while still
+falling on the floor. MF_NOSELFSHADOW is what sorts a surface into which list,
+and the interleaving is what makes the flag mean anything.
 ======================
 */
 void idRenderBackendEacp::DrawInteractions( void ) {
@@ -1174,17 +1213,35 @@ void idRenderBackendEacp::DrawInteractions( void ) {
 			continue;
 		}
 
-		// 4d.3: RB_StencilShadowPass( vLight->globalShadows ) runs here and
-		// again between the two lists below, with the stencil buffer cleared
-		// over the light's scissor rectangle ahead of both. Until it does, a
-		// shadow-casting light is drawn as if nothing cast one.
-		if ( ( vLight->globalShadows || vLight->localShadows ) && !warnedShadows ) {
-			warnedShadows = true;
-			common->Warning( "eacp: the stencil shadow pass is not implemented, so a "
-							 "light shines through whatever should be shadowing it" );
+		const bool	shadows = ( vLight->globalShadows || vLight->localShadows )
+			&& r_shadows.GetBool();
+
+		if ( shadows ) {
+			// The count starts from the same number under every light, which is
+			// what the clear is for - and it is over the light's own scissor
+			// rectangle, because that is the only part of the buffer this light
+			// will read.
+			backEnd.currentScissor = vLight->scissorRect;
+
+			if ( r_useScissor.GetBool() ) {
+				SetScissor( backEnd.currentScissor );
+			}
+
+			ClearStencil();
+
+			lightStencil = ES_LIT;
+		} else {
+			// Nothing has been counted, so nothing may be masked: a light with
+			// no shadow-casting surface in view has to reach every fragment
+			// inside it, including the ones an earlier light's volumes left a
+			// count in. glStencilFunc( GL_ALWAYS, 128, 255 ) is how OpenGL says
+			// that and a pipeline that ignores the buffer is how this does.
+			lightStencil = ES_IGNORE;
 		}
 
+		StencilShadowPass( vLight->globalShadows );
 		CreateDrawInteractions( vLight->localInteractions );
+		StencilShadowPass( vLight->localShadows );
 		CreateDrawInteractions( vLight->globalInteractions );
 
 		// A translucent surface is never in the depth buffer the fill wrote, so
@@ -1195,10 +1252,14 @@ void idRenderBackendEacp::DrawInteractions( void ) {
 			continue;
 		}
 
+		lightStencil = ES_IGNORE;
+
 		backEnd.depthFunc = GLS_DEPTHFUNC_LESS;
 		CreateDrawInteractions( vLight->translucentInteractions );
 		backEnd.depthFunc = GLS_DEPTHFUNC_EQUAL;
 	}
+
+	lightStencil = ES_IGNORE;
 }
 
 /*
@@ -1261,6 +1322,306 @@ void idRenderBackendEacp::CreateDrawInteractions( const drawSurf_t *surf ) {
 }
 
 /*
+================================================================================
+
+	The shadows.
+
+	Step 4d.3, and the last of the three the world was broken into. What the
+	other two leave undone: 4d.1 put every surface in the depth buffer at its
+	own depth and 4d.2 added each light to the surfaces inside it, but nothing
+	yet asks whether something stands between the two.
+
+	The answer is a count. Every shadow-casting surface under a light is
+	extruded away from it into a closed volume, that volume is rasterized into
+	the stencil buffer with the two facings counting in opposite directions, and
+	a fragment whose count came back to where it started is a fragment no volume
+	closed over. The interactions are then drawn through that count as a mask.
+
+	Three things about it are eacp's rather than Doom 3's:
+
+	  - **the two facings are one pipeline**, which is what glStencilOpSeparate
+	    buys and what the four-way branch in RB_T_Shadow spends its length
+	    working around. Both of eacp's backends have per-face stencil state
+	    outright, so this is the one branch of the four.
+	  - **the clear is a draw**, because a pass cannot be cleared once it has
+	    begun. See ClearStencil.
+	  - **the extrusion is the only vertex program Doom 3 has that this backend
+	    keeps as a program.** shadow.vp is two instructions and no fragment
+	    program, and it survives because what it computes is geometry rather
+	    than a fixed-function state that a modern API spells differently.
+
+================================================================================
+*/
+
+/*
+======================
+idRenderBackendEacp::ClearStencil
+
+qglClear( GL_STENCIL_BUFFER_BIT ) inside the light's scissor rectangle, which is
+what every light does before its own volumes are counted.
+
+**A pass cannot be cleared once it has begun.** The clear is a property of the
+attachment being loaded on both of eacp's backends, decided as the pass opens,
+so the only way to empty a rectangle of the stencil buffer in the middle of a
+frame is to draw over it - a quad, with StencilOp::Replace writing the pass's
+reference value everywhere it covers. The scissor does the rest: it is already
+the light's, so the quad reaches exactly the pixels the clear would have.
+
+The quad goes through the shadow program, which sounds like a stretch and is
+not: with the transform the identity and the light at the origin, the extrusion
+that program computes is the identity too, so what it draws is the corners it
+was handed. They are in clip space already, which is what the identity matrix
+means here.
+======================
+*/
+void idRenderBackendEacp::ClearStencil( void ) {
+	if ( !pass ) {
+		return;
+	}
+
+	// Two triangles over the whole of clip space at the near plane. The depth
+	// is never read - the pipeline below tests Always and writes nothing - so
+	// what it is chosen for is only being inside the frustum.
+	static const eacpShadowVert_t	corners[6] = {
+		{ { -1.0f, -1.0f, 0.0f, 1.0f } },
+		{ {  1.0f, -1.0f, 0.0f, 1.0f } },
+		{ {  1.0f,  1.0f, 0.0f, 1.0f } },
+		{ { -1.0f, -1.0f, 0.0f, 1.0f } },
+		{ {  1.0f,  1.0f, 0.0f, 1.0f } },
+		{ { -1.0f,  1.0f, 0.0f, 1.0f } },
+	};
+
+	// No colour, no depth, and no cull - the quad's winding is nobody's
+	// business, and CT_TWO_SIDED is what says so.
+	const int	stateBits = GLS_DEPTHMASK | GLS_COLORMASK | GLS_ALPHAMASK
+		| GLS_DEPTHFUNC_ALWAYS;
+
+	idEacpRenderProgs::shadowDraw_t	draw =
+		eacpRenderProgs.ShadowDraw( stateBits, CT_TWO_SIDED, ES_CLEAR );
+
+	if ( !draw.pipeline ) {
+		return;
+	}
+
+	static const float	identity[16] = {
+		1.0f, 0.0f, 0.0f, 0.0f,
+		0.0f, 1.0f, 0.0f, 0.0f,
+		0.0f, 0.0f, 1.0f, 0.0f,
+		0.0f, 0.0f, 0.0f, 1.0f
+	};
+
+	draw.program->modelViewProjection = asFloat4x4( identity );
+	draw.program->localLightOrigin = asFloat4( 0.0f, 0.0f, 0.0f, 0.0f );
+
+	const GPU::Buffer &	vertices =
+		eacpRenderProgs.StreamVertices( corners, sizeof( corners ) );
+
+	pass->setPipeline( *draw.pipeline );
+	pass->setVertexBuffer( vertices );
+	pass->setUniforms( *draw.program );
+
+	pass->draw( 6 );
+
+	// Not a draw the renderer knows about, so nothing it counts - and the three
+	// fields a draw is issued from are left as this found them, which is null:
+	// the shadow surfaces set their own.
+	drawProgram = NULL;
+	drawPipeline = NULL;
+	drawVertices = NULL;
+}
+
+/*
+======================
+idRenderBackendEacp::StencilShadowPass
+
+RB_StencilShadowPass, and the walk RB_RenderDrawSurfChainWithFunction did for it.
+
+Four things it does that are not here, and each is switched off by something
+this port controls rather than skipped:
+
+  - **the polygon offset** ( r_shadowPolygonFactor, r_shadowPolygonOffset ),
+    which is eacp gap 6 - the same gap the decals want, and this is its second
+    user. It matters because a volume's near cap is the occluder's own
+    triangles: they are rebuilt through the extrusion's subtract-and-add rather
+    than copied, so the cap lands within an ulp of the depth the surface itself
+    wrote and which side of LessEqual it falls on is decided by rounding. Doom 3
+    biases it one unit away and settles the question; nothing here does, and
+    nothing in the frames measured shows it. If a shadow ever creeps onto the
+    face that casts it, this is the reason.
+  - **the depth bounds test**, which is a scope cut (plan.md section 7) and is
+    already off: glConfig.depthBoundsTestAvailable is false.
+  - **r_showShadows**, the debug visualisation, which draws the volumes
+    visibly - as lines for two of its three values, and GLS_POLYMODE_LINE has
+    no eacp counterpart any more than r_showTris' does.
+  - **r_useCarmacksReverse 0**, the depth-pass-only algorithm from before the
+    patent expired. What it needs beyond what is here is a third pair of
+    stencil ops for its "preload", and nothing runs it: the cvar has defaulted
+    to 1 since 2019.
+======================
+*/
+void idRenderBackendEacp::StencilShadowPass( const drawSurf_t *drawSurfs ) {
+	if ( !r_shadows.GetBool() ) {
+		return;
+	}
+
+	if ( !drawSurfs ) {
+		return;
+	}
+
+	if ( r_showShadows.GetInteger() && !warnedShowShadows ) {
+		warnedShowShadows = true;
+		common->Warning( "eacp: r_showShadows is not implemented, so the shadow "
+						 "volumes are counted rather than drawn" );
+	}
+
+	if ( !r_useCarmacksReverse.GetBool() && !warnedDepthPassShadows ) {
+		warnedDepthPassShadows = true;
+		common->Warning( "eacp: r_useCarmacksReverse 0 is not implemented, so the "
+						 "shadows are counted depth-fail either way" );
+	}
+
+	if ( !r_useShadowVertexProgram.GetBool() && !warnedShadowVertexProgram ) {
+		warnedShadowVertexProgram = true;
+		common->Warning( "eacp: r_useShadowVertexProgram 0 has no counterpart here - "
+						 "the extrusion is the only way this backend projects a "
+						 "shadow volume" );
+	}
+
+	// Write nothing but the stencil plane. The depth test still runs, and has
+	// to: which side of it a fragment falls on is the whole of what is being
+	// counted.
+	SetState( GLS_DEPTHMASK | GLS_COLORMASK | GLS_ALPHAMASK | GLS_DEPTHFUNC_LESS );
+
+	// Both facings rasterized, which is what makes one pass over the volume
+	// enough. GL_Cull's own state has to agree, because it is what the next
+	// thing to draw compares against.
+	SetCull( CT_TWO_SIDED );
+
+	backEnd.currentSpace = NULL;
+
+	for ( const drawSurf_t *surf = drawSurfs ; surf ; surf = surf->nextOnLight ) {
+		SetSpace( surf->space, surf->space->modelDepthHack );
+
+		if ( r_useScissor.GetBool() && !backEnd.currentScissor.Equals( surf->scissorRect ) ) {
+			backEnd.currentScissor = surf->scissorRect;
+			SetScissor( backEnd.currentScissor );
+		}
+
+		ShadowSurface( surf );
+	}
+
+	SetCull( CT_FRONT_SIDED );
+
+	drawProgram = NULL;
+	drawPipeline = NULL;
+	drawVertices = NULL;
+}
+
+/*
+======================
+idRenderBackendEacp::ShadowSurface
+
+RB_T_Shadow: one surface's volume, counted.
+
+Two decisions are made per surface and both are the frontend's work being read
+back rather than anything computed here.
+
+**How much of the volume to draw.** A shadow volume is built as sil planes
+first, then the cap on the surface facing the light, then the cap at infinity -
+so a shorter index count is a volume without its caps, and the frontend has
+already worked out which surfaces can do without them. R_PotentiallyInsideInfiniteShadow
+is what sets DSF_VIEW_INSIDE_SHADOW, and a volume the view is outside of needs
+no caps at all.
+
+**Which way to count.** A volume the view is outside of can be counted on the
+fragments that passed the depth test, which is the older and cheaper algorithm;
+one the view is inside has to be counted on the fragments that failed it, which
+is Carmack's reverse and is why the caps were needed in the first place. The
+`external` flag is the same one in both decisions, which is not a coincidence -
+it is one question asked once.
+======================
+*/
+void idRenderBackendEacp::ShadowSurface( const drawSurf_t *surf ) {
+	const srfTriangles_t *	tri = surf->geo;
+
+	if ( !tri->shadowCache ) {
+		return;
+	}
+
+	int		numIndexes;
+	bool	external = false;
+
+	if ( !r_useExternalShadows.GetInteger() ) {
+		numIndexes = tri->numIndexes;
+	} else if ( r_useExternalShadows.GetInteger() == 2 ) {	// force no caps, for testing
+		numIndexes = tri->numShadowIndexesNoCaps;
+	} else if ( !( surf->dsFlags & DSF_VIEW_INSIDE_SHADOW ) ) {
+		// outside the shadow projection: no caps are ever needed
+		numIndexes = tri->numShadowIndexesNoCaps;
+		external = true;
+	} else if ( !backEnd.vLight->viewInsideLight
+				&& !( surf->geo->shadowCapPlaneBits & SHADOW_CAP_INFINITE ) ) {
+		// inside the projection but outside the light, on a volume that ends:
+		// some of the caps can still go
+		if ( backEnd.vLight->viewSeesShadowPlaneBits & surf->geo->shadowCapPlaneBits ) {
+			numIndexes = tri->numShadowIndexesNoFrontCaps;
+		} else {
+			numIndexes = tri->numShadowIndexesNoCaps;
+		}
+		external = true;
+	} else {
+		numIndexes = tri->numIndexes;
+	}
+
+	const bool	mirrored = backEnd.viewDef->isMirror;
+
+	eacpStencil_t	stencil;
+
+	if ( external ) {
+		stencil = mirrored ? ES_COUNT_DEPTH_PASS_MIRRORED : ES_COUNT_DEPTH_PASS;
+	} else {
+		stencil = mirrored ? ES_COUNT_DEPTH_FAIL_MIRRORED : ES_COUNT_DEPTH_FAIL;
+	}
+
+	idEacpRenderProgs::shadowDraw_t	draw =
+		eacpRenderProgs.ShadowDraw( backEnd.glState.glStateBits,
+									backEnd.glState.faceCulling, stencil );
+
+	if ( !draw.pipeline ) {
+		return;
+	}
+
+	draw.program->modelViewProjection = asFloat4x4( modelViewProjection );
+
+	// The light in the surface's own coordinates, which is the whole of what
+	// the extrusion needs. w = 0 is not decoration: shadow.vp relies on it to
+	// leave a vertex's own w alone through the subtraction, and
+	// R_GlobalPointToLocal writes three floats.
+	idVec4	localLight;
+
+	R_GlobalPointToLocal( surf->space->modelMatrix, backEnd.vLight->globalLightOrigin,
+						  localLight.ToVec3() );
+	localLight.w = 0.0f;
+
+	draw.program->localLightOrigin = asFloat4( localLight[0], localLight[1],
+											   localLight[2], localLight[3] );
+
+	// The shadow cache is the vertex cache's own block and its size is what
+	// says how much of it there is: a volume that extrudes on the GPU shares
+	// the ambient surface's doubled cache, so the surface's own numVerts is not
+	// the count.
+	const void *	vertices = vertexCache.Position( tri->shadowCache );
+
+	drawVertices = &eacpRenderProgs.StreamVertices( vertices,
+													(std::size_t)tri->shadowCache->size );
+
+	drawProgram = draw.program;
+	drawPipeline = draw.pipeline;
+
+	RB_DrawShadowElementsWithCounters( tri, numIndexes );
+}
+
+/*
 ======================
 idRenderBackendEacp::DrawInteraction
 
@@ -1281,7 +1642,8 @@ void idRenderBackendEacp::DrawInteraction( const drawInteraction_t *din ) {
 										 din->lightImage, din->diffuseImage,
 										 din->specularImage,
 										 backEnd.glState.glStateBits,
-										 backEnd.glState.faceCulling );
+										 backEnd.glState.faceCulling,
+										 lightStencil );
 
 	if ( !draw.pipeline ) {
 		return;
