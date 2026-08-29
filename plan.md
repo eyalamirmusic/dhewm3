@@ -258,6 +258,17 @@ in content overwhelmingly the two uniform ones, a material-level `clamp` clampin
 all three together. The **generic material stage** is one texture, so `2 × 2 = 4`.
 Everything else is fixed at author time.
 
+**That paragraph counted the wrong textures, and step 4d.2 found out by writing
+the program.** The interaction shader samples *five*: the three above plus the
+light's projected image and its falloff, and those two are declared by the
+**light** material rather than the surface's — so a light that repeats where its
+neighbour clamps is a second program, and a projection sampled with the wrong
+address mode tiles a light across a level instead of dimming it. The key space
+is `4⁵ = 1024`, not 8. What survives is the *decision* below, and it survives
+because it was a lazy cache rather than a sized array: the demo's first level
+reaches two of the thousand. The shape had to change with the number, though —
+1024 slots is a list searched on a packed key, not an array.
+
 **Decision: a lazy variant cache keyed on the tuple of samplings a draw needs,
 built on eacp's four configurations as they stand.** Compiled on first use, so we
 pay for the combinations the content contains rather than the sixteen it could.
@@ -304,8 +315,12 @@ Numbers are never reused, so a hole is an entry that closed.
 
 4. **BC/DXT compressed texture formats** — all Doom 3 art ships as DXT1/3/5 in the
    pk4s. Without it: decompress at load, ~4× VRAM, much slower level loads.
-5. **Cube textures** — skyboxes and reflections. (The normalization cubemap can be
-   deleted outright; `normalize()` is free now.)
+5. **Cube textures** — skyboxes and reflections. Two of the three users are
+   gone rather than pending: step 4d.2 deleted the normalization cube map, as
+   this entry predicted it could, and the `_ambient` map that stands in for it
+   on an ambient light with it — that one becoming a uniform, since the whole
+   point of the substitution is that the answer does not vary with the lookup.
+   What is left needs real cube sampling.
 6. **Depth bias / polygon offset** — decals z-fight without it.
 7. **Mip filter selection and anisotropy** — currently `Linear|Nearest` ×
    `Clamp|Repeat` only. Doom 3 exposes trilinear and aniso as cvars.
