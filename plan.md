@@ -4,12 +4,13 @@ Moving dhewm3 off SDL2 + OpenGL and onto [eacp](https://github.com/eyalamirmusic
 app lifecycle and message loop first, GPU rendering (Metal / D3D12) as the real work.
 
 **Status: Phase 0 is done and merged. Phase 1 has landed its gate and its seam.
-Phase 2 is under way: the app shell, the threading, the boot, the input and now
-the renderer's own scaffolding are in. `dhewm3-eacp` runs the engine with its
-renderer switched **on** — the frontend culls, lights and issues its command
-list, 176 images are on the GPU as Metal textures, and the backend consumes the
-list and draws nothing. Drawing is what is left, and its first step went back
-into eacp for the blend equation Doom 3's materials are written in.**
+Phase 2 is under way: the app shell, the threading, the boot, the input and the
+renderer are in, and the renderer now draws. `dhewm3-eacp` puts **Doom 3's main
+menu on screen through Metal** — every 2D element of it, out of one generic
+material-stage program in eacp's shader EDSL, five compiled pipelines and a
+streaming vertex pool. What is missing from that picture is the one thing in the
+menu that is not 2D: the lit Mars globe, which is a `renderDef`, and which is
+the world — step 4d.**
 
 Reference implementation for almost everything on the platform side:
 `~/Code/PureDOOM/examples/EACP` — a complete engine hosted on eacp, with its own
@@ -932,6 +933,103 @@ made an earlier `GIT_TAG main` fetch four-month-old eacp and report success — 
 a function ahead of `CPMAddPackage` fast-forwards the clone and configure prints
 which commit the branch resolved to.
 
+#### Step 4c — 2D, and the menu is on screen — **done**
+
+Everything Doom 3 puts on screen without a world goes through one path, and that
+path now runs on Metal. `renderer/RenderProgs_Eacp.{h,cpp}` holds the generic
+material-stage program, the two caches a modern API needs where OpenGL needed
+none, and the streaming pool; `idRenderBackendEacp::DrawView` holds the walk,
+which is `RB_STD_DrawShaderPasses` and `RB_STD_T_RenderShaderPasses` rewritten
+rather than ported.
+
+**The whole of a material stage is four lines of EDSL.** A texture sampled at a
+transformed coordinate, multiplied by a colour that is part constant and part
+per-vertex. What that replaces is a matrix stack, a texture matrix, `glColor`, a
+colour array, `GL_COMBINE_ARB` and six `qglTexEnvi` calls — and, for
+`SVC_INVERSE_MODULATE` with a non-white constant colour, a *second texture unit
+bound to the white image* purely so a combiner had somewhere to put the multiply.
+
+**Two caches, because a pipeline is compiled from all the state at once.** A
+program per sampling configuration, because eacp bakes the sampler into the
+shader (§4.3), and a pipeline per piece of Doom 3 state under it. Both lazy. The
+whole main menu asks for **four programs and five pipelines**, which is a number
+this build prints at shutdown rather than a number this plan guessed: §4.3 sized
+the sampling half at four and deliberately left the state half to the content.
+
+**Measured at the menu:** 102 draws, 542 triangles, 3 views a frame, clean under
+`MTL_DEBUG_LAYER=1` with `MTL_SHADER_VALIDATION=1` and GPU validation on, and not
+one warning from any of the paths this step leaves open — no stage skipped for a
+texgen, no image without a texture behind it. The picture is the SDL/GL build's
+element for element.
+
+**Five things it cost, and the first is the one that would have cost a day:**
+
+- **OpenGL clips against `-w ≤ z ≤ w` and Metal and D3D12 against `0 ≤ z ≤ w`,
+  and 2D is where that difference is total rather than subtle.** The gui model's
+  projection is `glOrtho( 0, 640, 480, 0, 0, 1 )` and every vertex it emits is at
+  `z = 0`, which the matrix sends to `z_ndc = -1` — *exactly* OpenGL's near plane,
+  and just outside everyone else's frustum. Uncorrected, the menu is not dim or
+  offset or z-fighting; it is clipped away entirely, and the failure looks
+  identical to a backend that never drew. One row of the matrix — `z' = (z + w)/2`
+  — is the whole fix, applied on the CPU where the matrix is built, because it is
+  a property of the API the matrix is going *to* rather than of the geometry it
+  came from.
+
+- **The alpha test in the `GLS_*` bitfield is dead code, and the real one is
+  somewhere else.** `GLS_ATEST_EQ_255`, `GLS_ATEST_LT_128` and `GLS_ATEST_GE_128`
+  have **zero** call sites in the whole tree; what Doom 3 actually alpha-tests
+  with is `shaderStage_t::hasAlphaTest` and a register-valued threshold, applied
+  by the depth-fill pass, which is step 4d's. So `setDiscardBelow` is not this
+  step's, and the three shader variants that looked mandatory are not. Worth
+  finding before building them, and doubly so because `LT_128` — keep where
+  alpha is *below* the threshold — is the one of the three that
+  `setDiscardBelow` cannot express at all.
+
+- **`CT_FRONT_SIDED` culls `GL_FRONT`**, which reads backwards until you know
+  Doom 3's triangles are wound the other way round from OpenGL's default. eacp
+  names the convention rather than the call — counter-clockwise **in clip space**
+  is the front face, spelled the same on both backends — and OpenGL's default
+  front face is that same convention, so the two enums line up directly and
+  `CT_FRONT_SIDED` is `CullMode::Front`. The mirror flip stays where `GL_Cull`
+  put it.
+
+- **The vertex is uploaded as `idDrawVert`, not repacked into something the
+  shader layer likes better.** One `GPU::UNorm8x4` field is what says the colour
+  is four bytes read as 0..1 rather than four floats, and with that declaration
+  the sixty bytes the engine already holds *are* the vertex layout — no per-draw
+  conversion pass, and `vertexInput(&member)` still reads the offsets off the
+  struct. A `static_assert` against `idDrawVert`'s size and two of its offsets is
+  what keeps the two from drifting into geometry that comes out scrambled.
+
+- **The seam's `DrawIndexed` is real on this backend, and what it draws *with* is
+  three fields.** In OpenGL every input to `glDrawElements` is context state,
+  left there by whoever last touched it; here the program, the pipeline and the
+  vertex buffer are arguments, so the walk sets three members where the OpenGL
+  path sets GL's, and the draw reads them. Which means the draws still go through
+  `RB_DrawElementsWithCounters`, so `r_showPrimitives` counts the same thing on
+  both backends — and it means a draw arriving from a path this backend has not
+  written yet finds them null and is a no-op rather than a draw against whatever
+  the last one left bound.
+
+**What the menu is missing is not 2D.** The Mars globe is a `renderDef` — a lit
+`models/wipes/planet2.lwo` rendered into a sub-rectangle of the screen, which
+`r_debugRenderToTexture 1` reports as `3d: 1, 2d: 2` on every frame. What this
+build draws in its place is `guis/assets/mainmenu/marshighlight`, the 2D halo the
+gui fades in *over* the model — so the dark disc in the screenshot is correct,
+and the bright lit sphere the SDL build shows under it is step 4d's.
+
+**Left open on purpose**, each already switched off by something this port
+controls: texgens other than `TG_EXPLICIT` (skipped with one warning, and 4e's),
+polygon offset (gap 6, and no 2D content asks), `GLS_POLYMODE_LINE` (`r_showTris`
+wireframe, which eacp cannot express), and new-style ARB-program stages and soft
+particles — both of which the *shared* code already skips on any backend that is
+not `BE_ARB2`.
+
+The gate is untouched again: nothing outside `RenderBackend_Eacp.cpp`, the two
+new `RenderProgs_Eacp` files and the eacp source list in `neo/CMakeLists.txt` was
+edited, so the SDL/GL binary is byte-identical and its 297/297 stands without
+re-running.
+
 ### Shader inventory for Phase 2
 
 Roughly 10–15 EDSL programs, each in the sampling variants §4.3 sizes — 8 worst case
@@ -1021,18 +1119,21 @@ Phase 2 is the first work that compiles against eacp. In rough order:
    - ~~**4b′. The blend equation and the write mask, in eacp.**~~ — **done**,
      §6. What 4c turned out to need before it could start: gaps 12 and 17,
      closed in eacp and the pin moved onto `main`.
-   - **4c. 2D.** ← **next.** Everything Doom 3 puts
-     on screen without a world —
-     the menus, the console, the HUD, the loading screens — goes through one
-     path, `RB_STD_DrawShaderPasses` over a `viewDef` with no `viewEntitys`.
-     So the *generic material stage* program is the first shader to write, and
-     it buys the largest visible step in the port: a menu that can be clicked.
-     It also exercises the whole draw plumbing at once — the state bitfield
-     translated into a pipeline, the variant cache §4.3 sizes, geometry
-     streamed through `GPU::StreamingBuffers`, textures bound per stage.
-   - **4d. The world.** Depth fill, the interaction program, the stencil shadow
-     pass. `Apps/GPU/StencilShadows` is the worked example for the last of
-     those and exists for exactly this moment.
+   - ~~**4c. 2D.**~~ — **done**, §6. Everything Doom 3 puts on screen without a
+     world — the menus, the console, the HUD, the loading screens — goes
+     through one path, `RB_STD_DrawShaderPasses` over a `viewDef` with no
+     `viewEntitys`, and the generic material stage is the one program that
+     draws all of it. The main menu is on screen: four programs, five
+     pipelines, 102 draws a frame, clean under the validation layers. It
+     exercised the whole draw plumbing at once, which is what it was for —
+     the state bitfield translated into a pipeline, the variant cache §4.3
+     sizes, geometry streamed through `GPU::StreamingBuffers`, a texture per
+     stage.
+   - **4d. The world.** ← **next.** Depth fill, the interaction program, the
+     stencil shadow pass. `Apps/GPU/StencilShadows` is the worked example for
+     the last of those and exists for exactly this moment. The first thing it
+     buys is visible without leaving the main menu: the lit Mars globe, which
+     is a `renderDef` and the one part of that screen 4c does not draw.
    - **4e. What is left.** Fog and blend lights, the texgen variants
      (reflect, skybox, wobblesky), subviews and mirrors, and `_currentRender` —
      which needs the composited frame to live in an app-owned render target

@@ -42,6 +42,8 @@ Suite 120, Rockville, Maryland 20850 USA.
 // two has to include eacp's headers before Doom 3's.
 #include <eacp/GPU/GPU.h>
 
+#include "renderer/RenderProgs_Eacp.h"
+
 #include "sys/platform.h"
 
 #include "renderer/tr_local.h"
@@ -60,9 +62,10 @@ Suite 120, Rockville, Maryland 20850 USA.
 	four has a counterpart in Metal or D3D12. So DrawView is rewritten rather
 	than ported, out of the same viewDef_t the frontend already builds.
 
-	What this step lands is everything around that: the device coming up, the
-	images, the frame and its passes, and the per-draw state recorded where the
-	draws will read it. DrawView itself still draws nothing - see step 4c.
+	What is drawn so far is the 2D view - the menus, the console, the HUD, the
+	loading screens - which is step 4c, and which is one path: shader passes
+	over a viewDef with no viewEntitys. The world is step 4d, and DrawView says
+	so where it turns back.
 
 ===============================================================================
 */
@@ -235,6 +238,18 @@ private:
 	void			BeginPass( bool clearColor );
 	void			EndPass( void );
 
+	// RB_BeginDrawingView's half that survives: where on the target this view
+	// lands, and what part of it may be written.
+	void			SetViewport( const idScreenRect &rect );
+	void			SetScissor( const idScreenRect &rect );
+
+	// RB_STD_DrawShaderPasses and RB_STD_T_RenderShaderPasses, rewritten. Not
+	// ported: what they do with two texture units and six combiner calls is one
+	// expression in idEacpStageProgram, and what they do with a matrix stack is
+	// one uniform.
+	void			DrawShaderPasses( drawSurf_t **drawSurfs, int numDrawSurfs );
+	void			DrawSurfaceShaderPasses( const drawSurf_t *surf );
+
 	// The texture an idImage carries, created on the first upload and
 	// destroyed by FreeImage. Held by pointer in idImage::backendTexture,
 	// because GPU::Texture has no empty state to default-construct.
@@ -242,17 +257,36 @@ private:
 	static void				ReplaceTexture( idImage *image, GPU::Texture *texture );
 
 	GPU::RenderPass *	pass;
-	bool				passClearsColor;
 
 	// The image on each texture unit, which is what a draw binds. The GL
 	// backend has no equivalent because GL remembers this itself.
 	idImage *			boundImages[MAX_MULTITEXTURE_UNITS];
+
+	// What the next DrawIndexed will use, and the reason the GL backend needs
+	// no equivalent: in OpenGL every one of these *is* context state, set by
+	// whoever last touched it and still there when glDrawElements is reached.
+	// Here they are arguments to a draw, so the code that would have set the
+	// GL state sets these instead and DrawIndexed reads them.
+	//
+	// Null means nothing has been prepared, which is what makes a draw arriving
+	// from a path this backend has not written yet - the depth fill, the
+	// interactions, the debug tools - a no-op rather than a draw against
+	// whatever the last one left bound.
+	idEacpStageProgram *				drawProgram;
+	const GPU::RenderPipeline *			drawPipeline;
+	const GPU::Buffer *					drawVertices;
+
+	// Clip from model for the space being drawn, rebuilt when the space
+	// changes. GL kept this in the matrix stack.
+	float				modelViewProjection[16];
 
 	// One warning per unimplemented path rather than one per frame, which is
 	// the difference between a note and an unusable console.
 	bool				warnedCopyFramebuffer;
 	bool				warnedCompressed;
 	bool				warnedExternalFormat;
+	bool				warnedTexgen;
+	bool				warnedMissingTexture;
 };
 
 static idRenderBackendEacp	renderBackendEacp;
@@ -260,11 +294,16 @@ idRenderBackend *			renderBackend = &renderBackendEacp;
 
 idRenderBackendEacp::idRenderBackendEacp() {
 	pass = NULL;
-	passClearsColor = false;
 	memset( boundImages, 0, sizeof( boundImages ) );
+	drawProgram = NULL;
+	drawPipeline = NULL;
+	drawVertices = NULL;
+	memset( modelViewProjection, 0, sizeof( modelViewProjection ) );
 	warnedCopyFramebuffer = false;
 	warnedCompressed = false;
 	warnedExternalFormat = false;
+	warnedTexgen = false;
+	warnedMissingTexture = false;
 }
 
 /*
@@ -382,6 +421,13 @@ idRenderBackendEacp::Shutdown
 void idRenderBackendEacp::Shutdown( void ) {
 	EndPass();
 	memset( boundImages, 0, sizeof( boundImages ) );
+
+	// What the content actually cost, rather than what plan.md section 4.3
+	// sized it at: one number, at the one moment the whole run is known.
+	common->Printf( "eacp: %i material-stage pipelines compiled\n",
+					eacpRenderProgs.NumPipelines() );
+
+	eacpRenderProgs.Shutdown();
 }
 
 /*
@@ -414,7 +460,6 @@ void idRenderBackendEacp::BeginPass( bool clearColor ) {
 	descriptor.clearStencil = (unsigned char)( 1 << ( glConfig.stencilBits - 1 ) );
 
 	pass = new GPU::RenderPass( eacpFrame->beginPass( descriptor ) );
-	passClearsColor = false;
 }
 
 void idRenderBackendEacp::EndPass( void ) {
@@ -437,6 +482,10 @@ void idRenderBackendEacp::SetDefaultState( void ) {
 	backEnd.glState.forceGlState = true;
 
 	memset( boundImages, 0, sizeof( boundImages ) );
+
+	drawProgram = NULL;
+	drawPipeline = NULL;
+	drawVertices = NULL;
 }
 
 /*
@@ -450,7 +499,6 @@ r_show* tools rely on to blank the parts of the screen they do not draw.
 */
 void idRenderBackendEacp::SetDrawBuffer( int buffer ) {
 	EndPass();
-	passClearsColor = true;
 	BeginPass( true );
 }
 
@@ -468,16 +516,398 @@ void idRenderBackendEacp::SwapBuffers( void ) {
 }
 
 /*
+================================================================================
+
+	Drawing.
+
+	Step 4c: everything Doom 3 puts on screen without a world. The menus, the
+	console, the HUD, the loading screens and the in-world GUIs all arrive here
+	as one viewDef with no viewEntitys, whose surfaces the gui model built, and
+	all of them go through shader passes alone - no depth fill, no lights, no
+	shadows.
+
+================================================================================
+*/
+
+/*
+======================
+R_EacpModelViewProjection
+
+Clip from model, with one correction that is the whole reason this is not a
+plain matrix multiply.
+
+OpenGL clips against -w <= z <= w and Metal and D3D12 against 0 <= z <= w, so a
+projection matrix written for the first puts half its depth range outside the
+second's frustum. The 2D projection is the case that makes it obvious rather
+than subtle: glOrtho( 0, 640, 480, 0, 0, 1 ) sends every vertex at z = 0 - which
+is every vertex the gui model produces - to z_ndc = -1, exactly the near plane
+in OpenGL and just outside the frustum everywhere else. Uncorrected, the menu is
+not dim or misplaced; it is entirely clipped away.
+
+The fix is one row: z' = (z + w) / 2, which is the standard mapping and is
+applied here rather than in the shader because it is a property of the API the
+matrix is going to, not of the geometry it came from.
+
+Both matrices are OpenGL's column-major layout, which is also MSL's, so the
+result is uploaded to a Float4x4 uniform as it stands.
+======================
+*/
+static void R_EacpModelViewProjection( const float modelView[16], const float projection[16],
+									   float out[16] ) {
+	for ( int column = 0 ; column < 4 ; column++ ) {
+		for ( int row = 0 ; row < 4 ; row++ ) {
+			float	sum = 0.0f;
+
+			for ( int k = 0 ; k < 4 ; k++ ) {
+				sum += projection[k*4 + row] * modelView[column*4 + k];
+			}
+
+			out[column*4 + row] = sum;
+		}
+	}
+
+	for ( int column = 0 ; column < 4 ; column++ ) {
+		out[column*4 + 2] = 0.5f * ( out[column*4 + 2] + out[column*4 + 3] );
+	}
+}
+
+/*
+======================
+idRenderBackendEacp::SetViewport / SetScissor
+
+Doom 3's viewport and scissor are OpenGL's: pixels with the origin at the bottom
+left, and inclusive bounds. eacp's are the render target's pixels with the
+origin at the top left, which is Metal's and D3D12's - so the y edge has to be
+measured from the other end, and the width is x2 - x1 + 1 rather than x2 - x1.
+
+The target's height comes from the pass rather than from glConfig, which is
+eacp finding I6's whole point: the pass knows what it is rendering into and a
+view's bounds do not.
+======================
+*/
+void idRenderBackendEacp::SetViewport( const idScreenRect &rect ) {
+	const float	height = (float)pass->targetHeight();
+
+	pass->setViewport( Graphics::Rect( (float)rect.x1,
+									   height - (float)( rect.y2 + 1 ),
+									   (float)( rect.x2 + 1 - rect.x1 ),
+									   (float)( rect.y2 + 1 - rect.y1 ) ) );
+}
+
+void idRenderBackendEacp::SetScissor( const idScreenRect &rect ) {
+	// A surface's scissorRect is inside the viewport, which is what the +
+	// viewport origin is doing here - qglScissor is given the same sum.
+	const idScreenRect &	viewport = backEnd.viewDef->viewport;
+	const float				height = (float)pass->targetHeight();
+
+	const float	x = (float)( viewport.x1 + rect.x1 );
+	const float	y = (float)( viewport.y1 + rect.y1 );
+	const float	w = (float)( rect.x2 + 1 - rect.x1 );
+	const float	h = (float)( rect.y2 + 1 - rect.y1 );
+
+	pass->setScissorRect( Graphics::Rect( x, height - ( y + h ), w, h ) );
+}
+
+/*
 ======================
 idRenderBackendEacp::DrawView
-
-Step 4c. The frontend's work all happens whether or not this draws - the
-surfaces are culled, the interactions built, the shadow volumes extruded and the
-command list issued - so an empty body here is the whole engine running with
-nothing on the glass, which is the point of landing it separately.
 ======================
 */
 void idRenderBackendEacp::DrawView( void ) {
+	if ( !pass ) {
+		// No frame is open, so this draw came from outside GPUView::render - a
+		// level load's own screen update, or a console command. Nothing to draw
+		// into, and saying so is better than a pass that presents nothing.
+		return;
+	}
+
+	// The world is step 4d: the depth fill, the interaction program and the
+	// stencil shadow pass, none of which exist yet. Everything before this
+	// point still runs - the frontend culls, lights and issues its list - so
+	// what turning back here costs is the picture and nothing else.
+	if ( backEnd.viewDef->viewEntitys ) {
+		return;
+	}
+
+	SetViewport( backEnd.viewDef->viewport );
+
+	backEnd.currentScissor = backEnd.viewDef->scissor;
+	SetScissor( backEnd.currentScissor );
+
+	// RB_BeginDrawingView's last act, and the reason SetCull is reached at all
+	// below: the cached value has to disagree with whatever is asked for next.
+	backEnd.glState.faceCulling = -1;
+	SetCull( CT_FRONT_SIDED );
+
+	DrawShaderPasses( (drawSurf_t **)&backEnd.viewDef->drawSurfs[0],
+					  backEnd.viewDef->numDrawSurfs );
+}
+
+/*
+======================
+idRenderBackendEacp::DrawShaderPasses
+
+RB_STD_DrawShaderPasses, minus the parts that belong to a 3D view. The
+_currentRender copy is one of them - SS_POST_PROCESS material in a 2D view does
+not dump the framebuffer even on OpenGL - and the ARB program environment is
+another, this backend having no ARB programs to give one to.
+======================
+*/
+void idRenderBackendEacp::DrawShaderPasses( drawSurf_t **drawSurfs, int numDrawSurfs ) {
+	if ( numDrawSurfs < 1 ) {
+		return;
+	}
+
+	if ( drawSurfs[0]->material->GetSort() >= SS_POST_PROCESS ) {
+		if ( r_skipPostProcess.GetBool() ) {
+			return;
+		}
+
+		// Nothing to copy: the copy is what a 3D view does, and this is not
+		// one. Saying it has been copied is what keeps the loop below from
+		// stopping at the first post-process surface, which is what OpenGL
+		// does here for the same reason.
+		backEnd.currentRenderCopied = true;
+	}
+
+	SelectTexture( 0 );
+
+	backEnd.currentSpace = NULL;
+
+	for ( int i = 0 ; i < numDrawSurfs ; i++ ) {
+		if ( drawSurfs[i]->material->SuppressInSubview() ) {
+			continue;
+		}
+
+		if ( drawSurfs[i]->material->GetSort() >= SS_POST_PROCESS
+			 && !backEnd.currentRenderCopied ) {
+			break;
+		}
+
+		DrawSurfaceShaderPasses( drawSurfs[i] );
+	}
+
+	SetCull( CT_FRONT_SIDED );
+}
+
+/*
+======================
+idRenderBackendEacp::DrawSurfaceShaderPasses
+
+RB_STD_T_RenderShaderPasses. Everything above the stage loop is the surface's -
+where it is, what it is clipped to, which way its triangles face and where its
+vertices are - and everything inside it is one stage's material expression,
+which is a program, a pipeline and five uniforms rather than a combiner.
+======================
+*/
+void idRenderBackendEacp::DrawSurfaceShaderPasses( const drawSurf_t *surf ) {
+	const srfTriangles_t *	tri = surf->geo;
+	const idMaterial *		shader = surf->material;
+
+	if ( !shader->HasAmbient() ) {
+		return;
+	}
+
+	if ( shader->IsPortalSky() ) {
+		return;
+	}
+
+	if ( surf->space != backEnd.currentSpace ) {
+		backEnd.currentSpace = surf->space;
+		R_EacpModelViewProjection( surf->space->modelViewMatrix,
+								   backEnd.viewDef->projectionMatrix,
+								   modelViewProjection );
+	}
+
+	if ( r_useScissor.GetBool() && !backEnd.currentScissor.Equals( surf->scissorRect ) ) {
+		backEnd.currentScissor = surf->scissorRect;
+		SetScissor( backEnd.currentScissor );
+	}
+
+	// Some deforms disable themselves by setting numIndexes to 0.
+	if ( !tri->numIndexes ) {
+		return;
+	}
+
+	if ( !tri->ambientCache ) {
+		common->Printf( "RB_T_RenderShaderPasses: !tri->ambientCache\n" );
+		return;
+	}
+
+	const float *	regs = surf->shaderRegisters;
+
+	SetCull( shader->GetCullType() );
+
+	// Gap 6 (plan.md section 5): no depth bias, so a decal on a wall z-fights
+	// instead of sitting on it. MF_POLYGONOFFSET and privatePolygonOffset are
+	// both this, and both are silent here rather than warned about, because
+	// what they produce is a picture that is slightly wrong rather than one
+	// that is missing.
+
+	// Doom 3 hands the GPU idDrawVert as it stands, and so does this: the
+	// vertex cache holds system memory on this backend, so the whole surface's
+	// vertices go into a streaming buffer once and every stage of it draws from
+	// there. Once per surface rather than once per stage, because a material
+	// with four stages is four draws over one piece of geometry.
+	const idDrawVert *	vertices = (const idDrawVert *)vertexCache.Position( tri->ambientCache );
+
+	drawVertices = &eacpRenderProgs.StreamVertices( vertices,
+													(std::size_t)tri->numVerts * sizeof( idDrawVert ) );
+
+	for ( int stage = 0 ; stage < shader->GetNumStages() ; stage++ ) {
+		const shaderStage_t *	pStage = shader->GetStage( stage );
+
+		if ( regs[ pStage->conditionRegister ] == 0 ) {
+			continue;
+		}
+
+		if ( pStage->lighting != SL_AMBIENT ) {
+			continue;
+		}
+
+		// ( GL_ZERO, GL_ONE ) leaves the destination exactly as it was; some
+		// alpha masks are written that way.
+		if ( ( pStage->drawStateBits & ( GLS_SRCBLEND_BITS | GLS_DSTBLEND_BITS ) )
+			 == ( GLS_SRCBLEND_ZERO | GLS_DSTBLEND_ONE ) ) {
+			continue;
+		}
+
+		// A new-style stage is a pair of hand-written ARB programs, and the
+		// OpenGL path skips them on any backend that is not BE_ARB2 - which
+		// this is not. The eacp answer to them is a program per newShaderStage,
+		// and it is nobody's step yet.
+		if ( pStage->newStage ) {
+			continue;
+		}
+
+		// Only TG_EXPLICIT here. The screen-space and cube texgens need
+		// _currentRender and cube maps respectively (step 4e, and gap 5), and a
+		// stage drawn with the wrong coordinates looks like a rendering bug
+		// rather than a missing feature - so it is skipped and said once.
+		if ( pStage->texture.texgen != TG_EXPLICIT ) {
+			if ( !warnedTexgen ) {
+				warnedTexgen = true;
+				common->Warning( "eacp: texgen %i is not implemented, so '%s' will not draw",
+								 pStage->texture.texgen, shader->GetName() );
+			}
+			continue;
+		}
+
+		float	color[4];
+
+		color[0] = regs[ pStage->color.registers[0] ];
+		color[1] = regs[ pStage->color.registers[1] ];
+		color[2] = regs[ pStage->color.registers[2] ];
+		color[3] = regs[ pStage->color.registers[3] ];
+
+		// An add of black adds nothing, and a blend at zero alpha blends
+		// nothing.
+		if ( ( pStage->drawStateBits & ( GLS_SRCBLEND_BITS | GLS_DSTBLEND_BITS ) )
+			 == ( GLS_SRCBLEND_ONE | GLS_DSTBLEND_ONE )
+			 && color[0] <= 0 && color[1] <= 0 && color[2] <= 0 ) {
+			continue;
+		}
+
+		if ( ( pStage->drawStateBits & ( GLS_SRCBLEND_BITS | GLS_DSTBLEND_BITS ) )
+			 == ( GLS_SRCBLEND_SRC_ALPHA | GLS_DSTBLEND_ONE_MINUS_SRC_ALPHA )
+			 && color[3] <= 0 ) {
+			continue;
+		}
+
+		RB_BindVariableStageImage( &pStage->texture, regs );
+
+		const idImage *		image = boundImages[0];
+		GPU::Texture *		texture = image ? TextureFor( image ) : NULL;
+
+		if ( !texture ) {
+			// An image the upload path turned away - a .dds this build cannot
+			// read, or a cube map. UploadImageLevel has already said which and
+			// why; this is the draw that would have used it.
+			if ( !warnedMissingTexture ) {
+				warnedMissingTexture = true;
+				common->Warning( "eacp: '%s' has no texture on the GPU, so '%s' will not draw",
+								 image ? image->imgName.c_str() : "(none)", shader->GetName() );
+			}
+			continue;
+		}
+
+		SetState( pStage->drawStateBits );
+
+		// A 2D view runs with the depth test off, which RB_BeginDrawingView
+		// does with glDisable( GL_DEPTH_TEST ) rather than through the state
+		// bitfield - so the bits say nothing about it and the pipeline has to
+		// be told. Always with no write is exactly what a disabled depth test
+		// is, and it keeps every 2D draw on one pipeline shape rather than one
+		// per material's idea of a depth function.
+		const int	stateBits = backEnd.glState.glStateBits
+			| GLS_DEPTHFUNC_ALWAYS | GLS_DEPTHMASK;
+
+		idEacpRenderProgs::stageDraw_t	draw =
+			eacpRenderProgs.StageDraw( image, stateBits, backEnd.glState.faceCulling );
+
+		if ( !draw.pipeline ) {
+			continue;
+		}
+
+		draw.program->modelViewProjection = eacp::Array<float, 16> {
+			modelViewProjection[0], modelViewProjection[1], modelViewProjection[2], modelViewProjection[3],
+			modelViewProjection[4], modelViewProjection[5], modelViewProjection[6], modelViewProjection[7],
+			modelViewProjection[8], modelViewProjection[9], modelViewProjection[10], modelViewProjection[11],
+			modelViewProjection[12], modelViewProjection[13], modelViewProjection[14], modelViewProjection[15]
+		};
+
+		// The texture matrix, as the two rows of it that are not the identity.
+		if ( pStage->texture.hasMatrix ) {
+			float	matrix[16];
+
+			RB_GetShaderTextureMatrix( regs, &pStage->texture, matrix );
+
+			draw.program->textureMatrixS = eacp::Array<float, 4> { matrix[0], matrix[4], matrix[12], 0.0f };
+			draw.program->textureMatrixT = eacp::Array<float, 4> { matrix[1], matrix[5], matrix[13], 0.0f };
+		} else {
+			draw.program->textureMatrixS = eacp::Array<float, 4> { 1.0f, 0.0f, 0.0f, 0.0f };
+			draw.program->textureMatrixT = eacp::Array<float, 4> { 0.0f, 1.0f, 0.0f, 0.0f };
+		}
+
+		// The three stageVertexColor_t modes as (modulate, add). OpenGL needs a
+		// combiner and a second texture unit bound to the white image to say
+		// the same thing; here they are two uniforms and the program is one.
+		//
+		// SVC_INVERSE_MODULATE inverts the alpha channel along with the three
+		// colour ones, which the fixed-function path does not: it sets
+		// GL_COMBINE_RGB alone and leaves alpha on the default modulate. That
+		// is a deliberate simplification and the one BFG's own port makes - the
+		// mode exists for cross-blended terrain, where the alpha is 1 either
+		// way, and no material in the demo reaches it at all.
+		switch ( pStage->vertexColor ) {
+		case SVC_MODULATE:
+			draw.program->colorModulate = eacp::Array<float, 4> { color[0], color[1], color[2], color[3] };
+			draw.program->colorAdd = eacp::Array<float, 4> { 0.0f, 0.0f, 0.0f, 0.0f };
+			break;
+		case SVC_INVERSE_MODULATE:
+			draw.program->colorModulate = eacp::Array<float, 4> { -color[0], -color[1], -color[2], -color[3] };
+			draw.program->colorAdd = eacp::Array<float, 4> { color[0], color[1], color[2], color[3] };
+			break;
+		default:
+			draw.program->colorModulate = eacp::Array<float, 4> { 0.0f, 0.0f, 0.0f, 0.0f };
+			draw.program->colorAdd = eacp::Array<float, 4> { color[0], color[1], color[2], color[3] };
+			break;
+		}
+
+		draw.program->image = *texture;
+
+		drawProgram = draw.program;
+		drawPipeline = draw.pipeline;
+
+		// Through the counter wrapper rather than around it: r_showPrimitives
+		// and the renderer's own performance counters are read from the same
+		// place on both backends, and DrawIndexed is the seam.
+		RB_DrawElementsWithCounters( tri );
+	}
+
+	drawProgram = NULL;
+	drawPipeline = NULL;
+	drawVertices = NULL;
 }
 
 /*
@@ -496,8 +926,10 @@ void idRenderBackendEacp::ReleaseTextures( void ) {
 	Per-draw state.
 
 	Recorded rather than acted on, because a modern pipeline is compiled from
-	all of it at once rather than set one field at a time. Step 4c turns the
-	recorded state into a RenderPipelineDescriptor and looks it up in a cache.
+	all of it at once rather than set one field at a time - so what turns these
+	into something the GPU can be told is idEacpRenderProgs::StageDraw, at the
+	moment a draw is issued, and it looks the answer up in a cache keyed on
+	exactly these fields.
 ======================
 */
 void idRenderBackendEacp::SetState( int stateBits ) {
@@ -526,7 +958,52 @@ void idRenderBackendEacp::SelectTexture( int unit ) {
 	backEnd.glState.currenttmu = unit;
 }
 
+/*
+======================
+idRenderBackendEacp::DrawIndexed
+
+Every indexed draw in the renderer arrives here, and what it draws *with* is
+whatever the path above it prepared - which on OpenGL is context state and here
+is the three drawProgram / drawPipeline / drawVertices fields. A draw from a
+path this backend has not written yet finds them null and is a no-op, which is
+the difference between an unfinished feature and a draw against whatever the
+last one left bound.
+======================
+*/
 void idRenderBackendEacp::DrawIndexed( const srfTriangles_t *tri, int numIndexes ) {
+	if ( !pass || !drawProgram || !drawPipeline || !drawVertices ) {
+		return;
+	}
+
+	if ( numIndexes < 1 ) {
+		return;
+	}
+
+	if ( r_singleTriangle.GetBool() ) {
+		numIndexes = 3;
+	}
+
+	// The index cache holds system memory here for the same reason the vertex
+	// cache does - this backend generates no buffer objects - so both branches
+	// end in a real pointer and the difference is only where it came from.
+	const glIndex_t *	indexes = ( tri->indexCache && r_useIndexBuffers.GetBool() )
+		? (const glIndex_t *)vertexCache.Position( tri->indexCache )
+		: tri->indexes;
+
+	if ( !indexes ) {
+		return;
+	}
+
+	const GPU::Buffer &	buffer =
+		eacpRenderProgs.StreamIndices( indexes, (std::size_t)numIndexes * sizeof( glIndex_t ) );
+
+	pass->setPipeline( *drawPipeline );
+	pass->setVertexBuffer( *drawVertices );
+	pass->setUniforms( *drawProgram );
+
+	drawProgram->bindTextures( *pass );
+
+	pass->drawIndexed( buffer, numIndexes, GPU::IndexFormat::UInt32 );
 }
 
 void idRenderBackendEacp::CheckErrors( void ) {

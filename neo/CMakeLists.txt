@@ -751,7 +751,11 @@ set(src_core
 # the reverse. So this is not a runtime choice and there is nothing to select
 # between - the linker decides, once, per target.
 set(src_renderbackend_gl	renderer/RenderBackend_GL.cpp)
-set(src_renderbackend_eacp	renderer/RenderBackend_Eacp.h renderer/RenderBackend_Eacp.cpp)
+set(src_renderbackend_eacp
+	renderer/RenderBackend_Eacp.h
+	renderer/RenderBackend_Eacp.cpp
+	renderer/RenderProgs_Eacp.h
+	renderer/RenderProgs_Eacp.cpp)
 
 if(APPLE)
 	set(osx_resources
