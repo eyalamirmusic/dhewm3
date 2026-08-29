@@ -11,22 +11,90 @@ endif()
 
 include(CPM)
 
-# A pinned commit, not `main`, and the reason is worth keeping: CPM keys its
-# source cache on the *declaration*, so a branch name is fetched once and never
-# again. The first configure of this file asked for `main` and got eacp as it
-# stood on 2026-04-30 - four months stale, with none of the Phase 0 stencil work
-# this port is built on - and reported it as a successful fetch of main. A branch
-# tag under a source cache is therefore not "we track main"; it is "we track
-# whatever main was the first time this machine built it", which is neither
-# current nor reproducible. A SHA is at least honest, and bumping it is a commit
-# somebody can see.
+# eacp's main, because for as long as this port is under way the two repositories
+# move together: a gap found here is fixed there (plan.md §5) and wanted here the
+# same afternoon. A SHA would mean a bump commit per finding and a tree that is
+# stale between them.
+set(EACP_GIT_TAG "main" CACHE STRING
+	"The eacp branch or commit to build against. A SHA pins; a branch tracks.")
+
+# **A branch name on its own does not track that branch, and this file learned it
+# the hard way.** CPM skips the download outright when the source directory
+# already exists (CPM.cmake, `if(EXISTS ${download_directory})` -> CPM_SKIP_FETCH),
+# whether that directory is a shared source cache or this build's own _deps. So a
+# branch is cloned by the first configure and never looked at again. The first
+# configure of this file asked for `main` and got eacp as it stood four months
+# earlier - with none of the Phase 0 stencil work this port is built on - and
+# reported it as a successful fetch of main.
 #
-# Bump it deliberately, and re-run the regression gate when you do. Point
-# CPM_eacp_SOURCE at a local checkout to develop against one.
+# It was pinned to a SHA after that, which was honest but wrong for a port whose
+# two halves are being written together. So the branch is back and this is what
+# makes it true: fast-forward the clone to the remote before CPM looks at it. The
+# reset is safe because this directory is CPM's to own - it is a throwaway clone
+# under the build tree - and it is deliberately NOT done to a checkout somebody
+# pointed CPM_eacp_SOURCE at, which is a working repository with a working
+# repository's uncommitted changes in it.
+function(eacp_track_branch tag)
+	if(CPM_eacp_SOURCE)
+		message(STATUS "eacp: using the local checkout at ${CPM_eacp_SOURCE}")
+		return()
+	endif()
+
+	# A SHA is a pin and needs no refreshing - CPM's own clone is already at it.
+	if(tag MATCHES "^[a-fA-F0-9]+$" AND NOT tag MATCHES "^[0-9]+$")
+		return()
+	endif()
+
+	set(clone "${CMAKE_BINARY_DIR}/_deps/eacp-src")
+
+	if(NOT IS_DIRECTORY "${clone}/.git")
+		return()	# nothing fetched yet; CPM is about to clone it fresh
+	endif()
+
+	find_package(Git QUIET)
+
+	if(NOT GIT_FOUND)
+		message(WARNING "eacp: no git found, so '${tag}' is whatever "
+			"${clone} already holds")
+		return()
+	endif()
+
+	execute_process(COMMAND "${GIT_EXECUTABLE}" fetch --quiet origin "${tag}"
+		WORKING_DIRECTORY "${clone}" RESULT_VARIABLE fetched)
+
+	if(NOT fetched EQUAL 0)
+		# Offline, most likely. Building against yesterday's eacp is better than
+		# not building, but say so rather than letting it pass for current.
+		message(WARNING "eacp: could not fetch '${tag}' - building against "
+			"whatever ${clone} already holds")
+		return()
+	endif()
+
+	execute_process(COMMAND "${GIT_EXECUTABLE}" reset --quiet --hard FETCH_HEAD
+		WORKING_DIRECTORY "${clone}" RESULT_VARIABLE reset_result)
+
+	if(NOT reset_result EQUAL 0)
+		message(WARNING "eacp: could not check out '${tag}' in ${clone}")
+		return()
+	endif()
+
+	execute_process(COMMAND "${GIT_EXECUTABLE}" rev-parse --short HEAD
+		WORKING_DIRECTORY "${clone}" OUTPUT_VARIABLE sha
+		OUTPUT_STRIP_TRAILING_WHITESPACE)
+
+	message(STATUS "eacp: tracking '${tag}', now at ${sha}")
+endfunction()
+
+eacp_track_branch("${EACP_GIT_TAG}")
+
+# Re-run the regression gate after an eacp that moved under you, the same as
+# after any other change to what the renderer is built on. Point
+# CPM_eacp_SOURCE at a local checkout to develop against one, or set
+# EACP_GIT_TAG to a SHA to pin.
 CPMAddPackage(
 	NAME eacp
 	GITHUB_REPOSITORY eyalamirmusic/eacp
-	GIT_TAG 05ffb0ca43f6cc4a06c98933cf0d912b6103b050
+	GIT_TAG ${EACP_GIT_TAG}
 	OPTIONS
 		# The engine has no use for an embedded browser, and it is the most
 		# expensive module eacp builds.
