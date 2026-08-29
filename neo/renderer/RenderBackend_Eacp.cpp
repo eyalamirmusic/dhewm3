@@ -62,10 +62,12 @@ Suite 120, Rockville, Maryland 20850 USA.
 	four has a counterpart in Metal or D3D12. So DrawView is rewritten rather
 	than ported, out of the same viewDef_t the frontend already builds.
 
-	What is drawn so far is the 2D view - the menus, the console, the HUD, the
-	loading screens - which is step 4c, and which is one path: shader passes
-	over a viewDef with no viewEntitys. The world is step 4d, and DrawView says
-	so where it turns back.
+	Step 4c drew the 2D view - the menus, the console, the HUD, the loading
+	screens - which is one path: shader passes over a viewDef with no
+	viewEntitys. Step 4d is the world, in three: the depth fill, the interaction
+	program and the stencil shadow pass. The first of the three is in, so a 3D
+	view now occludes correctly and draws its ambient stages; DrawView says
+	where the other two would go.
 
 ===============================================================================
 */
@@ -230,25 +232,62 @@ public:
 	virtual void	CopyDepthbufferToImage( idImage *image, int x, int y,
 											int imageWidth, int imageHeight,
 											bool useOversizedBuffer );
+	virtual bool	ReadPixels( int x, int y, int width, int height, byte *rgb );
 
 private:
-	// The pass every draw goes into. One per Doom 3 view, because a view is
-	// exactly what wants the depth and stencil planes cleared and the colour
-	// kept - which is what a pass with clear turned off does.
+	// Everything one draw needs that is not the geometry: a material stage's
+	// expression, said in the terms idEacpStageProgram takes rather than the
+	// terms the .mtr file uses.
+	//
+	// It is one struct rather than two because the depth fill and the ambient
+	// pass are one expression - RB_T_FillDepthBuffer draws a material's
+	// alpha-tested stages exactly as RB_STD_T_RenderShaderPasses draws its
+	// ambient ones, with the colour set to black and the alpha test on.
+	struct eacpStage_t {
+		const idImage *		image;			// what is sampled
+		int					stateBits;		// GLS_*, which the pipeline is compiled from
+		int					cullType;
+		Float4				color;			// the constant colour
+		stageVertexColor_t	vertexColor;	// how the vertex colour joins it
+		const float *		textureMatrix;	// RB_GetShaderTextureMatrix's 16, or NULL
+		bool				alphaTest;
+		float				alphaTestRef;
+	};
+
+	// The pass every draw goes into. One per frame so far - see DrawView on why
+	// a view does not get its own yet.
 	void			BeginPass( bool clearColor );
 	void			EndPass( void );
 
-	// RB_BeginDrawingView's half that survives: where on the target this view
-	// lands, and what part of it may be written.
+	// RB_BeginDrawingView: where on the target this view lands, what part of it
+	// may be written, and the state the view starts from.
+	void			BeginDrawingView( void );
 	void			SetViewport( const idScreenRect &rect );
 	void			SetScissor( const idScreenRect &rect );
+
+	// The matrix a draw is transformed by, rebuilt when the surface's space or
+	// its depth hack changes. This is also where both depth hacks land, each of
+	// them being a modified projection matrix and a depth range.
+	void			SetSpace( const viewEntity_t *space, float modelDepthHack );
+
+	// RB_STD_FillDepthBuffer and RB_T_FillDepthBuffer, rewritten. What every
+	// light after them tests against: the surface at its own depth, so an
+	// interaction pass can run at GLS_DEPTHFUNC_EQUAL and touch only the
+	// fragments that survived.
+	void			FillDepthBuffer( drawSurf_t **drawSurfs, int numDrawSurfs );
+	void			FillDepthBufferSurface( const drawSurf_t *surf );
 
 	// RB_STD_DrawShaderPasses and RB_STD_T_RenderShaderPasses, rewritten. Not
 	// ported: what they do with two texture units and six combiner calls is one
 	// expression in idEacpStageProgram, and what they do with a matrix stack is
-	// one uniform.
-	void			DrawShaderPasses( drawSurf_t **drawSurfs, int numDrawSurfs );
+	// one uniform. Returns how many surfaces were consumed, which is what says
+	// whether a second pass over the post-process ones is owed.
+	int				DrawShaderPasses( drawSurf_t **drawSurfs, int numDrawSurfs );
 	void			DrawSurfaceShaderPasses( const drawSurf_t *surf );
+
+	// One stage of one surface: the program and pipeline its state compiles to,
+	// the five uniforms that are its expression, and the draw.
+	void			DrawStage( const srfTriangles_t *tri, const eacpStage_t &stage );
 
 	// The texture an idImage carries, created on the first upload and
 	// destroyed by FreeImage. Held by pointer in idImage::backendTexture,
@@ -280,6 +319,19 @@ private:
 	// changes. GL kept this in the matrix stack.
 	float				modelViewProjection[16];
 
+	// What a depth hack sets, and the reason it is remembered: it is part of
+	// the viewport on this backend, so changing it means re-issuing the
+	// viewport, and re-issuing the viewport per surface would be the only
+	// per-surface call in the walk.
+	float				depthRangeNear;
+	float				depthRangeFar;
+
+	// The model depth hack modelViewProjection was last built with. Not read
+	// off backEnd.currentSpace, because one surface of a space can refuse the
+	// hack the space asks for: a soft particle does, and its neighbour in the
+	// same space does not.
+	float				appliedDepthHack;
+
 	// One warning per unimplemented path rather than one per frame, which is
 	// the difference between a note and an unusable console.
 	bool				warnedCopyFramebuffer;
@@ -287,6 +339,9 @@ private:
 	bool				warnedExternalFormat;
 	bool				warnedTexgen;
 	bool				warnedMissingTexture;
+	bool				warnedClipPlanes;
+	bool				warnedSubviewPass;
+	bool				warnedReadPixels;
 };
 
 static idRenderBackendEacp	renderBackendEacp;
@@ -299,11 +354,17 @@ idRenderBackendEacp::idRenderBackendEacp() {
 	drawPipeline = NULL;
 	drawVertices = NULL;
 	memset( modelViewProjection, 0, sizeof( modelViewProjection ) );
+	depthRangeNear = 0.0f;
+	depthRangeFar = 1.0f;
+	appliedDepthHack = 0.0f;
 	warnedCopyFramebuffer = false;
 	warnedCompressed = false;
 	warnedExternalFormat = false;
 	warnedTexgen = false;
 	warnedMissingTexture = false;
+	warnedClipPlanes = false;
+	warnedSubviewPass = false;
+	warnedReadPixels = false;
 }
 
 /*
@@ -423,9 +484,9 @@ void idRenderBackendEacp::Shutdown( void ) {
 	memset( boundImages, 0, sizeof( boundImages ) );
 
 	// What the content actually cost, rather than what plan.md section 4.3
-	// sized it at: one number, at the one moment the whole run is known.
-	common->Printf( "eacp: %i material-stage pipelines compiled\n",
-					eacpRenderProgs.NumPipelines() );
+	// sized it at: two numbers, at the one moment the whole run is known.
+	common->Printf( "eacp: %i material-stage programs and %i pipelines compiled\n",
+					eacpRenderProgs.NumPrograms(), eacpRenderProgs.NumPipelines() );
 
 	eacpRenderProgs.Shutdown();
 }
@@ -520,11 +581,19 @@ void idRenderBackendEacp::SwapBuffers( void ) {
 
 	Drawing.
 
-	Step 4c: everything Doom 3 puts on screen without a world. The menus, the
-	console, the HUD, the loading screens and the in-world GUIs all arrive here
-	as one viewDef with no viewEntitys, whose surfaces the gui model built, and
-	all of them go through shader passes alone - no depth fill, no lights, no
-	shadows.
+	Step 4c drew everything Doom 3 puts on screen without a world - the menus,
+	the console, the HUD, the loading screens and the in-world GUIs - which
+	arrive as one viewDef with no viewEntitys and go through shader passes
+	alone.
+
+	Step 4d is the world, and it is three things rather than one. This is the
+	first: the depth fill, which puts every opaque and perforated surface into
+	the depth buffer at its own depth and leaves the colour black. On its own
+	that draws a silhouette, and the picture is the ambient stages that are
+	drawn over it - a sky, a light's own glow, a screen's GUI. What it is
+	really for is the two steps after it: an interaction pass can then run at
+	GLS_DEPTHFUNC_EQUAL and touch only the fragments that survived, and a shadow
+	volume can be counted against a depth buffer that is already right.
 
 ================================================================================
 */
@@ -588,10 +657,15 @@ view's bounds do not.
 void idRenderBackendEacp::SetViewport( const idScreenRect &rect ) {
 	const float	height = (float)pass->targetHeight();
 
+	// The depth range goes out with the viewport rather than on its own, which
+	// is eacp's shape and not Doom 3's: glDepthRange is its own call, and the
+	// two depth hacks use it without touching the rectangle. Re-sending the
+	// rectangle to change the range costs nothing and keeps one call site.
 	pass->setViewport( Graphics::Rect( (float)rect.x1,
 									   height - (float)( rect.y2 + 1 ),
 									   (float)( rect.x2 + 1 - rect.x1 ),
-									   (float)( rect.y2 + 1 - rect.y1 ) ) );
+									   (float)( rect.y2 + 1 - rect.y1 ) ),
+					   depthRangeNear, depthRangeFar );
 }
 
 void idRenderBackendEacp::SetScissor( const idScreenRect &rect ) {
@@ -611,6 +685,10 @@ void idRenderBackendEacp::SetScissor( const idScreenRect &rect ) {
 /*
 ======================
 idRenderBackendEacp::DrawView
+
+RB_STD_DrawView. The sequence rather than the calls: fill the depth buffer, add
+each light through the stencil, blend the passes that do not depend on a light,
+fog. Two of those four are still missing and each says so where it would be.
 ======================
 */
 void idRenderBackendEacp::DrawView( void ) {
@@ -621,53 +699,167 @@ void idRenderBackendEacp::DrawView( void ) {
 		return;
 	}
 
-	// The world is step 4d: the depth fill, the interaction program and the
-	// stencil shadow pass, none of which exist yet. Everything before this
-	// point still runs - the frontend culls, lights and issues its list - so
-	// what turning back here costs is the picture and nothing else.
-	if ( backEnd.viewDef->viewEntitys ) {
-		return;
+	drawSurf_t **	drawSurfs = (drawSurf_t **)&backEnd.viewDef->drawSurfs[0];
+	const int		numDrawSurfs = backEnd.viewDef->numDrawSurfs;
+
+	// What an interaction pass tests with once the depth fill has run: the
+	// surface is already in the depth buffer at exactly its own depth, so a
+	// light touches the fragments that survived and no others.
+	backEnd.depthFunc = GLS_DEPTHFUNC_EQUAL;
+
+	BeginDrawingView();
+
+	// backEnd.lightScale, which each light's colour is multiplied by. Its
+	// sibling backEnd.overBright is always 1 here - tr.backEndRendererMaxLight
+	// is 999 for BE_EACP as it is for BE_ARB2 - so RB_STD_LightScale, the
+	// full-screen multiply that crutches up a backend whose blending range is
+	// eight bits, can never do anything on this path and is not ported.
+	RB_DetermineLightScale();
+
+	FillDepthBuffer( drawSurfs, numDrawSurfs );
+
+	// The lights are 4d.2 and 4d.3: the interaction program and the stencil
+	// shadow pass. Until then a lit surface is the black the depth fill left.
+
+	const int	processed = DrawShaderPasses( drawSurfs, numDrawSurfs );
+
+	// Fog and blend lights are 4e, and they belong here - between the two
+	// halves of the shader passes, because a post-process surface reads the
+	// frame with the fog already in it.
+
+	if ( processed < numDrawSurfs ) {
+		DrawShaderPasses( drawSurfs + processed, numDrawSurfs - processed );
 	}
+}
+
+/*
+======================
+idRenderBackendEacp::BeginDrawingView
+
+RB_BeginDrawingView, minus the part that is the pass's.
+
+Doom 3 clears the depth and stencil buffers here for a 3D view and leaves them
+alone for a 2D one; eacp clears both as a pass opens and there is one pass per
+frame, so the clear has already happened by the time this runs. That is right
+for one 3D view in a frame and wrong for two: a subview or a mirror is a second
+3D view over the same buffers and would find the first view's depth in them.
+
+Not fixed by opening a pass per view, which is the obvious answer and does not
+work: this view's colour has to survive into the next pass, and with MSAA on -
+which it is - the drawable's multisample texture is resolved and discarded as
+each pass ends, so the second pass would load an undefined attachment. It is
+step 4e's, with subviews and mirrors, and it is a real eacp question rather than
+a Doom 3 one.
+======================
+*/
+void idRenderBackendEacp::BeginDrawingView( void ) {
+	depthRangeNear = 0.0f;
+	depthRangeFar = 1.0f;
 
 	SetViewport( backEnd.viewDef->viewport );
 
 	backEnd.currentScissor = backEnd.viewDef->scissor;
 	SetScissor( backEnd.currentScissor );
 
+	if ( backEnd.viewDef->viewEntitys && !warnedSubviewPass
+		 && backEnd.viewDef->isSubview ) {
+		warnedSubviewPass = true;
+		common->Warning( "eacp: a subview shares the frame's depth buffer with the "
+						 "view it is drawn under, so it will occlude wrongly" );
+	}
+
 	// RB_BeginDrawingView's last act, and the reason SetCull is reached at all
 	// below: the cached value has to disagree with whatever is asked for next.
 	backEnd.glState.faceCulling = -1;
 	SetCull( CT_FRONT_SIDED );
-
-	DrawShaderPasses( (drawSurf_t **)&backEnd.viewDef->drawSurfs[0],
-					  backEnd.viewDef->numDrawSurfs );
 }
 
 /*
 ======================
-idRenderBackendEacp::DrawShaderPasses
+idRenderBackendEacp::SetSpace
 
-RB_STD_DrawShaderPasses, minus the parts that belong to a 3D view. The
-_currentRender copy is one of them - SS_POST_PROCESS material in a 2D view does
-not dump the framebuffer even on OpenGL - and the ARB program environment is
-another, this backend having no ARB programs to give one to.
+The matrix a draw is transformed by, and the depth range it writes into.
+
+On OpenGL these are three separate pieces of state left in the context -
+glLoadMatrixf for the modelview, glLoadMatrixf again for the hacked projection,
+glDepthRange for the range - and the two depth hacks are why they are one
+function here: RB_EnterWeaponDepthHack and RB_EnterModelDepthHack each rebuild
+the projection matrix *from the view's* and set a range to go with it, so the
+matrix this hands the shader depends on which of them applies.
+
+Their order is the GL path's exactly, which is to say the model hack wins: it
+copies the view's projection afresh rather than modifying the weapon hack's, and
+puts the range back to [0, 1] as it does so.
+
+The hack is an argument rather than read off the space because a surface can
+refuse the one its space asks for - a soft particle does - so the space changing
+is not the whole of when this has to be redone.
 ======================
 */
-void idRenderBackendEacp::DrawShaderPasses( drawSurf_t **drawSurfs, int numDrawSurfs ) {
-	if ( numDrawSurfs < 1 ) {
+void idRenderBackendEacp::SetSpace( const viewEntity_t *space, float modelDepthHack ) {
+	if ( space == backEnd.currentSpace && modelDepthHack == appliedDepthHack ) {
 		return;
 	}
 
-	if ( drawSurfs[0]->material->GetSort() >= SS_POST_PROCESS ) {
-		if ( r_skipPostProcess.GetBool() ) {
-			return;
-		}
+	float	projection[16];
+	float	nearDepth = 0.0f;
+	float	farDepth = 1.0f;
 
-		// Nothing to copy: the copy is what a 3D view does, and this is not
-		// one. Saying it has been copied is what keeps the loop below from
-		// stopping at the first post-process surface, which is what OpenGL
-		// does here for the same reason.
-		backEnd.currentRenderCopied = true;
+	memcpy( projection, backEnd.viewDef->projectionMatrix, sizeof( projection ) );
+
+	if ( space->weaponDepthHack ) {
+		projection[14] *= 0.25f;
+		farDepth = 0.5f;
+	}
+
+	if ( modelDepthHack != 0.0f ) {
+		memcpy( projection, backEnd.viewDef->projectionMatrix, sizeof( projection ) );
+		projection[14] -= modelDepthHack;
+		farDepth = 1.0f;
+	}
+
+	if ( nearDepth != depthRangeNear || farDepth != depthRangeFar ) {
+		depthRangeNear = nearDepth;
+		depthRangeFar = farDepth;
+		SetViewport( backEnd.viewDef->viewport );
+	}
+
+	R_EacpModelViewProjection( space->modelViewMatrix, projection, modelViewProjection );
+
+	backEnd.currentSpace = space;
+	appliedDepthHack = modelDepthHack;
+}
+
+/*
+======================
+idRenderBackendEacp::FillDepthBuffer
+
+RB_STD_FillDepthBuffer, which is also RB_RenderDrawSurfListWithFunction: the
+walk and the function it calls are separate on OpenGL only because four
+different passes share the walk, and this is the one of them that survives the
+port intact.
+
+Not here, and each is switched off by something this port controls:
+
+  - the mirror clip plane, which is a second texture unit whose alpha texgen
+    fails the alpha test behind the plane. It needs a subview to matter, and
+    subviews are 4e.
+  - the early depth capture (#3877), which feeds _currentDepthImage to the soft
+    particle program. r_enableDepthCapture is -1 and r_useSoftParticles only
+    reaches a BE_ARB2 backend, so nothing asks.
+  - polygon offset for decals, which is eacp gap 6.
+======================
+*/
+void idRenderBackendEacp::FillDepthBuffer( drawSurf_t **drawSurfs, int numDrawSurfs ) {
+	// A 2D view has nothing to occlude and writes no depth at all.
+	if ( !backEnd.viewDef->viewEntitys ) {
+		return;
+	}
+
+	if ( backEnd.viewDef->numClipPlanes && !warnedClipPlanes ) {
+		warnedClipPlanes = true;
+		common->Warning( "eacp: the mirror clip plane is not implemented, so a "
+						 "subview will draw what is behind its plane" );
 	}
 
 	SelectTexture( 0 );
@@ -675,8 +867,226 @@ void idRenderBackendEacp::DrawShaderPasses( drawSurf_t **drawSurfs, int numDrawS
 	backEnd.currentSpace = NULL;
 
 	for ( int i = 0 ; i < numDrawSurfs ; i++ ) {
+		const drawSurf_t *	surf = drawSurfs[i];
+
+		SetSpace( surf->space, surf->space->modelDepthHack );
+
+		if ( r_useScissor.GetBool() && !backEnd.currentScissor.Equals( surf->scissorRect ) ) {
+			backEnd.currentScissor = surf->scissorRect;
+			SetScissor( backEnd.currentScissor );
+		}
+
+		FillDepthBufferSurface( surf );
+	}
+
+	drawProgram = NULL;
+	drawPipeline = NULL;
+	drawVertices = NULL;
+}
+
+/*
+======================
+idRenderBackendEacp::FillDepthBufferSurface
+
+RB_T_FillDepthBuffer. An opaque surface is one draw of the white image in black;
+a perforated one is a draw per alpha-tested stage, through the same texture and
+the same texture matrix its ambient pass would use, so the holes in a grate are
+holes in the depth buffer too.
+======================
+*/
+void idRenderBackendEacp::FillDepthBufferSurface( const drawSurf_t *surf ) {
+	const srfTriangles_t *	tri = surf->geo;
+	const idMaterial *		shader = surf->material;
+
+	if ( !shader->IsDrawn() ) {
+		return;
+	}
+
+	// Some deforms disable themselves by setting numIndexes to 0.
+	if ( !tri->numIndexes ) {
+		return;
+	}
+
+	// A translucent surface neither writes depth nor tests against it.
+	if ( shader->Coverage() == MC_TRANSLUCENT ) {
+		return;
+	}
+
+	if ( !tri->ambientCache ) {
+		common->Printf( "RB_T_FillDepthBuffer: !tri->ambientCache\n" );
+		return;
+	}
+
+	const float *	regs = surf->shaderRegisters;
+
+	// If every stage of the material is conditioned off, the surface is not
+	// there at all this frame.
+	int	stage;
+
+	for ( stage = 0 ; stage < shader->GetNumStages() ; stage++ ) {
+		if ( regs[ shader->GetStage( stage )->conditionRegister ] != 0 ) {
+			break;
+		}
+	}
+
+	if ( stage == shader->GetNumStages() ) {
+		return;
+	}
+
+	eacpStage_t	draw;
+
+	draw.cullType = backEnd.glState.faceCulling;
+	draw.vertexColor = SVC_IGNORE;
+	draw.textureMatrix = NULL;
+	draw.alphaTest = false;
+	draw.alphaTestRef = 0.0f;
+
+	if ( shader->GetSort() == SS_SUBVIEW ) {
+		// A subview's own surface - the mirror, the monitor - is drawn down by
+		// the overbright factor rather than to black, because what will be
+		// composited into it later has already been scaled up by it.
+		draw.stateBits = GLS_SRCBLEND_DST_COLOR | GLS_DSTBLEND_ZERO | GLS_DEPTHFUNC_LESS;
+
+		const float	down = 1.0f / backEnd.overBright;
+
+		draw.color = asFloat4( down, down, down, 1.0f );
+	} else {
+		draw.stateBits = GLS_DEPTHFUNC_LESS;
+		draw.color = asFloat4( 0.0f, 0.0f, 0.0f, 1.0f );
+	}
+
+	// Once per surface rather than once per stage: a perforated material with
+	// two alpha-tested stages is two draws over one piece of geometry.
+	const idDrawVert *	vertices = (const idDrawVert *)vertexCache.Position( tri->ambientCache );
+
+	drawVertices = &eacpRenderProgs.StreamVertices( vertices,
+													(std::size_t)tri->numVerts * sizeof( idDrawVert ) );
+
+	bool	drawSolid = ( shader->Coverage() == MC_OPAQUE );
+
+	if ( shader->Coverage() == MC_PERFORATED ) {
+		bool	didDraw = false;
+
+		for ( stage = 0 ; stage < shader->GetNumStages() ; stage++ ) {
+			const shaderStage_t *	pStage = shader->GetStage( stage );
+
+			if ( !pStage->hasAlphaTest ) {
+				continue;
+			}
+
+			if ( regs[ pStage->conditionRegister ] == 0 ) {
+				continue;
+			}
+
+			// Having tried to draw an alpha-tested stage is what says the
+			// surface is not solid, whether or not the stage itself drew.
+			didDraw = true;
+
+			draw.color[3] = regs[ pStage->color.registers[3] ];
+
+			if ( draw.color[3] <= 0 ) {
+				continue;
+			}
+
+			if ( pStage->texture.texgen != TG_EXPLICIT ) {
+				if ( !warnedTexgen ) {
+					warnedTexgen = true;
+					common->Warning( "eacp: texgen %i is not implemented, so '%s' will not draw",
+									 pStage->texture.texgen, shader->GetName() );
+				}
+				continue;
+			}
+
+			float	matrix[16];
+
+			if ( pStage->texture.hasMatrix ) {
+				RB_GetShaderTextureMatrix( regs, &pStage->texture, matrix );
+				draw.textureMatrix = matrix;
+			} else {
+				draw.textureMatrix = NULL;
+			}
+
+			pStage->texture.image->Bind();
+
+			draw.image = boundImages[0];
+			draw.alphaTest = true;
+			draw.alphaTestRef = regs[ pStage->alphaTestRegister ];
+
+			DrawStage( tri, draw );
+		}
+
+		if ( !didDraw ) {
+			drawSolid = true;
+		}
+	}
+
+	if ( drawSolid ) {
+		globalImages->whiteImage->Bind();
+
+		draw.image = boundImages[0];
+		draw.textureMatrix = NULL;
+		draw.alphaTest = false;
+		draw.color[3] = 1.0f;
+
+		DrawStage( tri, draw );
+	}
+}
+
+/*
+======================
+idRenderBackendEacp::DrawShaderPasses
+
+RB_STD_DrawShaderPasses. Two of its parts are not here and neither is a
+shortcut: the ARB program environment, this backend having no ARB programs to
+give one to, and the _currentRender copy, which the shared code already skips on
+any backend that is not BE_ARB2 - so a post-process material samples a stale
+_currentRender on this path exactly as it would on OpenGL's, and the fix is step
+4e's render target rather than anything here.
+
+Returns how far it got, which is not always the whole list: the post-process
+surfaces are deliberately left for a second call, after the fog that has to be
+in the frame before they read it.
+======================
+*/
+int idRenderBackendEacp::DrawShaderPasses( drawSurf_t **drawSurfs, int numDrawSurfs ) {
+	if ( numDrawSurfs < 1 ) {
+		return numDrawSurfs;
+	}
+
+	// Only a 3D view obeys it - the console and the menus are drawn by this
+	// same path and are not what r_skipAmbient is for.
+	if ( backEnd.viewDef->viewEntitys && r_skipAmbient.GetBool() ) {
+		return numDrawSurfs;
+	}
+
+	if ( drawSurfs[0]->material->GetSort() >= SS_POST_PROCESS ) {
+		if ( r_skipPostProcess.GetBool() ) {
+			return 0;
+		}
+
+		// Nothing to copy from: a 2D view never dumps the framebuffer even on
+		// OpenGL, and a 3D view's dump is guarded by BE_ARB2 in the shared
+		// code. Saying it has been copied is what keeps the loop below from
+		// stopping at the first post-process surface, which is what OpenGL
+		// does here for the same reason.
+		backEnd.currentRenderCopied = true;
+	}
+
+	SelectTexture( 0 );
+
+	int	i;
+
+	backEnd.currentSpace = NULL;
+
+	for ( i = 0 ; i < numDrawSurfs ; i++ ) {
 		if ( drawSurfs[i]->material->SuppressInSubview() ) {
 			continue;
+		}
+
+		if ( backEnd.viewDef->isXraySubview && drawSurfs[i]->space->entityDef ) {
+			if ( drawSurfs[i]->space->entityDef->parms.xrayIndex != 2 ) {
+				continue;
+			}
 		}
 
 		if ( drawSurfs[i]->material->GetSort() >= SS_POST_PROCESS
@@ -688,6 +1098,8 @@ void idRenderBackendEacp::DrawShaderPasses( drawSurf_t **drawSurfs, int numDrawS
 	}
 
 	SetCull( CT_FRONT_SIDED );
+
+	return i;
 }
 
 /*
@@ -712,12 +1124,13 @@ void idRenderBackendEacp::DrawSurfaceShaderPasses( const drawSurf_t *surf ) {
 		return;
 	}
 
-	if ( surf->space != backEnd.currentSpace ) {
-		backEnd.currentSpace = surf->space;
-		R_EacpModelViewProjection( surf->space->modelViewMatrix,
-								   backEnd.viewDef->projectionMatrix,
-								   modelViewProjection );
-	}
+	// #3878: a soft particle refuses the model depth hack, the older and
+	// cruder way of softening the same edge. It refuses it on every backend,
+	// including this one, where the soft particle program itself is behind
+	// BE_ARB2 and so never runs.
+	const bool	softParticle = ( surf->dsFlags & DSF_SOFT_PARTICLE ) != 0;
+
+	SetSpace( surf->space, softParticle ? 0.0f : surf->space->modelDepthHack );
 
 	if ( r_useScissor.GetBool() && !backEnd.currentScissor.Equals( surf->scissorRect ) ) {
 		backEnd.currentScissor = surf->scissorRect;
@@ -793,12 +1206,10 @@ void idRenderBackendEacp::DrawSurfaceShaderPasses( const drawSurf_t *surf ) {
 			continue;
 		}
 
-		float	color[4];
-
-		color[0] = regs[ pStage->color.registers[0] ];
-		color[1] = regs[ pStage->color.registers[1] ];
-		color[2] = regs[ pStage->color.registers[2] ];
-		color[3] = regs[ pStage->color.registers[3] ];
+		const Float4	color = asFloat4( regs[ pStage->color.registers[0] ],
+										  regs[ pStage->color.registers[1] ],
+										  regs[ pStage->color.registers[2] ],
+										  regs[ pStage->color.registers[3] ] );
 
 		// An add of black adds nothing, and a blend at zero alpha blends
 		// nothing.
@@ -816,22 +1227,27 @@ void idRenderBackendEacp::DrawSurfaceShaderPasses( const drawSurf_t *surf ) {
 
 		RB_BindVariableStageImage( &pStage->texture, regs );
 
-		const idImage *		image = boundImages[0];
-		GPU::Texture *		texture = image ? TextureFor( image ) : NULL;
+		eacpStage_t	draw;
 
-		if ( !texture ) {
-			// An image the upload path turned away - a .dds this build cannot
-			// read, or a cube map. UploadImageLevel has already said which and
-			// why; this is the draw that would have used it.
-			if ( !warnedMissingTexture ) {
-				warnedMissingTexture = true;
-				common->Warning( "eacp: '%s' has no texture on the GPU, so '%s' will not draw",
-								 image ? image->imgName.c_str() : "(none)", shader->GetName() );
-			}
-			continue;
+		draw.image = boundImages[0];
+		draw.cullType = backEnd.glState.faceCulling;
+		draw.vertexColor = pStage->vertexColor;
+		draw.color = color;
+		draw.alphaTest = false;
+		draw.alphaTestRef = 0.0f;
+
+		float	matrix[16];
+
+		if ( pStage->texture.hasMatrix ) {
+			RB_GetShaderTextureMatrix( regs, &pStage->texture, matrix );
+			draw.textureMatrix = matrix;
+		} else {
+			draw.textureMatrix = NULL;
 		}
 
 		SetState( pStage->drawStateBits );
+
+		draw.stateBits = backEnd.glState.glStateBits;
 
 		// A 2D view runs with the depth test off, which RB_BeginDrawingView
 		// does with glDisable( GL_DEPTH_TEST ) rather than through the state
@@ -839,75 +1255,110 @@ void idRenderBackendEacp::DrawSurfaceShaderPasses( const drawSurf_t *surf ) {
 		// be told. Always with no write is exactly what a disabled depth test
 		// is, and it keeps every 2D draw on one pipeline shape rather than one
 		// per material's idea of a depth function.
-		const int	stateBits = backEnd.glState.glStateBits
-			| GLS_DEPTHFUNC_ALWAYS | GLS_DEPTHMASK;
-
-		idEacpRenderProgs::stageDraw_t	draw =
-			eacpRenderProgs.StageDraw( image, stateBits, backEnd.glState.faceCulling );
-
-		if ( !draw.pipeline ) {
-			continue;
-		}
-
-		draw.program->modelViewProjection = eacp::Array<float, 16> {
-			modelViewProjection[0], modelViewProjection[1], modelViewProjection[2], modelViewProjection[3],
-			modelViewProjection[4], modelViewProjection[5], modelViewProjection[6], modelViewProjection[7],
-			modelViewProjection[8], modelViewProjection[9], modelViewProjection[10], modelViewProjection[11],
-			modelViewProjection[12], modelViewProjection[13], modelViewProjection[14], modelViewProjection[15]
-		};
-
-		// The texture matrix, as the two rows of it that are not the identity.
-		if ( pStage->texture.hasMatrix ) {
-			float	matrix[16];
-
-			RB_GetShaderTextureMatrix( regs, &pStage->texture, matrix );
-
-			draw.program->textureMatrixS = eacp::Array<float, 4> { matrix[0], matrix[4], matrix[12], 0.0f };
-			draw.program->textureMatrixT = eacp::Array<float, 4> { matrix[1], matrix[5], matrix[13], 0.0f };
-		} else {
-			draw.program->textureMatrixS = eacp::Array<float, 4> { 1.0f, 0.0f, 0.0f, 0.0f };
-			draw.program->textureMatrixT = eacp::Array<float, 4> { 0.0f, 1.0f, 0.0f, 0.0f };
-		}
-
-		// The three stageVertexColor_t modes as (modulate, add). OpenGL needs a
-		// combiner and a second texture unit bound to the white image to say
-		// the same thing; here they are two uniforms and the program is one.
 		//
-		// SVC_INVERSE_MODULATE inverts the alpha channel along with the three
-		// colour ones, which the fixed-function path does not: it sets
-		// GL_COMBINE_RGB alone and leaves alpha on the default modulate. That
-		// is a deliberate simplification and the one BFG's own port makes - the
-		// mode exists for cross-blended terrain, where the alpha is 1 either
-		// way, and no material in the demo reaches it at all.
-		switch ( pStage->vertexColor ) {
-		case SVC_MODULATE:
-			draw.program->colorModulate = eacp::Array<float, 4> { color[0], color[1], color[2], color[3] };
-			draw.program->colorAdd = eacp::Array<float, 4> { 0.0f, 0.0f, 0.0f, 0.0f };
-			break;
-		case SVC_INVERSE_MODULATE:
-			draw.program->colorModulate = eacp::Array<float, 4> { -color[0], -color[1], -color[2], -color[3] };
-			draw.program->colorAdd = eacp::Array<float, 4> { color[0], color[1], color[2], color[3] };
-			break;
-		default:
-			draw.program->colorModulate = eacp::Array<float, 4> { 0.0f, 0.0f, 0.0f, 0.0f };
-			draw.program->colorAdd = eacp::Array<float, 4> { color[0], color[1], color[2], color[3] };
-			break;
+		// A 3D view is the opposite: the depth buffer is already filled and the
+		// bits are the material's own, which is what decides whether a stage
+		// sits on the surface the depth fill put there or behind it.
+		if ( !backEnd.viewDef->viewEntitys ) {
+			draw.stateBits |= GLS_DEPTHFUNC_ALWAYS | GLS_DEPTHMASK;
 		}
 
-		draw.program->image = *texture;
-
-		drawProgram = draw.program;
-		drawPipeline = draw.pipeline;
-
-		// Through the counter wrapper rather than around it: r_showPrimitives
-		// and the renderer's own performance counters are read from the same
-		// place on both backends, and DrawIndexed is the seam.
-		RB_DrawElementsWithCounters( tri );
+		DrawStage( tri, draw );
 	}
 
 	drawProgram = NULL;
 	drawPipeline = NULL;
 	drawVertices = NULL;
+}
+
+/*
+======================
+idRenderBackendEacp::DrawStage
+
+One draw. What OpenGL says with a matrix stack, a texture matrix, glColor, a
+colour array, GL_COMBINE_ARB and six qglTexEnvi calls is a program, a pipeline
+and five uniforms - and the program and the pipeline are looked up rather than
+built, both being cached on exactly the state that went into them.
+
+The geometry is not an argument: drawVertices is already this surface's, set
+once by the caller because a material with four stages is four draws over one
+piece of geometry.
+======================
+*/
+void idRenderBackendEacp::DrawStage( const srfTriangles_t *tri, const eacpStage_t &stage ) {
+	GPU::Texture *	texture = stage.image ? TextureFor( stage.image ) : NULL;
+
+	if ( !texture ) {
+		// An image the upload path turned away - a .dds this build cannot read,
+		// or a cube map. UploadImageLevel has already said which and why; this
+		// is the draw that would have used it.
+		if ( !warnedMissingTexture ) {
+			warnedMissingTexture = true;
+			common->Warning( "eacp: '%s' has no texture on the GPU, so a surface will not draw",
+							 stage.image ? stage.image->imgName.c_str() : "(none)" );
+		}
+		return;
+	}
+
+	idEacpRenderProgs::stageDraw_t	draw =
+		eacpRenderProgs.StageDraw( stage.image, stage.stateBits, stage.cullType,
+								   stage.alphaTest );
+
+	if ( !draw.pipeline ) {
+		return;
+	}
+
+	draw.program->modelViewProjection = asFloat4x4( modelViewProjection );
+
+	// The texture matrix, as the two rows of it that are not the identity.
+	if ( stage.textureMatrix ) {
+		const float *	matrix = stage.textureMatrix;
+
+		draw.program->textureMatrixS = asFloat4( matrix[0], matrix[4], matrix[12], 0.0f );
+		draw.program->textureMatrixT = asFloat4( matrix[1], matrix[5], matrix[13], 0.0f );
+	} else {
+		draw.program->textureMatrixS = asFloat4( 1.0f, 0.0f, 0.0f, 0.0f );
+		draw.program->textureMatrixT = asFloat4( 0.0f, 1.0f, 0.0f, 0.0f );
+	}
+
+	// The three stageVertexColor_t modes as (modulate, add). OpenGL needs a
+	// combiner and a second texture unit bound to the white image to say the
+	// same thing; here they are two uniforms and the program is one.
+	//
+	// SVC_INVERSE_MODULATE inverts the alpha channel along with the three
+	// colour ones, which the fixed-function path does not: it sets
+	// GL_COMBINE_RGB alone and leaves alpha on the default modulate. That is a
+	// deliberate simplification and the one BFG's own port makes - the mode
+	// exists for cross-blended terrain, where the alpha is 1 either way, and no
+	// material in the demo reaches it at all.
+	const Float4 &	color = stage.color;
+	const Float4	black = asFloat4( 0.0f, 0.0f, 0.0f, 0.0f );
+
+	switch ( stage.vertexColor ) {
+	case SVC_MODULATE:
+		draw.program->colorModulate = color;
+		draw.program->colorAdd = black;
+		break;
+	case SVC_INVERSE_MODULATE:
+		draw.program->colorModulate = asFloat4( -color[0], -color[1], -color[2], -color[3] );
+		draw.program->colorAdd = color;
+		break;
+	default:
+		draw.program->colorModulate = black;
+		draw.program->colorAdd = color;
+		break;
+	}
+
+	draw.program->alphaTestRef = stage.alphaTestRef;
+	draw.program->image = *texture;
+
+	drawProgram = draw.program;
+	drawPipeline = draw.pipeline;
+
+	// Through the counter wrapper rather than around it: r_showPrimitives and
+	// the renderer's own performance counters are read from the same place on
+	// both backends, and DrawIndexed is the seam.
+	RB_DrawElementsWithCounters( tri );
 }
 
 /*
@@ -1247,4 +1698,28 @@ void idRenderBackendEacp::CopyFramebufferToImage( idImage *image, int x, int y,
 void idRenderBackendEacp::CopyDepthbufferToImage( idImage *image, int x, int y,
 												  int imageWidth, int imageHeight,
 												  bool useOversizedBuffer ) {
+}
+
+/*
+====================
+idRenderBackendEacp::ReadPixels
+
+The same missing thing CopyFramebufferToImage is missing, one step further on:
+there is no back buffer to read, only a drawable that has already been handed
+back to the compositor by the time anyone asks. It needs the app-owned render
+target of step 4e, and until then the honest answer is no.
+
+Which is not a cosmetic gap and was found by a crash rather than by reading:
+the game itself calls this, without being asked and at map load, to take the
+camera shot its objective screen shows - idObjective::Event_CamShot.
+====================
+*/
+bool idRenderBackendEacp::ReadPixels( int x, int y, int width, int height, byte *rgb ) {
+	if ( !warnedReadPixels ) {
+		warnedReadPixels = true;
+		common->Warning( "eacp: reading the frame back is not implemented yet, so the "
+						 "objective camera shots will be missing" );
+	}
+
+	return false;
 }

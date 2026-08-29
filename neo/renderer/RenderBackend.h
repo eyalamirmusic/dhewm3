@@ -256,6 +256,20 @@ public:
 	virtual void			CopyDepthbufferToImage( idImage *image, int x, int y,
 													int imageWidth, int imageHeight,
 													bool useOversizedBuffer ) = 0;
+
+	// The frame that has just been drawn, back on the CPU as tightly packed
+	// RGB bytes with the origin at the bottom left - which is OpenGL's
+	// convention and what R_WriteTGA's own flipVertical argument is written
+	// against. The caller allocates ( width + 3 ) * height * 3, because OpenGL
+	// pads each row to a word boundary.
+	//
+	// False from a backend that cannot do it, and that is not a hypothetical:
+	// a modern API has no front or back buffer to read, only a render target
+	// somebody kept, so this is the one entry point whose answer differs by
+	// more than how it is spelled. The callers are the objective camshots the
+	// game takes for its own UI, and they would rather write nothing than
+	// crash.
+	virtual bool			ReadPixels( int x, int y, int width, int height, byte *rgb ) = 0;
 };
 
 extern idRenderBackend *	renderBackend;

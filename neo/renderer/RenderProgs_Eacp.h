@@ -39,6 +39,41 @@ class idImage;
 /*
 ================================================================================
 
+	The CPU side of a uniform, named.
+
+	eacp's Uniform<Float4> is assigned a packed Array<float, 4> and its
+	Uniform<Float4x4> an Array<float, 16> - the same bytes the shader reads, in
+	the same order. The types are worth names for the same reason the vertex
+	struct below is: an eacp::Array<float, 16> at a call site says how big it is
+	and not what it is, and this is the difference between a matrix and four
+	colours in a row.
+
+	The two makers are what keep a matrix upload from being sixteen
+	comma-separated subscripts, which is what it was before they existed.
+
+================================================================================
+*/
+
+using Float4 = eacp::Array<float, 4>;
+using Float4x4 = eacp::Array<float, 16>;
+
+inline Float4 asFloat4( float x, float y, float z, float w ) {
+	return Float4 { x, y, z, w };
+}
+
+// Doom 3 keeps its matrices as float[16] in OpenGL's column-major order, which
+// is also MSL's and HLSL's as eacp generates them - so this is a copy rather
+// than a transpose.
+inline Float4x4 asFloat4x4( const float m[16] ) {
+	return Float4x4 { m[0],  m[1],  m[2],  m[3],
+					  m[4],  m[5],  m[6],  m[7],
+					  m[8],  m[9],  m[10], m[11],
+					  m[12], m[13], m[14], m[15] };
+}
+
+/*
+================================================================================
+
 	idDrawVert, said in eacp's terms.
 
 	The same sixty bytes in the same order, so the vertex the engine already has
@@ -79,12 +114,21 @@ struct eacpDrawVert_t {
 	which is SVC_IGNORE at (0, c), SVC_MODULATE at (c, 0) and
 	SVC_INVERSE_MODULATE at (-c, c).
 
+	It is also what fills the depth buffer, which is not a second program
+	because it is not a second expression: RB_T_FillDepthBuffer draws a
+	material's alpha-tested stages exactly as this draws its ambient ones, with
+	the constant colour set to black and the alpha test on. So the only thing
+	the depth fill adds is the discard - which cannot be a uniform, because a
+	discard is a branch the generated source either has or does not, so it is
+	the second dimension of the program cache rather than a bit of state.
+
 ================================================================================
 */
 
 class idEacpStageProgram : public eacp::GPU::ShaderProgram {
 public:
-	explicit				idEacpStageProgram( eacp::GPU::TextureSampling sampling );
+							idEacpStageProgram( eacp::GPU::TextureSampling sampling,
+												bool alphaTest );
 
 	virtual void			define( void ) override;
 
@@ -101,10 +145,18 @@ public:
 	eacp::GPU::Uniform<eacp::GPU::Float4>		colorModulate;
 	eacp::GPU::Uniform<eacp::GPU::Float4>		colorAdd;
 
+	// What glAlphaFunc( GL_GREATER, ref ) compares against, on the alpha-test
+	// variant. A register value, so it changes per stage and per frame and
+	// cannot be the compile-time threshold setDiscardBelow takes - see define().
+	eacp::GPU::Uniform<eacp::GPU::Float>		alphaTestRef;
+
 	eacp::GPU::Uniform<eacp::GPU::Texture2D>	image;
 
 	EACP_SHADER( modelViewProjection, textureMatrixS, textureMatrixT,
-				 colorModulate, colorAdd, image )
+				 colorModulate, colorAdd, alphaTestRef, image )
+
+private:
+	bool					discards;
 };
 
 /*
@@ -135,7 +187,8 @@ public:
 		const eacp::GPU::RenderPipeline *		pipeline;
 	};
 
-	stageDraw_t				StageDraw( const idImage *image, int stateBits, int cullType );
+	stageDraw_t				StageDraw( const idImage *image, int stateBits, int cullType,
+									   bool alphaTest );
 
 	// Geometry for one draw, in a buffer no frame still in flight is reading.
 	// The reference is good until this frame's pool comes round again, which is
@@ -143,8 +196,12 @@ public:
 	const eacp::GPU::Buffer &	StreamVertices( const void *data, std::size_t bytes );
 	const eacp::GPU::Buffer &	StreamIndices( const void *data, std::size_t bytes );
 
-	// How many pipelines have been compiled, for the log line that says what a
-	// level's content actually cost.
+	// How many programs and pipelines have been compiled, for the log line that
+	// says what a level's content actually cost. Both numbers are the content's
+	// answer to a question plan.md only sized: the first is how many of the
+	// eight (sampling, alpha test) combinations a level reaches, and the second
+	// how many pieces of Doom 3 state it draws them in.
+	int						NumPrograms( void ) const;
 	int						NumPipelines( void ) const;
 
 private:
@@ -157,16 +214,19 @@ private:
 		eacp::GPU::RenderPipeline *			pipeline;
 	};
 
-	// One way of sampling, and everything built on it. The program holds the
+	// One compiled program, and everything built on it. The program holds the
 	// generated source and the packed uniform block; the library is that source
 	// compiled once; the pipelines are the states it has been asked to draw in.
-	struct samplingVariant_t {
+	struct programVariant_t {
 		std::optional<idEacpStageProgram>		program;
 		std::optional<eacp::GPU::ShaderLibrary>	library;
 		eacp::Vector<statePipeline_t>			pipelines;
 	};
 
-	samplingVariant_t		variants[eacp::GPU::samplingConfigurations];
+	// Two dimensions, because two things are baked into a shader's source
+	// rather than set beside it: how its texture is sampled (GPU/SAMPLERS.md)
+	// and whether it discards.
+	programVariant_t		variants[eacp::GPU::samplingConfigurations][2];
 
 	eacp::GPU::StreamingBuffers	vertexStream;
 	eacp::GPU::StreamingBuffers	indexStream;

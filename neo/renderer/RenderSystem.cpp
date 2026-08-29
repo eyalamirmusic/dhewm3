@@ -929,13 +929,17 @@ void idRenderSystemLocal::CaptureRenderToFile( const char *fileName, bool fixAlp
 	guiModel->Clear();
 	R_IssueRenderCommands();
 
-	qglReadBuffer( GL_BACK );
-
 	// include extra space for OpenGL padding to word boundaries
 	int	c = ( rc->width + 3 ) * rc->height;
 	byte *data = (byte *)R_StaticAlloc( c * 3 );
 
-	qglReadPixels( rc->x, rc->y, rc->width, rc->height, GL_RGB, GL_UNSIGNED_BYTE, data );
+	if ( !renderBackend->ReadPixels( rc->x, rc->y, rc->width, rc->height, data ) ) {
+		// A backend with nothing to read back has already said so. Writing no
+		// file is what the callers can survive - this is the game taking a
+		// snapshot for its own objective screen, not the player asking for one.
+		R_StaticFree( data );
+		return;
+	}
 
 	byte *data2 = (byte *)R_StaticAlloc( c * 4 );
 

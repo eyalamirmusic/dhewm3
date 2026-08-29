@@ -102,6 +102,7 @@ public:
 	virtual void	CopyDepthbufferToImage( idImage *image, int x, int y,
 											int imageWidth, int imageHeight,
 											bool useOversizedBuffer );
+	virtual bool	ReadPixels( int x, int y, int width, int height, byte *rgb );
 };
 
 static idRenderBackendGL	renderBackendGL;
@@ -1210,4 +1211,16 @@ void idRenderBackendGL::CopyDepthbufferToImage( idImage *image, int x, int y,
 
 	qglTexParameterf( GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE );
 	qglTexParameterf( GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE );
+}
+
+/*
+====================
+idRenderBackendGL::ReadPixels
+====================
+*/
+bool idRenderBackendGL::ReadPixels( int x, int y, int width, int height, byte *rgb ) {
+	qglReadBuffer( GL_BACK );
+	qglReadPixels( x, y, width, height, GL_RGB, GL_UNSIGNED_BYTE, rgb );
+
+	return true;
 }

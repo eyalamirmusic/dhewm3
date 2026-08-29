@@ -8,9 +8,10 @@ Phase 2 is under way: the app shell, the threading, the boot, the input and the
 renderer are in, and the renderer now draws. `dhewm3-eacp` puts **Doom 3's main
 menu on screen through Metal** — every 2D element of it, out of one generic
 material-stage program in eacp's shader EDSL, five compiled pipelines and a
-streaming vertex pool. What is missing from that picture is the one thing in the
-menu that is not 2D: the lit Mars globe, which is a `renderDef`, and which is
-the world — step 4d.**
+streaming vertex pool — and now **loads a level and fills its depth buffer**, so
+the world occludes correctly and its ambient stages draw over a black
+silhouette. What is missing from both pictures is the light: the interaction
+program and the stencil shadow pass, steps 4d.2 and 4d.3.**
 
 Reference implementation for almost everything on the platform side:
 `~/Code/PureDOOM/examples/EACP` — a complete engine hosted on eacp, with its own
@@ -371,6 +372,26 @@ Numbers are never reused, so a hole is an entry that closed.
     and it has to be fixed before the Windows host (§8) can use this table.
     `ToUnicode` with a live keyboard state can also consume a dead key and
     corrupt the character after it, which is the same fix.
+
+18. **A second pass on a frame cannot keep the first one's colour, because
+    multisampling resolves and discards it.** Doom 3 renders one *view* per
+    pass — a pass clears depth and stencil, which is exactly what
+    `RB_BeginDrawingView` asks for — and every view after the first has to find
+    the colour the ones before it wrote. `Frame::beginPass` with `clear = false`
+    is the call for that, and it is right on a single-sampled target: the
+    drawable is attached with `MTLStoreActionStore` and loaded back. With MSAA
+    it is not. The MSAA texture is attached instead, with
+    `MTLStoreActionMultisampleResolve`, which resolves into the drawable and
+    stores nothing — so the next pass's `MTLLoadActionLoad` reads an attachment
+    nothing kept. `StoreAndMultisampleResolve` is the shape that would work.
+
+    Read out of `Frame-Apple.mm` rather than measured, because the port took the
+    other road: it uses one pass for the whole frame, which clears depth once
+    and is therefore right for one 3D view and wrong for two. Step 4d.1 says so
+    where it decides it, and it is what makes subviews and mirrors 4e's rather
+    than a thing that nearly works. Worth knowing that the eacp build draws at
+    4x MSAA either way — `GPUView`'s default, which `r_multiSamples` does not
+    reach.
 
 ### Checked, and *not* gaps
 
@@ -1030,13 +1051,132 @@ new `RenderProgs_Eacp` files and the eacp source list in `neo/CMakeLists.txt` wa
 edited, so the SDL/GL binary is byte-identical and its 297/297 stands without
 re-running.
 
+#### Step 4d.1 — the depth fill, and the world in silhouette — **done**
+
+The first of the world's three. `RB_STD_FillDepthBuffer` and
+`RB_T_FillDepthBuffer` rewritten into `idRenderBackendEacp`, `DrawView` no
+longer turning back on `viewEntitys`, and the ambient passes it already had now
+running over a 3D view as well as a 2D one.
+
+**What it draws is the level in black with its ambient stages on top** — the
+light glows, the panel sprites, the sky, the screens — which is the whole of
+what Doom 3 puts on a surface before a light touches it. That is not much of a
+picture and it is not meant to be: what the step is *for* is the two after it.
+An interaction pass can only run at `GLS_DEPTHFUNC_EQUAL` — touching the
+fragments that survived and no others — once something has put every opaque and
+perforated surface in the depth buffer at exactly its own depth, and a shadow
+volume can only be counted against a depth buffer that is already right.
+
+**The depth fill is not a second shader, because it is not a second
+expression.** `RB_T_FillDepthBuffer` draws a material's alpha-tested stages
+exactly as `RB_STD_T_RenderShaderPasses` draws its ambient ones — same texture,
+same texture matrix — with the constant colour set to black and the alpha test
+on. So it is `idEacpStageProgram` with two things added: an `alphaTestRef`
+uniform, and the discard. The discard cannot be a uniform — a `discard` is a
+branch the generated source either has or does not — so it becomes the *second
+dimension* of the program cache, which is now `(sampling, alpha test)` and eight
+wide worst case. The demo's whole main menu and its first level between them
+reach **four of the eight**.
+
+**`setDiscardBelow`'s threshold is a compile-time float and Doom 3's is a shader
+register**, so the uniform goes on the other side of the comparison: discarding
+below zero on `alpha - ref` is discarding below `ref` on `alpha`. The one
+difference from `glAlphaFunc( GL_GREATER, ref )` is at exact equality, which GL
+discards and this keeps.
+
+**Both depth hacks survive, and they are one function here rather than three
+pieces of context state.** `RB_EnterWeaponDepthHack` and
+`RB_EnterModelDepthHack` each rebuild the projection matrix *from the view's* and
+set a `glDepthRange` to go with it, so on eacp they are a different
+`modelViewProjection` and a different `setViewport` — which takes the range as
+two extra arguments and needs no second call. The hack is an argument to
+`SetSpace` rather than read off the space, because a surface can refuse the one
+its space asks for: a soft particle does (#3878), and its neighbour in the same
+space does not.
+
+**Measured against the SDL/GL build drawing exactly what this backend can
+draw** — `r_skipInteractions 1`, `r_skipFogLights 1`, `r_skipBlendLights 1` —
+at one pinned camera in `demo_mars_city1`:
+
+| | views | draws | tris | shdw |
+| --- | --- | --- | --- | --- |
+| SDL/GL, lights skipped | 1 | 128 | 13777 | 9736 |
+| eacp | 1 | 89 | 4041 | 0 |
+
+**Those are the same numbers, and the first reading of them said the two were
+three times apart.** `r_showPrimitives` prints `tris` as
+`( c_drawIndexes + c_shadowIndexes ) / 3` and `draws` as
+`c_drawElements + c_shadowElements`, so a backend that draws no shadow volumes
+is not being compared like for like until the shadow half comes out of the other
+one's totals: 13777 − 9736 = **4041**, exactly what the eacp backend drew. The
+draw column follows from the same subtraction but cannot be checked against it —
+`c_shadowElements` is never printed on its own — so what is measured is the
+triangles, and 39 shadow draws is what the draw column *implies* rather than
+what it says. Worth knowing before trusting that counter across a port.
+
+**Over the gate's own reference demo, frame for frame, the difference is a
+constant 10 triangles with a name.** `textures/decals/p_oppressive` has a
+`TG_REFLECT_CUBE` stage, which needs cube maps (gap 5); the backend skips it and
+says so once. That holds for as long as the two runs are looking at the same
+demo frame, which is the demo's opening while nothing is moving — **and no
+further, because `playDemo` is paced by the wall clock.** The two builds run at
+different speeds and start sampling different demo frames, after which the
+comparison is of two different pictures and says nothing; `com_fixedTic 1` does
+not fix it. **A frame-exact eacp gate needs `aviDemo`, `aviDemo` needs the frame
+back on the CPU, and that needs step 4e's render target** — so the eacp build
+cannot be gated the way the GL one is until 4e lands, and until then a matched
+still frame is the sharpest instrument there is.
+
+The run is clean under `MTL_DEBUG_LAYER=1` with `MTL_SHADER_VALIDATION=1` and
+GPU validation, loads the level and quits without an assert, and reports **4
+material-stage programs and 23 pipelines** for the level against the menu's 4
+and 5.
+
+**Three things it cost:**
+
+- **The game crashes the eacp build at map load, and it is a framebuffer read
+  rather than a draw.** `idObjective::Event_CamShot` fires as the level spawns
+  and calls `idRenderSystemLocal::CaptureRenderToFile`, which was still plain
+  `qglReadPixels` in a shared file — a null function pointer on this host. So
+  the seam grew a `ReadPixels`, GL doing what it did and eacp answering `false`,
+  and `CaptureRenderToFile` writing nothing rather than crashing. It is the one
+  entry point whose answer differs by more than spelling: a modern API has no
+  back buffer to read, only a render target somebody kept, so the real answer is
+  4e's the same way `_currentRender` is. The screenshot path
+  (`R_ReadTiledPixels`) is deliberately *not* moved — its front-buffer read and
+  its Wayland special case are GL's own, and the gate's `aviDemo` goes through
+  it.
+
+- **One pass per frame, not one per view, and that is now a decision rather than
+  an oversight.** A pass clears depth and stencil as it opens, which is exactly
+  what `RB_BeginDrawingView` wants for a 3D view — but the colour has to survive
+  from one view to the next, and with MSAA on it does not (gap 18). One pass a
+  frame is therefore right for one 3D view and wrong for two, which is a subview
+  or a mirror, and `BeginDrawingView` warns once when it sees one.
+
+- **`RB_STD_LightScale` can never do anything on this backend and is not
+  ported.** It is the full-screen multiply that crutches up a backend whose
+  blending range is eight bits, and it returns immediately unless
+  `backEnd.overBright > 1` — which `RB_DetermineLightScale` only produces when
+  the brightest light exceeds `tr.backEndRendererMaxLight`, and that is 999 for
+  `BE_EACP` as it is for `BE_ARB2`. `RB_DetermineLightScale` itself is still
+  called, for `backEnd.lightScale`, which 4d.2 needs.
+
+**The gate re-run rather than reasoned about**, because this step edited three
+shared files — `RenderBackend.h`, `RenderBackend_GL.cpp` and `RenderSystem.cpp`.
+**297 of 297 frames identical** to the step 4b baseline.
+
 ### Shader inventory for Phase 2
 
 Roughly 10–15 EDSL programs, each in the sampling variants §4.3 sizes — 8 worst case
-for interaction, 4 for the generic stage, compiled lazily:
+for interaction, 8 for the generic stage now that the alpha test is a variant of it
+rather than a program beside it, compiled lazily:
 
 - interaction (bump / diffuse / specular) — the port of `interaction.vfp`
-- depth fill, with alpha test (`setDiscardBelow`)
+- ~~depth fill, with alpha test~~ — **not a program of its own**, which step 4d.1
+  found rather than assumed: the depth fill is the generic material stage with the
+  colour black and a `setDiscardBelow`, so it is one more *variant* of that one
+  and the count below moves from 4 to 8 rather than the list growing an entry
 - shadow volume extrude (stencil) — `Apps/GPU/StencilShadows` is the worked example
 - generic material stage, in its texgen variants: normal, reflect, skybox, wobblesky
 - fog
@@ -1129,11 +1269,24 @@ Phase 2 is the first work that compiles against eacp. In rough order:
      the state bitfield translated into a pipeline, the variant cache §4.3
      sizes, geometry streamed through `GPU::StreamingBuffers`, a texture per
      stage.
-   - **4d. The world.** ← **next.** Depth fill, the interaction program, the
-     stencil shadow pass. `Apps/GPU/StencilShadows` is the worked example for
-     the last of those and exists for exactly this moment. The first thing it
-     buys is visible without leaving the main menu: the lit Mars globe, which
-     is a `renderDef` and the one part of that screen 4c does not draw.
+   - **4d. The world**, in three, because it is three ideas rather than one.
+     - ~~**4d.1. The depth fill.**~~ — **done**, §6. Every opaque and
+       perforated surface into the depth buffer at its own depth, and the
+       ambient passes now running over a 3D view. What it draws is the level
+       in black with its glows on top; what it is for is that the two steps
+       after it can test against it. 89 draws and 4041 triangles at a pinned
+       camera, which is the SDL/GL build's count exactly once its shadow half
+       is subtracted.
+     - **4d.2. The interaction program.** ← **next.** The port of
+       `interaction.vfp` into the EDSL — bump, diffuse and specular against
+       one light's projection and falloff — driven by
+       `RB_CreateSingleDrawInteractions`, at `GLS_DEPTHFUNC_EQUAL` over what
+       4d.1 filled. The first thing it buys is visible without leaving the
+       main menu: the lit Mars globe, which is a `renderDef` and the one part
+       of that screen 4c does not draw.
+     - **4d.3. The stencil shadow pass.** `RB_StencilShadowPass` and the
+       two-sided depth-fail count. `Apps/GPU/StencilShadows` is the worked
+       example and exists for exactly this moment.
    - **4e. What is left.** Fog and blend lights, the texgen variants
      (reflect, skybox, wobblesky), subviews and mirrors, and `_currentRender` —
      which needs the composited frame to live in an app-owned render target

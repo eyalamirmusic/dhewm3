@@ -71,11 +71,13 @@ static_assert( offsetof( eacpDrawVert_t, color ) == offsetof( idDrawVert, color 
 ================================================================================
 */
 
-idEacpStageProgram::idEacpStageProgram( GPU::TextureSampling sampling ) {
+idEacpStageProgram::idEacpStageProgram( GPU::TextureSampling sampling, bool alphaTest ) {
 	// Before compile(), not after: the build walk reads this to place the
 	// static sampler the generated shader points at, and eacp bakes the choice
 	// into the source rather than leaving it to a bind.
 	image.sampling = sampling;
+
+	discards = alphaTest;
 
 	compile();
 }
@@ -107,8 +109,24 @@ void idEacpStageProgram::define( void ) {
 	auto	transformed = GPU::float2( GPU::dot( homogeneous, textureMatrixS ),
 									   GPU::dot( homogeneous, textureMatrixT ) );
 
-	setFragment( GPU::sample( image, varying( transformed ) )
-				 * varying( vertexColor * colorModulate + colorAdd ) );
+	auto	fragment = GPU::sample( image, varying( transformed ) )
+		* varying( vertexColor * colorModulate + colorAdd );
+
+	// glAlphaFunc( GL_GREATER, ref ) against the fragment's own alpha, which is
+	// what the fixed-function pipeline compares: the default texture env is
+	// modulate, so the alpha reaching the test is the texture's times the
+	// constant colour's - which is this expression's w.
+	//
+	// setDiscardBelow's threshold is a compile-time float and Doom 3's is a
+	// shader register, so the uniform goes on the other side of the comparison:
+	// discarding below zero on ( alpha - ref ) is discarding below ref on
+	// alpha. The one difference from GL is at exact equality, which GL_GREATER
+	// discards and this keeps.
+	if ( discards ) {
+		setDiscardBelow( fragment.w() - alphaTestRef, 0.0f );
+	}
+
+	setFragment( fragment );
 }
 
 /*
@@ -287,23 +305,41 @@ idEacpRenderProgs::~idEacpRenderProgs() {
 
 void idEacpRenderProgs::Shutdown( void ) {
 	for ( int i = 0 ; i < GPU::samplingConfigurations ; i++ ) {
-		samplingVariant_t &	variant = variants[i];
+		for ( int test = 0 ; test < 2 ; test++ ) {
+			programVariant_t &	variant = variants[i][test];
 
-		for ( int j = 0 ; j < variant.pipelines.size() ; j++ ) {
-			delete variant.pipelines[j].pipeline;
+			for ( int j = 0 ; j < variant.pipelines.size() ; j++ ) {
+				delete variant.pipelines[j].pipeline;
+			}
+
+			variant.pipelines.clear();
+			variant.library.reset();
+			variant.program.reset();
 		}
-
-		variant.pipelines.clear();
-		variant.library.reset();
-		variant.program.reset();
 	}
+}
+
+int idEacpRenderProgs::NumPrograms( void ) const {
+	int	total = 0;
+
+	for ( int i = 0 ; i < GPU::samplingConfigurations ; i++ ) {
+		for ( int test = 0 ; test < 2 ; test++ ) {
+			if ( variants[i][test].program.has_value() ) {
+				total++;
+			}
+		}
+	}
+
+	return total;
 }
 
 int idEacpRenderProgs::NumPipelines( void ) const {
 	int	total = 0;
 
 	for ( int i = 0 ; i < GPU::samplingConfigurations ; i++ ) {
-		total += variants[i].pipelines.size();
+		for ( int test = 0 ; test < 2 ; test++ ) {
+			total += variants[i][test].pipelines.size();
+		}
 	}
 
 	return total;
@@ -320,17 +356,19 @@ guess in a comment.
 ====================
 */
 idEacpRenderProgs::stageDraw_t idEacpRenderProgs::StageDraw( const idImage *image,
-															 int stateBits, int cullType ) {
+															 int stateBits, int cullType,
+															 bool alphaTest ) {
 	stageDraw_t	draw;
 
 	draw.program = NULL;
 	draw.pipeline = NULL;
 
 	const GPU::TextureSampling	sampling = R_EacpSampling( image );
-	samplingVariant_t &			variant = variants[ GPU::samplingIndex( sampling ) ];
+	programVariant_t &			variant =
+		variants[ GPU::samplingIndex( sampling ) ][ alphaTest ? 1 : 0 ];
 
 	if ( !variant.program.has_value() ) {
-		variant.program.emplace( sampling );
+		variant.program.emplace( sampling, alphaTest );
 		variant.library.emplace( GPU::Device::shared(), variant.program->source() );
 
 		if ( !variant.library->isValid() ) {
@@ -343,9 +381,9 @@ idEacpRenderProgs::stageDraw_t idEacpRenderProgs::StageDraw( const idImage *imag
 
 	// The bits a pipeline is compiled against. Two of GL_State's are not here:
 	// GLS_POLYMODE_LINE, which is r_showTris' wireframe and has no eacp
-	// counterpart, and GLS_ATEST_BITS, which nothing in this tree sets - the
-	// alpha test Doom 3 actually uses is shaderStage_t::hasAlphaTest, applied
-	// by the depth-fill pass, and it is step 4d's.
+	// counterpart, and GLS_ATEST_BITS, which has zero call sites in this tree -
+	// the alpha test Doom 3 actually uses is shaderStage_t::hasAlphaTest, and
+	// it arrives here as the alphaTest argument rather than in the bitfield.
 	const int	pipelineBits = stateBits
 		& ( GLS_SRCBLEND_BITS | GLS_DSTBLEND_BITS
 			| GLS_DEPTHMASK | GLS_REDMASK | GLS_GREENMASK | GLS_BLUEMASK | GLS_ALPHAMASK
@@ -389,7 +427,7 @@ idEacpRenderProgs::stageDraw_t idEacpRenderProgs::StageDraw( const idImage *imag
 	descriptor.depthWrite = !( pipelineBits & GLS_DEPTHMASK );
 
 	// StencilFace's defaults are always-test, never-write, which is exactly
-	// glDisable( GL_STENCIL_TEST ). The shadow pass sets them; step 4d.
+	// glDisable( GL_STENCIL_TEST ). The shadow pass sets them; step 4d.3.
 	descriptor.stencil = true;
 
 	descriptor.cullMode = R_EacpCullMode( cullType );
