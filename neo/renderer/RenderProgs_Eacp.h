@@ -127,6 +127,25 @@ struct eacpShadowVert_t {
 /*
 ================================================================================
 
+	The blit's vertex, which is not the engine's at all.
+
+	Six of these are the whole geometry of putting the finished frame on the
+	screen: a quad already in clip space, with the texture coordinate that
+	samples the render target it came out of. Nothing in Doom 3 produces them,
+	because on OpenGL there is nothing to put on the screen - the frame is
+	already in the back buffer.
+
+================================================================================
+*/
+
+struct eacpBlitVert_t {
+	float					xy[2];
+	float					st[2];
+};
+
+/*
+================================================================================
+
 	What a draw does with the stencil buffer.
 
 	On OpenGL this is three calls left in the context - glStencilFunc,
@@ -395,6 +414,38 @@ public:
 /*
 ================================================================================
 
+	idEacpBlitProgram
+
+	The finished frame onto the screen: one texture, sampled at the coordinate
+	the vertex carries, written out unchanged.
+
+	It exists because the frame is no longer drawn into the thing that gets
+	presented. Everything above composes into an app-owned render target, and
+	this is what puts that target on the drawable - which is a draw here and is
+	nothing at all on OpenGL, where the frame was in the back buffer the moment
+	it was drawn.
+
+	There is no transform because there is nothing to transform: the six
+	vertices are already in clip space, and what the viewport does with them is
+	the whole of the mapping.
+
+================================================================================
+*/
+
+class idEacpBlitProgram : public eacp::GPU::ShaderProgram {
+public:
+							idEacpBlitProgram();
+
+	virtual void			define( void ) override;
+
+	eacp::GPU::Uniform<eacp::GPU::Texture2D>	image;
+
+	EACP_SHADER( image )
+};
+
+/*
+================================================================================
+
 	idEacpRenderProgs
 
 	The three caches and the streaming pools, in one place because they are
@@ -453,6 +504,16 @@ public:
 
 	shadowDraw_t			ShadowDraw( int stateBits, int cullType, eacpStencil_t stencil );
 
+	// The frame onto the screen. Its pipeline is the one thing here that is not
+	// compiled against the render target: it draws into the drawable, so it
+	// takes the drawable's sample count rather than the target's one.
+	struct blitDraw_t {
+		idEacpBlitProgram *						program;
+		const eacp::GPU::RenderPipeline *		pipeline;
+	};
+
+	blitDraw_t				BlitDraw( void );
+
 	// Geometry for one draw, in a buffer no frame still in flight is reading.
 	// The reference is good until this frame's pool comes round again, which is
 	// several frames after the draw that bound it was submitted.
@@ -470,12 +531,15 @@ public:
 private:
 	// One pipeline, and the state it was compiled for. Held by pointer because
 	// GPU::RenderPipeline is pinned in place - it owns native objects behind a
-	// Pimpl and has no copy.
+	// Pimpl and has no copy - and by an *owning* pointer because that is what
+	// says who releases it. eacp::OwningPointer is a unique_ptr that still
+	// converts to the raw pointer a draw is issued with, so the ownership costs
+	// the call sites nothing.
 	struct statePipeline_t {
-		int									stateBits;
-		int									cullType;
-		eacpStencil_t						stencil;
-		eacp::GPU::RenderPipeline *			pipeline;
+		int											stateBits;
+		int											cullType;
+		eacpStencil_t								stencil;
+		eacp::OwningPointer<eacp::GPU::RenderPipeline>	pipeline;
 	};
 
 	// One compiled program, and everything built on it. The program holds the
@@ -506,8 +570,10 @@ private:
 
 	// By pointer, because a ShaderProgram is pinned in place - its uniform
 	// members hold nodes in the graph it owns - so it can neither be copied nor
-	// moved, and a vector that grows does one or the other.
-	eacp::Vector<interactionVariant_t *>	interactions;
+	// moved, and a vector that grows does one or the other. An OwnedVector is
+	// that vector of pointers with the ownership said out loud: it is a
+	// Vector<OwningPointer<T>>, so the elements go when it does.
+	eacp::OwnedVector<interactionVariant_t>	interactions;
 
 	// The shadow program, which has no variants - see the class. What it does
 	// have is more pipelines than either of the others per program: the count
@@ -516,13 +582,23 @@ private:
 	std::optional<eacp::GPU::ShaderLibrary>	shadowLibrary;
 	eacp::Vector<statePipeline_t>			shadowPipelines;
 
+	// The blit, which has one of everything: one program, one pipeline, and no
+	// state to key either on. It is also the only pipeline here that is not
+	// built by PipelineFor, because what it draws into is the drawable rather
+	// than the render target and the two do not agree on sample count.
+	std::optional<idEacpBlitProgram>		blitProgram;
+	std::optional<eacp::GPU::ShaderLibrary>	blitLibrary;
+	eacp::OwningPointer<eacp::GPU::RenderPipeline>	blitPipeline;
+
 	// The pipeline all three caches build, from the state Doom 3 asks for and
-	// the program that is going to be drawn with it. NULL if it would not
-	// compile, which the caller answers by skipping the draw.
-	eacp::GPU::RenderPipeline *	BuildPipeline( const eacp::GPU::ShaderLibrary &library,
-											   const eacp::GPU::VertexLayout &layout,
-											   int stateBits, int cullType,
-											   eacpStencil_t stencil );
+	// the program that is going to be drawn with it. Empty if it would not
+	// compile, which the caller answers by skipping the draw - and returned by
+	// value because that is the handover: whoever takes it owns it.
+	eacp::OwningPointer<eacp::GPU::RenderPipeline>
+							BuildPipeline( const eacp::GPU::ShaderLibrary &library,
+										   const eacp::GPU::VertexLayout &layout,
+										   int stateBits, int cullType,
+										   eacpStencil_t stencil );
 
 	// The one lookup all three caches do: a linear search of the pipelines
 	// already compiled for a program, and a compile when it is not there. The

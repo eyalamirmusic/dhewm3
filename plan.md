@@ -6,14 +6,16 @@ app lifecycle and message loop first, GPU rendering (Metal / D3D12) as the real 
 **Status: Phase 0 is done and merged. Phase 1 has landed its gate and its seam.
 Phase 2 is under way: the app shell, the threading, the boot, the input and the
 renderer are in, and the renderer now draws. `dhewm3-eacp` puts **Doom 3's main
-menu on screen through Metal**, **loads a level**, **lights it** and now
+menu on screen through Metal**, **loads a level**, **lights it** and
 **shadows it** — the world is done, all three of the steps 4d was broken into.
 `interaction.vfp` and `shadow.vp` are in the EDSL, the stencil shadow volumes
 are counted two-sided in one pass over each volume, and at a pinned camera in
 `demo_mars_city1` the two backends draw **the same 71 draws, 1644 triangles and
-2376 shadow triangles**, volume for volume. What is left is 4e: fog and blend
-lights, the texgen variants, subviews, and the render target `_currentRender`
-and a frame-exact gate both need.**
+2376 shadow triangles**, volume for volume. 4e has started: the frame is
+composed into an app-owned **render target** and the drawable is a blit of it,
+which is what `_currentRender`, a pass per view, and a readback the gate could
+hash all need. What is left in 4e is those, plus fog, blend lights and the
+texgen variants.**
 
 Reference implementation for almost everything on the platform side:
 `~/Code/PureDOOM/examples/EACP` — a complete engine hosted on eacp, with its own
@@ -305,11 +307,14 @@ Re-verified against `main` at `be7a749` rather than carried forward on trust.
 *starting* Phase 2 — each degrades the picture or has a workaround, and the list is
 better driven by real content than guessed at now.
 
-That last sentence has now been tested. 12, 17 and 19 are what it turned up —
-the gaps this port found by walking real content rather than by reading eacp.
-12 and 17 stopped the next step rather than degrading it, and both are closed,
-in §6 under step 4b′. 19 does not stop anything today, because it is D3D12's
-alone and the eacp host is macOS-only for other reasons; it stops Windows.
+That last sentence has now been tested. 12, 17, 19, 20 and 21 are what it turned
+up — the gaps this port found by walking real content rather than by reading
+eacp. 12 and 17 stopped the next step rather than degrading it, and both are
+closed, in §6 under step 4b′. 19 does not stop anything today, because it is
+D3D12's alone and the eacp host is macOS-only for other reasons; it stops
+Windows. 20 is a price already paid, in multisampling, for what step 4e.1
+bought. 21 is the one that stops something worth having: without a texture
+readback there is no frame-exact gate for this backend.
 
 Numbers are never reused, so a hole is an entry that closed.
 
@@ -412,10 +417,15 @@ Numbers are never reused, so a hole is an entry that closed.
     Read out of `Frame-Apple.mm` rather than measured, because the port took the
     other road: it uses one pass for the whole frame, which clears depth once
     and is therefore right for one 3D view and wrong for two. Step 4d.1 says so
-    where it decides it, and it is what makes subviews and mirrors 4e's rather
-    than a thing that nearly works. Worth knowing that the eacp build draws at
-    4x MSAA either way — `GPUView`'s default, which `r_multiSamples` does not
-    reach.
+    where it decides it, and it is what made subviews and mirrors 4e's rather
+    than a thing that nearly works.
+
+    **Step 4e.1 stopped this binding without closing it.** The frame is composed
+    into a texture now, and a texture target is single-sampled and stored — so
+    `clear = false` on a second pass over it loads exactly what the first one
+    wrote. The entry stays because it is still true of the drawable, and because
+    the reason it stopped mattering is that this port gave up multisampling
+    (gap 20) rather than that eacp gained `StoreAndMultisampleResolve`.
 
 19. **A shader can bind four textures on D3D12, and Doom 3's interaction program
     needs five.** `Lib/eacp/GPU/Windows/D3D12Types.h:25` is
@@ -440,6 +450,34 @@ Numbers are never reused, so a hole is an entry that closed.
     that must be true before Windows rather than blocking anything now. Raising
     the constant moves `bufferRegisterBase` with it, which is why it is a change
     to eacp rather than a number to edit.
+
+20. **A texture render target cannot be multisampled.**
+    `Frame::beginPass(texture)` is single-sampled by design — its own comment
+    says a texture target "has nothing to resolve into", the texture being what
+    a resolve would produce — while the drawable path attaches an MSAA texture
+    and resolves into the drawable. So the shape is there on one path and absent
+    on the other, and an app that moves its composition into a texture (step
+    4e.1, and PureDOOM before it) gives up multisampling to do it.
+
+    Measured rather than assumed: 0.8 of 255 on Doom 3's main menu, which is the
+    screen with the most edges per pixel in the game, and 0.1 on a level view.
+    Worth it for what the target buys, and cheap to close if it ever is not — an
+    MSAA texture beside the target, resolved into it, is what the drawable path
+    already does.
+
+21. **A texture cannot be read back to the CPU.** `Buffer::read` exists and
+    `Texture` has nothing like it: `update()` uploads, and the only readback in
+    eacp is `GPUView::renderNativeContent`, which renders a *new* frame
+    offscreen for a `View` snapshot. That is no use to an engine, whose `render`
+    is a whole simulation tick.
+
+    Found by step 4e.1 arriving at the point where it would be used. What it
+    blocks is `ReadPixels`, and through it the objective camshots the game takes
+    for its own UI, `R_ReadTiledPixels`' screenshots, `aviDemo` - and a
+    frame-exact gate for the eacp build, which is the reason it matters more
+    than the list above suggests. Everything this port has measured against the
+    GL build so far has been a screen grab agreeing to 0.3 of 255; this is what
+    would make it a hash.
 
 ### Checked, and *not* gaps
 
@@ -1437,6 +1475,69 @@ omission.** The three files this step touched — `RenderBackend_Eacp.cpp`,
 for byte the one the last capture was taken from. Unlike 4d.2, which edited
 three shared files and re-ran it at 297/297.
 
+#### Step 4e.1 — the frame lives in a render target — **done**
+
+The first piece of 4e, and the one the rest of it is waiting on. `BeginPass`
+opens onto an app-owned `GPU::Texture` rather than the drawable, and
+`SwapBuffers` closes that pass and opens a second one over the drawable to draw
+the texture across it. PureDOOM's `captureTarget` is the same shape (§3).
+
+**Why it has to be a second pass on the same frame rather than a second frame.**
+Passes on one frame are ordered by the queue, so a texture written by an earlier
+one is legal to sample in a later one and neither backend needs a fence to say
+so. What is *not* legal is sampling the texture a pass is rendering into — which
+is the whole reason `_currentRender` needs this and why the blit cannot be
+folded into the pass above it.
+
+**The target is sized to `glConfig.vidWidth`, not to the window.** Every
+viewport, scissor and screen coordinate in the renderer is measured against
+those, so a target of any other size would put the picture somewhere the
+renderer does not think it is; the blit then maps that rectangle onto whatever
+the drawable happens to be. Which is also what makes a window resize scale the
+frame rather than corrupt it — `GLimp_SetScreenParms` refuses to resize (gap 8),
+so the two really can differ.
+
+**It costs the multisampling, and that is a straight trade rather than an
+oversight.** A texture target on eacp is single-sampled — it *is* what a resolve
+would produce, so there is nothing to resolve into (§5, gap 20) — so the view is
+set to one sample and every pipeline is compiled for one. Measured on the menu,
+which is the screen with the most edges per pixel in the game: a mean of 0.8 of
+255 against the same frame at 4×, and 0.1 on a level view. What the trade buys is
+everything 4e is for, and one thing it settles immediately: `r_multiSamples`
+defaults to 0, and until now the eacp build drew at four samples with no way for
+the cvar to reach it.
+
+**What it does not cost is the picture.** At the static camera of 4d.3 the
+counters are unchanged and the frame still matches the SDL/GL build at a mean of
+0.3 of 255 — the same number as before the target existed, which is the point:
+the frame went through a texture and came out the same frame. Clean under
+`MTL_DEBUG_LAYER=1` with `MTL_SHADER_VALIDATION=1` and GPU validation, at 9
+programs and 32 pipelines against 4d.3's 8 and 31 — the blit being one of each.
+
+**The owning pointers were made to say so while this landed.** The port's
+pipelines, programs, textures and passes were held in raw pointers with matching
+`delete`s; they are `eacp::OwningPointer` and `eacp::OwnedVector` now, which is
+the same thing the containers were already doing for the shader programs with
+`std::optional`. Two places kept a bare `new` and both have a reason:
+`GPU::RenderPass` has no move constructor, so a new-expression is the only way
+to build one from `beginPass`'s prvalue and hold it past the statement; and
+`idImage::backendTexture` is a `void *` in a header both backends compile, so
+`ReplaceTexture` is where ownership is carried by hand — in and out through
+owning pointers, with no `delete` in sight.
+
+**What this unblocks, in the order it is worth doing:**
+
+- **`ReadPixels`, and with it a frame-exact gate.** The frame is now in a texture
+  the app owns; what is missing is a way to read one back, which eacp does not
+  have (§5, gap 21). That is the keystone: it turns every comparison in this
+  port from a screen grab at 0.3 of 255 into a hash.
+- **`_currentRender`**, which is this same blit into an image's texture rather
+  than into the drawable.
+- **A pass per view.** Gap 18 said a second pass could not keep the first's
+  colour because the multisampled drawable resolves and discards it; a texture
+  target is stored and loads back, so `clear = false` now means what it says and
+  subviews and mirrors stop being blocked by the frame's shape.
+
 ### Shader inventory for Phase 2
 
 Roughly 10–15 EDSL programs, each in the sampling variants §4.3 sizes — 8 worst case
@@ -1577,16 +1678,28 @@ Phase 2 is the first work that compiles against eacp. In rough order:
        triangles and 2376 shadow triangles at a camera with nothing animating
        in it, which is the SDL/GL build's count exactly, volume for volume —
        and the picture agrees at 0.3 of 255.
-   - **4e. What is left.** ← **next.** Fog and blend lights, the texgen variants
-     (reflect, skybox, wobblesky), subviews and mirrors, `r_gammaInShader`
-     (step 4d.2 — the identity at the default settings, and nothing at any
-     other), and `_currentRender` — which needs the composited frame to live in
-     an app-owned render target that the drawable is blitted from, because a
-     texture cannot be sampled by the pass rendering into it. PureDOOM's
-     `captureTarget`, §3. That render target is also what gives the eacp build a
-     `ReadPixels` and so a frame the gate could hash; two screen grabs of a
-     scene that holds still get within 0.3 of 255 of each other (step 4d.3),
-     which is enough to compare a picture by and not enough to hash one.
+   - **4e. What is left**, and it is a basket rather than a step.
+     - ~~**4e.1. The render target.**~~ — **done**, §6. The frame is composed
+       into an app-owned texture and the drawable is a blit of it, which is
+       what a pass that reads what an earlier one wrote needs — PureDOOM's
+       `captureTarget`, §3. Same counters, same picture at 0.3 of 255, one
+       multisampling given up (gap 20).
+     - **4e.2. `ReadPixels`** ← **next**, and it needs eacp to grow a texture
+       readback (gap 21). It is worth doing first because of what it turns
+       into: the eacp build's frames become hashable, so the gate stops being
+       the GL build's alone and every comparison after it is exact rather than
+       within 0.3 of 255. The objective camshots and `R_ReadTiledPixels` come
+       with it.
+     - **4e.3. `_currentRender`**, which is 4e.1's blit into an image's
+       texture rather than into the drawable, plus the shared code that
+       currently skips the copy on any backend that is not `BE_ARB2`.
+     - **4e.4. A pass per view**, and so subviews and mirrors: gap 18 said a
+       second pass could not keep the first's colour, and a texture target
+       stores rather than resolving, so `clear = false` now means what it says.
+     - **4e.5. The rest.** Fog and blend lights, the texgen variants (reflect,
+       skybox, wobblesky — two of the three want cube maps, gap 5), and
+       `r_gammaInShader` (step 4d.2 — the identity at the default settings, and
+       nothing at any other).
 5. **Delete** `glimp.cpp`, `events.cpp`, `threads.cpp`, `neo/sys/linux/`, SDL,
    and fold `dhewm3-eacp` back into `dhewm3`.
 

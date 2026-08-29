@@ -260,10 +260,17 @@ private:
 		float				alphaTestRef;
 	};
 
+	// The texture the frame is composed into, made on the first pass and
+	// remade when the engine's idea of the screen size changes.
+	bool			EnsureFrameTarget( void );
+
 	// The pass every draw goes into. One per frame so far - see DrawView on why
 	// a view does not get its own yet.
 	void			BeginPass( bool clearColor );
 	void			EndPass( void );
+
+	// And the pass that puts the finished one on the screen.
+	void			PresentFrameTarget( void );
 
 	// RB_BeginDrawingView: where on the target this view lands, what part of it
 	// may be written, and the state the view starts from.
@@ -323,11 +330,27 @@ private:
 
 	// The texture an idImage carries, created on the first upload and
 	// destroyed by FreeImage. Held by pointer in idImage::backendTexture,
-	// because GPU::Texture has no empty state to default-construct.
+	// because GPU::Texture has no empty state to default-construct - and by a
+	// void * one, because that field is in a header both backends compile.
+	// ReplaceTexture is where that raw field is owned on both sides of the
+	// swap; nothing else touches it.
 	static GPU::Texture *	TextureFor( const idImage *image );
-	static void				ReplaceTexture( idImage *image, GPU::Texture *texture );
+	static void				ReplaceTexture( idImage *image,
+											OwningPointer<GPU::Texture> texture );
 
-	GPU::RenderPass *	pass;
+	// The pass, and it is a pointer because a RenderPass cannot be anything
+	// else: it has no default state and no move, so the only way to hold one
+	// past the expression that opened it is to build it where it will live.
+	// Owning, so that ending the pass is dropping it rather than remembering to
+	// delete it.
+	OwningPointer<GPU::RenderPass>	pass;
+
+	// Where the frame is drawn, which is no longer the thing that is presented.
+	// A pointer for the same reason: GPU::Texture owns native objects and has
+	// no empty state to default-construct.
+	OwningPointer<GPU::Texture>		frameTarget;
+	int								frameTargetWidth;
+	int								frameTargetHeight;
 
 	// The image on each texture unit, which is what a draw binds. The GL
 	// backend has no equivalent because GL remembers this itself.
@@ -408,7 +431,8 @@ static void R_EacpDrawInteraction( const drawInteraction_t *din ) {
 }
 
 idRenderBackendEacp::idRenderBackendEacp() {
-	pass = NULL;
+	frameTargetWidth = 0;
+	frameTargetHeight = 0;
 	memset( boundImages, 0, sizeof( boundImages ) );
 	drawProgram = NULL;
 	drawPipeline = NULL;
@@ -547,12 +571,73 @@ void idRenderBackendEacp::Shutdown( void ) {
 	EndPass();
 	memset( boundImages, 0, sizeof( boundImages ) );
 
+	// While there is still a device to hand it back to - this backend is a
+	// static, and its destructor runs long after the device has gone.
+	frameTarget.reset();
+	frameTargetWidth = 0;
+	frameTargetHeight = 0;
+
 	// What the content actually cost, rather than what plan.md section 4.3
 	// sized it at: two numbers, at the one moment the whole run is known.
 	common->Printf( "eacp: %i programs and %i pipelines compiled\n",
 					eacpRenderProgs.NumPrograms(), eacpRenderProgs.NumPipelines() );
 
 	eacpRenderProgs.Shutdown();
+}
+
+/*
+======================
+idRenderBackendEacp::EnsureFrameTarget
+
+The texture the frame is composed into, which since step 4e is where the
+renderer draws rather than the drawable.
+
+**The size is the engine's, not the window's.** glConfig.vidWidth is what every
+viewport, scissor and screen-space coordinate in the renderer is measured
+against, so a target of any other size would put the picture somewhere the
+renderer does not think it is. The blit then maps that rectangle onto whatever
+the drawable happens to be, which is also what makes a window resize scale the
+frame rather than corrupt it - GLimp_SetScreenParms refuses to resize (gap 8),
+so the two really can differ.
+
+BGRA8Unorm because that is the drawable's format and the pipelines are compiled
+against one number for both; stencil because the shadow pass needs the plane,
+and asking for it brings the depth buffer the world needs with it.
+======================
+*/
+bool idRenderBackendEacp::EnsureFrameTarget( void ) {
+	if ( glConfig.vidWidth < 1 || glConfig.vidHeight < 1 ) {
+		return false;
+	}
+
+	if ( frameTarget && frameTargetWidth == glConfig.vidWidth
+		 && frameTargetHeight == glConfig.vidHeight ) {
+		return true;
+	}
+
+	frameTarget.reset();
+
+	GPU::TextureDescriptor	descriptor;
+
+	descriptor.width = glConfig.vidWidth;
+	descriptor.height = glConfig.vidHeight;
+	descriptor.format = GPU::TextureFormat::BGRA8Unorm;
+	descriptor.renderTarget = true;
+	descriptor.stencil = true;
+
+	frameTarget.create( GPU::Device::shared(), descriptor, (const void *)NULL );
+
+	if ( !frameTarget->isValid() || !frameTarget->isRenderTarget() ) {
+		common->Warning( "eacp: no %ix%i render target, so nothing can be drawn",
+						 glConfig.vidWidth, glConfig.vidHeight );
+		frameTarget.reset();
+		return false;
+	}
+
+	frameTargetWidth = glConfig.vidWidth;
+	frameTargetHeight = glConfig.vidHeight;
+
+	return true;
 }
 
 /*
@@ -564,6 +649,11 @@ depth and stencil unconditionally as it opens and can be told whether to clear
 colour, which is exactly what RB_BeginDrawingView asks for - the depth buffer
 and the stencil buffer emptied for this view, the colour left where the views
 before it put it.
+
+Into the render target rather than the drawable, which is step 4e's whole
+change and is what a second pass on one frame needs: a texture target is stored
+and can be loaded back, where a multisampled drawable resolves and keeps nothing
+(§5, gap 18).
 ======================
 */
 void idRenderBackendEacp::BeginPass( bool clearColor ) {
@@ -572,6 +662,10 @@ void idRenderBackendEacp::BeginPass( bool clearColor ) {
 	}
 
 	if ( !eacpFrame ) {
+		return;
+	}
+
+	if ( !EnsureFrameTarget() ) {
 		return;
 	}
 
@@ -584,7 +678,10 @@ void idRenderBackendEacp::BeginPass( bool clearColor ) {
 	// unsigned, so the algorithm starts half way up its range.
 	descriptor.clearStencil = (unsigned char)( 1 << ( glConfig.stencilBits - 1 ) );
 
-	pass = new GPU::RenderPass( eacpFrame->beginPass( descriptor ) );
+	// Built where it will live rather than moved into place, which is the one
+	// thing a RenderPass allows: beginPass returns a prvalue, so this
+	// constructs it in the allocation and never copies or moves it.
+	pass.reset( new GPU::RenderPass( eacpFrame->beginPass( *frameTarget, descriptor ) ) );
 
 	// The one value every stencil comparison in the frame is against, and the
 	// one StencilOp::Replace writes - which is why it can be said once here
@@ -601,8 +698,67 @@ void idRenderBackendEacp::EndPass( void ) {
 	}
 
 	pass->end();
-	delete pass;
-	pass = NULL;
+	pass.reset();
+}
+
+/*
+======================
+idRenderBackendEacp::PresentFrameTarget
+
+The frame onto the screen: a second pass on the same frame, over the drawable,
+drawing the target the first one composed into.
+
+**It is a pass on the same frame rather than a frame of its own**, which is what
+makes it legal to sample here what was written there: passes on one frame are
+ordered by the queue, so neither backend needs a fence to say the target is
+finished. What is *not* legal is sampling a texture from the pass rendering into
+it, which is why this cannot be folded into the pass above and why EndPass has
+to have run before it.
+
+The quad is written with the target's row 0 at the top of the screen: clip space
+has y up and a texture's rows start at the top, so the corner at y = +1 is the
+one that samples t = 0.
+======================
+*/
+void idRenderBackendEacp::PresentFrameTarget( void ) {
+	if ( !eacpFrame || !frameTarget ) {
+		return;
+	}
+
+	idEacpRenderProgs::blitDraw_t	draw = eacpRenderProgs.BlitDraw();
+
+	if ( !draw.pipeline ) {
+		return;
+	}
+
+	static const eacpBlitVert_t	quad[6] = {
+		{ { -1.0f,  1.0f }, { 0.0f, 0.0f } },
+		{ { -1.0f, -1.0f }, { 0.0f, 1.0f } },
+		{ {  1.0f, -1.0f }, { 1.0f, 1.0f } },
+		{ { -1.0f,  1.0f }, { 0.0f, 0.0f } },
+		{ {  1.0f, -1.0f }, { 1.0f, 1.0f } },
+		{ {  1.0f,  1.0f }, { 1.0f, 0.0f } },
+	};
+
+	draw.program->image = *frameTarget;
+
+	const GPU::Buffer &	vertices = eacpRenderProgs.StreamVertices( quad, sizeof( quad ) );
+
+	GPU::RenderPassDescriptor	descriptor;
+
+	// Black behind it, which is what shows if the drawable and the target are
+	// ever different shapes.
+	descriptor.clear = true;
+
+	GPU::RenderPass	screen = eacpFrame->beginPass( descriptor );
+
+	screen.setPipeline( *draw.pipeline );
+	screen.setVertexBuffer( vertices );
+
+	draw.program->bindTextures( screen );
+
+	screen.draw( 6 );
+	screen.end();
 }
 
 /*
@@ -625,9 +781,9 @@ void idRenderBackendEacp::SetDefaultState( void ) {
 ======================
 idRenderBackendEacp::SetDrawBuffer
 
-Where the frame goes. There is one place it can go - the drawable the view
-handed us - so what is left of this is the debug clear, which several of the
-r_show* tools rely on to blank the parts of the screen they do not draw.
+Where the frame goes. There is one place it can go - the render target the frame
+is composed into - so what is left of this is the debug clear, which several of
+the r_show* tools rely on to blank the parts of the screen they do not draw.
 ======================
 */
 void idRenderBackendEacp::SetDrawBuffer( int buffer ) {
@@ -639,13 +795,17 @@ void idRenderBackendEacp::SetDrawBuffer( int buffer ) {
 ======================
 idRenderBackendEacp::SwapBuffers
 
-Not a present. eacp's Frame presents itself when GPUView::render returns, which
-is after common->Frame() has run - so all this has to do is close whatever pass
-is still open, because a pass outliving the frame that made it is undefined.
+Still not a present - eacp's Frame presents itself when GPUView::render returns,
+which is after common->Frame() has run - but since step 4e it is where the frame
+reaches the drawable, because the drawable is not what it was drawn into.
+
+Closing the pass first is not optional: a pass outliving the frame that made it
+is undefined, and the one below samples what this one wrote.
 ======================
 */
 void idRenderBackendEacp::SwapBuffers( void ) {
 	EndPass();
+	PresentFrameTarget();
 }
 
 /*
@@ -2181,9 +2341,27 @@ GPU::Texture *idRenderBackendEacp::TextureFor( const idImage *image ) {
 	return (GPU::Texture *)image->backendTexture;
 }
 
-void idRenderBackendEacp::ReplaceTexture( idImage *image, GPU::Texture *texture ) {
-	delete (GPU::Texture *)image->backendTexture;
-	image->backendTexture = texture;
+/*
+====================
+idRenderBackendEacp::ReplaceTexture
+
+The one place an image's texture changes hands, and the only place ownership has
+to be carried by hand rather than by a type.
+
+idImage::backendTexture is a void * in a header both backends compile, which is
+what keeps eacp's types out of Doom 3's headers - so what an idImage holds
+cannot itself be an owning pointer. What it can be is owned on both sides of
+this function: the incoming one arrives owned and is released into the field,
+and the outgoing one is adopted by a local that frees it as it goes out of
+scope. Neither end of the swap names a delete, and there is no window in which
+one of them is owned twice.
+====================
+*/
+void idRenderBackendEacp::ReplaceTexture( idImage *image,
+										  OwningPointer<GPU::Texture> texture ) {
+	const OwningPointer<GPU::Texture>	previous( (GPU::Texture *)image->backendTexture );
+
+	image->backendTexture = texture.release();
 }
 
 /*
@@ -2279,7 +2457,8 @@ void idRenderBackendEacp::UploadImageLevel( idImage *image, int face, int level,
 	// so a chain built for them is a third more upload and memory for nothing.
 	descriptor.mipmapped = ( image->filter == TF_DEFAULT );
 
-	ReplaceTexture( image, new GPU::Texture( GPU::Device::shared(), descriptor, swizzled ) );
+	ReplaceTexture( image, makeOwned<GPU::Texture>( GPU::Device::shared(), descriptor,
+													swizzled ) );
 
 	R_StaticFree( swizzled );
 }
@@ -2341,7 +2520,8 @@ void idRenderBackendEacp::UploadScratchImage( idImage *image, const byte *data, 
 		descriptor.height = rows;
 		descriptor.format = GPU::TextureFormat::RGBA8Unorm;
 
-		ReplaceTexture( image, new GPU::Texture( GPU::Device::shared(), descriptor, data ) );
+		ReplaceTexture( image, makeOwned<GPU::Texture>( GPU::Device::shared(), descriptor,
+														data ) );
 	}
 
 	image->uploadWidth = cols;

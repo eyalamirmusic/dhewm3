@@ -347,6 +347,37 @@ void idEacpShadowProgram::define( void ) {
 /*
 ================================================================================
 
+	idEacpBlitProgram
+
+================================================================================
+*/
+
+idEacpBlitProgram::idEacpBlitProgram() {
+	// Linear rather than nearest, and it costs nothing at the size the frame is
+	// normally drawn: the quad covers the drawable exactly, so every fragment
+	// centre lands on a texel centre and the filter has nothing to interpolate.
+	// What it buys is the case where the two disagree - a window resized under
+	// a render target sized to glConfig - where nearest would alias hard.
+	image.sampling.filter = GPU::TextureFilter::Linear;
+	image.sampling.addressMode = GPU::TextureAddressMode::Clamp;
+
+	compile();
+}
+
+void idEacpBlitProgram::define( void ) {
+	auto	position = vertexInput( &eacpBlitVert_t::xy );
+	auto	texcoord = vertexInput( &eacpBlitVert_t::st );
+
+	// Already clip space, so there is no matrix. z is zero and w is one, which
+	// is inside the frustum on both APIs - the pipeline tests no depth anyway.
+	setPosition( GPU::float4( position, 0.0f, 1.0f ) );
+
+	setFragment( GPU::sample( image, varying( texcoord ) ) );
+}
+
+/*
+================================================================================
+
 	State, translated.
 
 	The GLS_* bitfield is the one piece of Doom 3's backend that was already
@@ -583,20 +614,33 @@ idEacpRenderProgs::idEacpRenderProgs()
 }
 
 idEacpRenderProgs::~idEacpRenderProgs() {
-	// Not Shutdown(): this runs from a static destructor, after the device has
-	// gone, and releasing a pipeline then is worse than leaking one. The
-	// backend's Shutdown is what empties this while there is still a device to
-	// release it to.
+	// Nothing, and Shutdown below is what makes that safe rather than lucky.
+	//
+	// This object is a static, so this runs at exit, after the device has gone -
+	// and handing a pipeline back to a device that is not there is worse than
+	// leaking one. Every member holds what it owns, so what keeps that from
+	// happening is not the absence of a destructor here: it is that Shutdown has
+	// already emptied them while there was still a device to release them to,
+	// and an empty container has nothing left to free.
 }
 
+/*
+====================
+idEacpRenderProgs::Shutdown
+
+Everything the device owns, released in the one window where releasing it is
+safe: the backend's Shutdown, which runs before GLimp takes the window away.
+
+Emptying rather than deleting. Each container owns its contents - a
+statePipeline_t holds an OwningPointer and the interaction variants are an
+OwnedVector - so clearing one *is* the release, and there is no order to get
+wrong.
+====================
+*/
 void idEacpRenderProgs::Shutdown( void ) {
 	for ( int i = 0 ; i < GPU::samplingConfigurations ; i++ ) {
 		for ( int test = 0 ; test < 2 ; test++ ) {
 			programVariant_t &	variant = variants[i][test];
-
-			for ( int j = 0 ; j < variant.pipelines.size() ; j++ ) {
-				delete variant.pipelines[j].pipeline;
-			}
 
 			variant.pipelines.clear();
 			variant.library.reset();
@@ -604,25 +648,15 @@ void idEacpRenderProgs::Shutdown( void ) {
 		}
 	}
 
-	for ( int i = 0 ; i < interactions.size() ; i++ ) {
-		interactionVariant_t *	variant = interactions[i];
-
-		for ( int j = 0 ; j < variant->pipelines.size() ; j++ ) {
-			delete variant->pipelines[j].pipeline;
-		}
-
-		delete variant;
-	}
-
 	interactions.clear();
-
-	for ( int i = 0 ; i < shadowPipelines.size() ; i++ ) {
-		delete shadowPipelines[i].pipeline;
-	}
 
 	shadowPipelines.clear();
 	shadowLibrary.reset();
 	shadowProgram.reset();
+
+	blitPipeline.reset();
+	blitLibrary.reset();
+	blitProgram.reset();
 }
 
 int idEacpRenderProgs::NumPrograms( void ) const {
@@ -646,6 +680,10 @@ int idEacpRenderProgs::NumPrograms( void ) const {
 		total++;
 	}
 
+	if ( blitProgram.has_value() ) {
+		total++;
+	}
+
 	return total;
 }
 
@@ -663,6 +701,10 @@ int idEacpRenderProgs::NumPipelines( void ) const {
 	}
 
 	total += shadowPipelines.size();
+
+	if ( blitPipeline ) {
+		total++;
+	}
 
 	return total;
 }
@@ -682,14 +724,15 @@ runs, the vertices it reads and what it does to the stencil - are the arguments,
 because they are the only part that differs between the callers.
 ====================
 */
-GPU::RenderPipeline *idEacpRenderProgs::BuildPipeline( const GPU::ShaderLibrary &library,
-													   const GPU::VertexLayout &layout,
-													   int stateBits, int cullType,
-													   eacpStencil_t stencil ) {
+eacp::OwningPointer<GPU::RenderPipeline>
+idEacpRenderProgs::BuildPipeline( const GPU::ShaderLibrary &library,
+								  const GPU::VertexLayout &layout,
+								  int stateBits, int cullType,
+								  eacpStencil_t stencil ) {
 	eacp::GPU::GPUView *	view = R_EacpGetView();
 
 	if ( !view ) {
-		return NULL;
+		return {};
 	}
 
 	GPU::RenderPipelineDescriptor	descriptor;
@@ -698,10 +741,14 @@ GPU::RenderPipeline *idEacpRenderProgs::BuildPipeline( const GPU::ShaderLibrary 
 	descriptor.vertexLayout = layout;
 	descriptor.topology = GPU::PrimitiveTopology::Triangles;
 
-	// The drawable's, and the view's own multisampling. Both backends reject a
-	// draw whose pipeline disagrees with the pass it is issued into.
+	// The render target's, which is the same colour format the drawable has -
+	// deliberately, so that these pipelines could draw into either - and
+	// single-sampled, because a texture target on eacp has nothing to resolve
+	// into and no multisampling to offer. Both backends reject a draw whose
+	// pipeline disagrees with the pass it is issued into, so this is not a
+	// preference.
 	descriptor.colorFormat = GPU::PixelFormat::BGRA8Unorm;
-	descriptor.sampleCount = view->sampleCount();
+	descriptor.sampleCount = 1;
 
 	descriptor.blend = R_EacpBlendState( stateBits );
 	descriptor.colorWriteMask = R_EacpColorWriteMask( stateBits );
@@ -720,13 +767,13 @@ GPU::RenderPipeline *idEacpRenderProgs::BuildPipeline( const GPU::ShaderLibrary 
 
 	descriptor.cullMode = R_EacpCullMode( cullType );
 
-	GPU::RenderPipeline *	pipeline = new GPU::RenderPipeline( GPU::Device::shared(), descriptor );
+	eacp::OwningPointer<GPU::RenderPipeline>	pipeline =
+		eacp::makeOwned<GPU::RenderPipeline>( GPU::Device::shared(), descriptor );
 
 	if ( !pipeline->isValid() ) {
 		common->Warning( "eacp: no pipeline for state 0x%x, cull %i, stencil %i",
 						 stateBits, cullType, stencil );
-		delete pipeline;
-		return NULL;
+		return {};
 	}
 
 	return pipeline;
@@ -774,9 +821,10 @@ idEacpRenderProgs::PipelineFor( eacp::Vector<statePipeline_t> &pipelines,
 	entry.stencil = stencil;
 	entry.pipeline = BuildPipeline( library, layout, pipelineBits, cullType, stencil );
 
-	pipelines.add( entry );
-
-	return entry.pipeline;
+	// Moved in, not copied: the pipeline has one owner and this is it changing
+	// hands. Reading the answer back out of the list afterwards rather than off
+	// `entry`, which no longer holds anything.
+	return pipelines.add( std::move( entry ) ).pipeline;
 }
 
 /*
@@ -878,12 +926,14 @@ idEacpRenderProgs::InteractionDraw( const idImage *bump, const idImage *falloff,
 	}
 
 	if ( !variant ) {
-		variant = new interactionVariant_t;
+		// Made by the list rather than handed to it, which is what an
+		// OwnedVector offers instead of a new: the element is constructed in
+		// place and owned from the moment it exists.
+		variant = &interactions.createNew();
+
 		variant->key = key;
 		variant->program.emplace( sampling );
 		variant->library.emplace( GPU::Device::shared(), variant->program->source() );
-
-		interactions.add( variant );
 
 		if ( !variant->library->isValid() ) {
 			common->Warning( "eacp: the interaction shader failed to compile" );
@@ -946,6 +996,82 @@ idEacpRenderProgs::shadowDraw_t idEacpRenderProgs::ShadowDraw( int stateBits, in
 	draw.pipeline = PipelineFor( shadowPipelines, *shadowLibrary,
 								 shadowProgram->vertexLayout(),
 								 stateBits, cullType, stencil );
+
+	return draw;
+}
+
+/*
+====================
+idEacpRenderProgs::BlitDraw
+
+The frame onto the screen, and the one pipeline here that PipelineFor does not
+build.
+
+Everything else draws into the render target, which is single-sampled and
+carries a depth-stencil buffer; this draws into the *drawable*, which is
+whatever GPUView was configured with. The two have to be described differently
+or the backend rejects the draw - so this builds its descriptor by hand rather
+than pretending the difference away with an argument to the shared one.
+
+There is no state to key it on. It is one quad, opaque, with no test of any
+kind, drawn once a frame.
+====================
+*/
+idEacpRenderProgs::blitDraw_t idEacpRenderProgs::BlitDraw( void ) {
+	blitDraw_t	draw;
+
+	draw.program = NULL;
+	draw.pipeline = NULL;
+
+	eacp::GPU::GPUView *	view = R_EacpGetView();
+
+	if ( !view ) {
+		return draw;
+	}
+
+	if ( !blitProgram.has_value() ) {
+		blitProgram.emplace();
+		blitLibrary.emplace( GPU::Device::shared(), blitProgram->source() );
+
+		if ( !blitLibrary->isValid() ) {
+			common->Warning( "eacp: the blit shader failed to compile, so the frame "
+							 "will not reach the screen" );
+			blitProgram.reset();
+			return draw;
+		}
+	}
+
+	draw.program = &*blitProgram;
+
+	if ( !blitPipeline ) {
+		GPU::RenderPipelineDescriptor	descriptor;
+
+		descriptor.library = &*blitLibrary;
+		descriptor.vertexLayout = blitProgram->vertexLayout();
+		descriptor.topology = GPU::PrimitiveTopology::Triangles;
+
+		descriptor.colorFormat = GPU::PixelFormat::BGRA8Unorm;
+		descriptor.sampleCount = view->sampleCount();
+
+		// The drawable's own attachments, which the view asked for and every
+		// pipeline drawing into it has to name - even this one, which tests
+		// neither. Always with no write is the test not happening.
+		descriptor.depth = true;
+		descriptor.depthCompare = GPU::CompareFunction::Always;
+		descriptor.depthWrite = false;
+		descriptor.stencil = view->hasStencil();
+
+		blitPipeline.create( GPU::Device::shared(), descriptor );
+
+		if ( !blitPipeline->isValid() ) {
+			common->Warning( "eacp: no pipeline for the blit, so the frame will not "
+							 "reach the screen" );
+			blitPipeline.reset();
+			return draw;
+		}
+	}
+
+	draw.pipeline = blitPipeline;
 
 	return draw;
 }
