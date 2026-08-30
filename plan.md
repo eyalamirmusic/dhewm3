@@ -139,7 +139,9 @@ Two patterns worth stealing beyond the code:
 - **`captureTarget`** — PureDOOM keeps the whole composited frame in an app-owned
   render target rather than copying back from the drawable. That is the answer for
   Doom 3's `_currentRender` (heat haze, mirrors), so no drawable→texture blit is
-  needed from eacp.
+  needed from eacp. **Taken, in step 4e.1**, and it brought two things this entry
+  did not predict: the multisampling has to go (gap 20), and the same shape is
+  what a *pass per view* needs, not only what `_currentRender` does.
 - **Demo replay as the safety net.** PureDOOM's regression gate is deterministic
   demo playback. dhewm3 has the same facility built in: `recordDemo` / `playDemo` /
   `timeDemo` (`neo/framework/Session.cpp:643`, `:681`, `:692`).
@@ -1240,6 +1242,13 @@ and 5.
   frame is therefore right for one 3D view and wrong for two, which is a subview
   or a mirror, and `BeginDrawingView` warns once when it sees one.
 
+  **The reason expired with step 4e.1 and the code has not caught up yet.** The
+  frame is composed into a texture now, and a texture target is single-sampled
+  and stored, so a second pass over it with `clear = false` loads what the first
+  one wrote. What kept this at one pass a frame is gone; what is left is the
+  work of splitting it, which is 4e.4. The warning is still there and still
+  honest until then.
+
 - **`RB_STD_LightScale` can never do anything on this backend and is not
   ported.** It is the full-screen multiply that crutches up a backend whose
   blending range is eight bits, and it returns immediately unless
@@ -1341,6 +1350,14 @@ build's own screen grab at (33.7, 39.0, 34.7) that leaves about 5%, over two
 runs that are not on the same animation frame and one of which is at 4× MSAA.
 Which is to say: the tone comparison says nothing yet, and knowing *why* it says
 nothing is the useful part. The counters are the instrument until 4e.
+
+**Step 4d.3 found what was missing and it was neither path's fault.** Compare
+two *screen* grabs rather than a screen grab against a framebuffer read, at a
+camera where the world holds still, and the two builds land 0.3 of 255 apart —
+so the instrument was never the capture path, it was that the two runs were
+looking at different animation frames. A framebuffer read is still what a *gate*
+needs, and that is gap 21 rather than 4e's render target: the target landed in
+4e.1 and there is still nothing in eacp that reads a texture back.
 
 The plan's own stated first result for this step landed too: **the Mars globe on
 the main menu**, which is a `renderDef` with a light on it and the one thing on
@@ -1560,6 +1577,10 @@ rather than a program beside it, compiled lazily:
   variants — it reads no texture — and the most pipelines per program, because
   what varies is the stencil rather than the sampler: the count in its two
   forms, the clear, and the mirrored pair of the count.
+- **the blit** — **done**, step 4e.1, and the one entry on this list Doom 3 has
+  no counterpart for. It puts the render target on the drawable, which is a
+  draw here and is nothing at all on OpenGL, where the frame was in the back
+  buffer the moment it was drawn. One texture, no transform, six vertices.
 - generic material stage, in its texgen variants: normal, reflect, skybox, wobblesky
 - fog
 - light blend
@@ -1567,6 +1588,12 @@ rather than a program beside it, compiled lazily:
 
 The EDSL earns its keep here: one source per shader covering Metal and D3D12, against
 Doom 3's original two hand-written ARB programs per path.
+
+**Four of them exist and the list was the right shape.** What the count missed
+is at both ends: a program the API needs and the engine does not (the blit), and
+a program the engine needs and the API makes unnecessary (the depth fill, which
+turned out to be a variant rather than an entry). The sampling-variant sizing was
+the part that was wrong, and §4.3 says where.
 
 ---
 
