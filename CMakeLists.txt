@@ -18,7 +18,7 @@ list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/CMake")
 # The platform layer this port is moving onto. Off by default until it can run
 # the game; see plan.md. macOS only for now - the Windows host layer is named
 # there and not written.
-option(EACP "Build the eacp host alongside the SDL/GL executable (macOS only)" OFF)
+option(EACP "Build the eacp host alongside the SDL/GL executable	 (macOS only)" ON)
 
 include(Eacp)
 
