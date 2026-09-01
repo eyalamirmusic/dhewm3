@@ -238,7 +238,8 @@ public:
 	virtual void	CopyDepthbufferToImage( idImage *image, int x, int y,
 											int imageWidth, int imageHeight,
 											bool useOversizedBuffer );
-	virtual bool	ReadPixels( int x, int y, int width, int height, byte *rgb );
+	virtual bool	ReadPixels( int x, int y, int width, int height, byte *rgb,
+								bool presented );
 
 private:
 	// Everything one draw needs that is not the geometry: a material stage's
@@ -926,9 +927,24 @@ would be.
 */
 void idRenderBackendEacp::DrawView( void ) {
 	if ( !pass ) {
-		// No frame is open, so this draw came from outside GPUView::render - a
-		// level load's own screen update, or a console command. Nothing to draw
-		// into, and saying so is better than a pass that presents nothing.
+		// A view with no pass open, which is not the same thing as a view with
+		// nowhere to go. The frame's own pass is opened by SetDrawBuffer, and
+		// the engine draws a view before that has run: idObjective::Event_CamShot
+		// renders its camera into a crop from the *game's* think, several
+		// commands before the frame that shows it begins.
+		//
+		// So a pass is opened here, and without the colour clear, because what
+		// this view is being added to is whatever the last frame composed - the
+		// same thing OpenGL's back buffer holds at this moment, and for the same
+		// reason. Found by the camshot coming back black.
+		BeginPass( false );
+	}
+
+	if ( !pass ) {
+		// And this is the case the check above used to be: no frame at all, so
+		// the draw came from outside GPUView::render - a level load's own screen
+		// update, or a console command. Nothing to draw into, and saying so is
+		// better than a pass that presents nothing.
 		return;
 	}
 
@@ -2590,22 +2606,76 @@ void idRenderBackendEacp::CopyDepthbufferToImage( idImage *image, int x, int y,
 ====================
 idRenderBackendEacp::ReadPixels
 
-The same missing thing CopyFramebufferToImage is missing, one step further on:
-there is no back buffer to read, only a drawable that has already been handed
-back to the compositor by the time anyone asks. It needs the app-owned render
-target of step 4e, and until then the honest answer is no.
+The frame back on the CPU, which on this backend is the render target step 4e.1
+composes into read through eacp's Texture::read. There is no back buffer to ask
+for and never was: what OpenGL keeps in one, this keeps in a texture it owns,
+which is why 4e.1 had to land before this could.
 
-Which is not a cosmetic gap and was found by a crash rather than by reading:
-the game itself calls this, without being asked and at map load, to take the
-camera shot its objective screen shows - idObjective::Event_CamShot.
+`presented` is OpenGL's question and has no answer here. The target is not
+swapped or discarded when the drawable is drawn from it, so the frame that is on
+the screen and the frame that has been composed are the same pixels in the same
+texture - which is what the seam says the distinction is worth on a backend that
+composes into its own target.
+
+**The two calls before the copy are not optional and are not the same thing.**
+Ending the pass is because a texture cannot be read while it is the thing being
+rendered into. Flushing the frame is because a frame's commands do not reach the
+GPU until it ends, so without it the copy would return the frame before this one
+- and the game asks for this from inside the frame it wants, every time.
+
+What comes out is OpenGL's layout rather than the texture's, because that is
+what the callers unpack: rows from the bottom up, three bytes a pixel, each row
+padded to four.
 ====================
 */
-bool idRenderBackendEacp::ReadPixels( int x, int y, int width, int height, byte *rgb ) {
-	if ( !warnedReadPixels ) {
-		warnedReadPixels = true;
-		common->Warning( "eacp: reading the frame back is not implemented yet, so the "
-						 "objective camera shots will be missing" );
+bool idRenderBackendEacp::ReadPixels( int x, int y, int width, int height, byte *rgb,
+									  bool presented ) {
+	if ( rgb == NULL || width < 1 || height < 1 ) {
+		return false;
 	}
 
-	return false;
+	if ( !eacpFrame || !frameTarget ) {
+		// Outside a frame, which is where a console command or a level load's
+		// own screen update runs. There is nothing composed to read.
+		if ( !warnedReadPixels ) {
+			warnedReadPixels = true;
+			common->Warning( "eacp: the frame can only be read back from inside one" );
+		}
+
+		return false;
+	}
+
+	// Doom 3 measures from the bottom left of the frame; a texture's rows start
+	// at the top.
+	const int	top = frameTargetHeight - ( y + height );
+
+	if ( x < 0 || top < 0 || x + width > frameTargetWidth
+		 || y + height > frameTargetHeight ) {
+		return false;
+	}
+
+	EndPass();
+	eacpFrame->flush();
+
+	byte *	bgra = (byte *)R_StaticAlloc( width * height * 4 );
+
+	frameTarget->read( Graphics::Rect( (float)x, (float)top,
+									   (float)width, (float)height ), bgra );
+
+	const int	row = ( width * 3 + 3 ) & ~3;
+
+	for ( int r = 0 ; r < height ; r++ ) {
+		const byte *	src = bgra + ( height - 1 - r ) * width * 4;
+		byte *			dst = rgb + r * row;
+
+		for ( int c = 0 ; c < width ; c++ ) {
+			dst[ c * 3 + 0 ] = src[ c * 4 + 2 ];
+			dst[ c * 3 + 1 ] = src[ c * 4 + 1 ];
+			dst[ c * 3 + 2 ] = src[ c * 4 + 0 ];
+		}
+	}
+
+	R_StaticFree( bgra );
+
+	return true;
 }

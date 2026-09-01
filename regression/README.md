@@ -27,6 +27,34 @@ differs on every one of them. A gate that cannot fail is not a gate.
 
 A capture takes about twenty seconds and writes 297 frames at 320x240.
 
+## The eacp build too, since step 4e.2
+
+`GAME` picks the binary, because a build tree holds both of them:
+
+```sh
+GAME=dhewm3-eacp BUILD=$PWD/cmake-build-eacp \
+	caffeinate -du ./regression/gate.sh capture eacp-after
+```
+
+Two things are different about that run and neither is optional.
+
+**Hold the display awake.** The eacp build's frame is driven by the display
+link, which stops when the panel sleeps (plan.md §5, gap 13) - and a capture
+that stops half way looks like a hang. `caffeinate -du` is the whole fix.
+
+**Compare each build against itself.** `dhewm3` and `dhewm3-eacp` are two
+renderers, so their hashes have nothing to say to each other - the same reason
+the hashes are only comparable within one machine and GPU. What the gate answers
+for either build is "did this change move anything", which is the question it
+was built for.
+
+The eacp build was checked in both directions the same way the GL one was, and
+the numbers are the same: 297 identical across two captures, 297 moved with
+`r_skipSpecular 1`. Both builds write the same 320x240 frames of the same tour -
+`BeginFrame` renders a tiled screenshot at `com_aviDemoWidth`, so the window's
+size does not reach these - and **none of the 297 pairs hash the same**, which
+is what two renderers agreeing to the eye and not to the bit looks like.
+
 ## Both paths have to be pinned, not just fs_savepath
 
 dhewm3 keeps `dhewm.cfg` on `fs_configpath`, which is separate from

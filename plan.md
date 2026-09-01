@@ -11,11 +11,13 @@ menu on screen through Metal**, **loads a level**, **lights it** and
 `interaction.vfp` and `shadow.vp` are in the EDSL, the stencil shadow volumes
 are counted two-sided in one pass over each volume, and at a pinned camera in
 `demo_mars_city1` the two backends draw **the same 71 draws, 1644 triangles and
-2376 shadow triangles**, volume for volume. 4e has started: the frame is
-composed into an app-owned **render target** and the drawable is a blit of it,
-which is what `_currentRender`, a pass per view, and a readback the gate could
-hash all need. What is left in 4e is those, plus fog, blend lights and the
-texgen variants.**
+2376 shadow triangles**, volume for volume. 4e is two steps in: the frame is
+composed into an app-owned **render target**, and that target is now **read back
+to the CPU** — so the eacp build takes the game's own camera shots, writes
+screenshots, and **runs the regression gate**, 297 frames hashed and identical
+across two captures. Every comparison from here is a hash rather than a screen
+grab. What is left in 4e is `_currentRender`, a pass per view, fog, blend lights
+and the texgen variants.**
 
 Reference implementation for almost everything on the platform side:
 `~/Code/PureDOOM/examples/EACP` — a complete engine hosted on eacp, with its own
@@ -315,8 +317,9 @@ eacp. 12 and 17 stopped the next step rather than degrading it, and both are
 closed, in §6 under step 4b′. 19 does not stop anything today, because it is
 D3D12's alone and the eacp host is macOS-only for other reasons; it stops
 Windows. 20 is a price already paid, in multisampling, for what step 4e.1
-bought. 21 is the one that stops something worth having: without a texture
-readback there is no frame-exact gate for this backend.
+bought. **21 is closed too**, in §6 under step 4e.2, and it is the one that was
+stopping something worth having: eacp grew `Texture::read` and `Frame::flush`,
+and this build's frames are hashes now rather than screen grabs.
 
 Numbers are never reused, so a hole is an entry that closed.
 
@@ -467,19 +470,25 @@ Numbers are never reused, so a hole is an entry that closed.
     MSAA texture beside the target, resolved into it, is what the drawable path
     already does.
 
-21. **A texture cannot be read back to the CPU.** `Buffer::read` exists and
-    `Texture` has nothing like it: `update()` uploads, and the only readback in
-    eacp is `GPUView::renderNativeContent`, which renders a *new* frame
-    offscreen for a `View` snapshot. That is no use to an engine, whose `render`
-    is a whole simulation tick.
+21. ~~**A texture cannot be read back to the CPU.**~~ — **closed**, and the
+    entry is kept because what closing it turned out to need is worth knowing.
+    `Buffer::read` existed and `Texture` had nothing like it; the only readback
+    in eacp was `GPUView::renderNativeContent`, which renders a *new* frame
+    offscreen for a `View` snapshot, and that is no use to an engine whose
+    `render` is a whole simulation tick.
 
-    Found by step 4e.1 arriving at the point where it would be used. What it
-    blocks is `ReadPixels`, and through it the objective camshots the game takes
-    for its own UI, `R_ReadTiledPixels`' screenshots, `aviDemo` - and a
-    frame-exact gate for the eacp build, which is the reason it matters more
-    than the list above suggests. Everything this port has measured against the
-    GL build so far has been a screen grab agreeing to 0.3 of 255; this is what
-    would make it a hash.
+    Found by step 4e.1 arriving at the point where it would be used, and closed
+    by step 4e.2 — in two calls rather than one, which is the finding.
+    `Texture::read` is the obvious half: the blit into a shared buffer that
+    `renderNativeContent` was already doing by hand, generalised, with a region
+    and a stride. The half that is not obvious is that **it is not enough on its
+    own**, because a read-back is asked for from *inside* the frame that drew
+    the pixels, and a frame's commands do not reach the GPU until the frame
+    ends. So the read would return the frame before it — silently, and on both
+    backends. `Frame::flush()` is what makes it true: send what has been
+    recorded and carry on recording. The two are separable and each has its own
+    reason to exist, so they are two calls; `Tests/GPU/TextureReadTests.cpp`
+    pins the pair, and fails without the flush.
 
 ### Checked, and *not* gaps
 
@@ -1544,16 +1553,74 @@ owning pointers, with no `delete` in sight.
 
 **What this unblocks, in the order it is worth doing:**
 
-- **`ReadPixels`, and with it a frame-exact gate.** The frame is now in a texture
-  the app owns; what is missing is a way to read one back, which eacp does not
-  have (§5, gap 21). That is the keystone: it turns every comparison in this
-  port from a screen grab at 0.3 of 255 into a hash.
+- ~~**`ReadPixels`, and with it a frame-exact gate.**~~ — **done**, step 4e.2
+  below.
 - **`_currentRender`**, which is this same blit into an image's texture rather
   than into the drawable.
 - **A pass per view.** Gap 18 said a second pass could not keep the first's
   colour because the multisampled drawable resolves and discards it; a texture
   target is stored and loads back, so `clear = false` now means what it says and
   subviews and mirrors stop being blocked by the frame's shape.
+
+#### Step 4e.2 — the frame comes back, and the gate is the eacp build's too — **done**
+
+The keystone 4e.1 was for. `idRenderBackendEacp::ReadPixels` reads the render
+target the frame is composed into, so **`dhewm3-eacp` writes its own frames to
+disk**: the objective camera shots the game takes for its own UI, the
+`screenshot` command, and — the point of the step — `aviDemo`, which is what the
+regression gate is built on. The gate has run on this backend at **297 frames,
+byte-identical across two captures**, and different on all 297 with
+`r_skipSpecular 1`, which is the same both-directions check §6's gate got before
+anyone trusted it.
+
+**It needed two things from eacp, not one, and the second was a surprise.**
+`Texture::read` is what gap 21 asked for and is the blit
+`GPUView::renderNativeContent` was already doing by hand. What that alone gets
+you is *the previous frame*: the read happens inside `common->Frame()`, which
+runs inside `GPUView::render`, and nothing a frame records has reached the GPU
+until the frame ends. So eacp also grew `Frame::flush()` — send what is
+recorded, carry on recording — and `ReadPixels` calls `EndPass` then `flush`
+before it copies. `EndPass` is the other half and is a different reason: a
+texture cannot be read while it is the thing being rendered into.
+
+Both are on eacp `main` at `f6f0034`, with `Tests/GPU/TextureReadTests.cpp`
+beside them — which fails when the flush is taken out, that being the only way
+to know the test is measuring the thing it is named after. The D3D12 half is
+written and unrun: the eacp host is macOS-only (§8), so nothing here has
+executed it.
+
+**The seam grew a `presented` flag, and the flag is OpenGL's alone.** Moving
+`R_ReadTiledPixels` off `qgl` — it still called `qglReadPixels` directly, which
+is why the gate could not see this backend — turned up two callers that want
+different buffers. `CaptureRenderToFile` reads what has been drawn and not
+shown; `R_ReadTiledPixels` reads what a swap has just put on the screen, and
+Doom 3 spells that `glReadBuffer( GL_FRONT )`. On a backend that composes into a
+target it owns there is one picture either way, so eacp ignores the flag and the
+GL backend is where the two branches — Wayland's included — now live. The GL
+build re-ran the gate at **297/297 identical**, which is what makes that a move
+rather than a change.
+
+**And it found a bug in the port that had nothing to do with reading pixels.**
+The first camshot came back black. `DrawView` returned early when no pass was
+open, on the theory that a view arriving then was a draw from outside the frame;
+`idObjective::Event_CamShot` disproves it — it renders its camera from the
+*game's* think, several commands before the frame that will show it opens its
+pass in `SetDrawBuffer`. So a view with no pass now opens one, without the
+colour clear, which is exactly the stale back buffer OpenGL draws that view over.
+The picture matches the GL build's camshot.
+
+**What the port gets for it.** Every measurement after this is a hash. The
+comparisons up to here have been screen grabs agreeing to 0.3 of 255 — good
+enough to say a picture is right, useless for saying a change moved nothing —
+and `regression/gate.sh` now takes `GAME=dhewm3-eacp` and answers that question
+for this backend the way it has answered it for the GL one since Phase 1.
+
+Two things about running it, both in `gate.sh`'s own header now. The display has
+to be held awake (`caffeinate -du`), because the engine is driven by the display
+link and gap 13 stops it with the panel. And the two builds' hashes are not
+comparable with each other — they are two renderers — so each is compared
+against itself, which is the rule `regression/README.md` already states for
+machines and GPUs.
 
 ### Shader inventory for Phase 2
 
@@ -1711,14 +1778,16 @@ Phase 2 is the first work that compiles against eacp. In rough order:
        what a pass that reads what an earlier one wrote needs — PureDOOM's
        `captureTarget`, §3. Same counters, same picture at 0.3 of 255, one
        multisampling given up (gap 20).
-     - **4e.2. `ReadPixels`** ← **next**, and it needs eacp to grow a texture
-       readback (gap 21). It is worth doing first because of what it turns
-       into: the eacp build's frames become hashable, so the gate stops being
-       the GL build's alone and every comparison after it is exact rather than
-       within 0.3 of 255. The objective camshots and `R_ReadTiledPixels` come
-       with it.
-     - **4e.3. `_currentRender`**, which is 4e.1's blit into an image's
-       texture rather than into the drawable, plus the shared code that
+     - ~~**4e.2. `ReadPixels`.**~~ — **done**, §6. eacp grew the texture
+       readback gap 21 asked for *and* a `Frame::flush` beside it, because a
+       read inside the frame that drew the pixels otherwise returns the frame
+       before it. The eacp build's frames are hashes now: the gate runs on it
+       at 297/297 identical across two captures and different on all 297 with
+       `r_skipSpecular 1`. The objective camshots, the `screenshot` command and
+       `R_ReadTiledPixels` came with it — the last of those off `qgl` and onto
+       the seam, which cost the GL build nothing (297/297).
+     - **4e.3. `_currentRender`** ← **next**, which is 4e.1's blit into an
+       image's texture rather than into the drawable, plus the shared code that
        currently skips the copy on any backend that is not `BE_ARB2`.
      - **4e.4. A pass per view**, and so subviews and mirrors: gap 18 said a
        second pass could not keep the first's colour, and a texture target

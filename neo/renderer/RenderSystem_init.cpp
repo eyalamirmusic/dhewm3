@@ -1288,21 +1288,18 @@ void R_ReadTiledPixels( int width, int height, byte *buffer, renderView_t *ref =
 				h = height - yo;
 			}
 
-			if ( glConfig.isWayland ) {
-				// DG: Native Wayland (=> not XWayland) doesn't seem to support reading
-				//     from the front buffer - screenshot is black then..
-				//     So just read from the default (probably back-) buffer
-				qglReadPixels( 0, 0, w, h, GL_RGB, GL_UNSIGNED_BYTE, temp );
-			} else {
-				// DG: It's probably better to restore the glReadBuffer mode after reading the pixels..
-				//     (at least with XWayland on GNOME changing resolutions is wonky when not doing this)
-				GLint oldReadBuf = GL_BACK;
-				qglGetIntegerv( GL_READ_BUFFER, &oldReadBuf );
-				qglReadBuffer( GL_FRONT );
-
-				qglReadPixels( 0, 0, w, h, GL_RGB, GL_UNSIGNED_BYTE, temp );
-
-				qglReadBuffer( oldReadBuf );
+			// The frame that has just been put on the screen, rather than the
+			// one being drawn: every path above ends in a swap, whether it went
+			// through session->UpdateScreen or through tr.EndFrame. Which
+			// buffer that is - and whether there is one at all - is the
+			// backend's, see idRenderBackend::ReadPixels.
+			//
+			// A backend that cannot read one back leaves the tile as it found
+			// it. The caller gets whatever it allocated rather than a
+			// half-filled picture, and the state this function changed is still
+			// put back below.
+			if ( !renderBackend->ReadPixels( 0, 0, w, h, temp, true ) ) {
+				continue;
 			}
 
 			int	row = ( w * 3 + 3 ) & ~3;		// OpenGL pads to dword boundaries

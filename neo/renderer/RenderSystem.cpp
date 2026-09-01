@@ -933,7 +933,9 @@ void idRenderSystemLocal::CaptureRenderToFile( const char *fileName, bool fixAlp
 	int	c = ( rc->width + 3 ) * rc->height;
 	byte *data = (byte *)R_StaticAlloc( c * 3 );
 
-	if ( !renderBackend->ReadPixels( rc->x, rc->y, rc->width, rc->height, data ) ) {
+	// Not presented: R_IssueRenderCommands above drew this frame and nothing
+	// swapped it, so what is wanted is the one being composed.
+	if ( !renderBackend->ReadPixels( rc->x, rc->y, rc->width, rc->height, data, false ) ) {
 		// A backend with nothing to read back has already said so. Writing no
 		// file is what the callers can survive - this is the game taking a
 		// snapshot for its own objective screen, not the player asking for one.

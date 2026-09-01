@@ -102,7 +102,8 @@ public:
 	virtual void	CopyDepthbufferToImage( idImage *image, int x, int y,
 											int imageWidth, int imageHeight,
 											bool useOversizedBuffer );
-	virtual bool	ReadPixels( int x, int y, int width, int height, byte *rgb );
+	virtual bool	ReadPixels( int x, int y, int width, int height, byte *rgb,
+								bool presented );
 };
 
 static idRenderBackendGL	renderBackendGL;
@@ -1216,11 +1217,38 @@ void idRenderBackendGL::CopyDepthbufferToImage( idImage *image, int x, int y,
 /*
 ====================
 idRenderBackendGL::ReadPixels
+
+Which buffer is read is the whole of what `presented` decides here, and it is
+the reason the seam has to ask: the frame that is on the screen is the front
+buffer, and the frame that has been drawn and not shown is the back one.
 ====================
 */
-bool idRenderBackendGL::ReadPixels( int x, int y, int width, int height, byte *rgb ) {
-	qglReadBuffer( GL_BACK );
+bool idRenderBackendGL::ReadPixels( int x, int y, int width, int height, byte *rgb,
+									bool presented ) {
+	// DG: Native Wayland (=> not XWayland) doesn't seem to support reading
+	//     from the front buffer - screenshot is black then..
+	//     So just read from the default (probably back-) buffer
+	//
+	// Named rather than left to the current read buffer, which is what
+	// R_ReadTiledPixels did before this moved here: "the default" is GL_BACK
+	// until something sets it otherwise, and saying so is the same picture
+	// without depending on who ran last.
+	if ( !presented || glConfig.isWayland ) {
+		qglReadBuffer( GL_BACK );
+		qglReadPixels( x, y, width, height, GL_RGB, GL_UNSIGNED_BYTE, rgb );
+
+		return true;
+	}
+
+	// DG: It's probably better to restore the glReadBuffer mode after reading the pixels..
+	//     (at least with XWayland on GNOME changing resolutions is wonky when not doing this)
+	GLint oldReadBuf = GL_BACK;
+	qglGetIntegerv( GL_READ_BUFFER, &oldReadBuf );
+	qglReadBuffer( GL_FRONT );
+
 	qglReadPixels( x, y, width, height, GL_RGB, GL_UNSIGNED_BYTE, rgb );
+
+	qglReadBuffer( oldReadBuf );
 
 	return true;
 }

@@ -27,6 +27,19 @@
 # GATE_TIMEOUT (default 300) bounds every engine run. Nothing here ever waits
 # on the engine indefinitely: it is a windowed game being driven by a script,
 # and the ways it can sit there are not all worth enumerating.
+#
+# GAME (default dhewm3) picks which binary to run, because a build tree holds
+# both of them: dhewm3 is the SDL/GL build and dhewm3-eacp is the port. They are
+# two renderers and their hashes are not comparable with each other - compare
+# each build against itself, the way the README already says hashes are only
+# comparable within one machine and GPU.
+#
+#   GAME=dhewm3-eacp BUILD=$PWD/cmake-build-eacp ./regression/gate.sh capture x
+#
+# The eacp build is driven by the display link, which stops when the panel
+# sleeps (plan.md section 5, gap 13) - so hold the display awake for the run:
+#
+#   caffeinate -du ./regression/gate.sh capture x
 
 set -eu
 
@@ -35,13 +48,15 @@ build=${BUILD:-$root/cmake-build-debug}
 timeout=${GATE_TIMEOUT:-300}
 work=$root/regression/work
 gamedir=demo
+game=${GAME:-dhewm3}
 
-if [ -x "$build/neo/dhewm3.app/Contents/MacOS/dhewm3" ]; then
-	exe=$build/neo/dhewm3.app/Contents/MacOS/dhewm3
-elif [ -x "$build/neo/dhewm3" ]; then
-	exe=$build/neo/dhewm3
+if [ -x "$build/neo/$game.app/Contents/MacOS/$game" ]; then
+	exe=$build/neo/$game.app/Contents/MacOS/$game
+elif [ -x "$build/neo/$game" ]; then
+	exe=$build/neo/$game
 else
-	echo "no dhewm3 binary under $build - set BUILD to your build directory" >&2
+	echo "no $game binary under $build - set BUILD to your build directory," >&2
+	echo "or GAME to the binary you meant (dhewm3, dhewm3-eacp)" >&2
 	exit 1
 fi
 

@@ -257,19 +257,27 @@ public:
 													int imageWidth, int imageHeight,
 													bool useOversizedBuffer ) = 0;
 
-	// The frame that has just been drawn, back on the CPU as tightly packed
-	// RGB bytes with the origin at the bottom left - which is OpenGL's
-	// convention and what R_WriteTGA's own flipVertical argument is written
-	// against. The caller allocates ( width + 3 ) * height * 3, because OpenGL
-	// pads each row to a word boundary.
+	// The frame, back on the CPU as RGB bytes with the origin at the bottom
+	// left - which is OpenGL's convention and what R_WriteTGA's own
+	// flipVertical argument is written against. Each row is padded to a
+	// four-byte boundary, which is GL_PACK_ALIGNMENT's default and why the
+	// caller allocates ( width + 3 ) * height * 3 rather than width * height *
+	// 3; a backend that is not OpenGL still has to pad, because one of the two
+	// callers unpacks the padding and the other assumes it is not there.
 	//
-	// False from a backend that cannot do it, and that is not a hypothetical:
-	// a modern API has no front or back buffer to read, only a render target
-	// somebody kept, so this is the one entry point whose answer differs by
-	// more than how it is spelled. The callers are the objective camshots the
-	// game takes for its own UI, and they would rather write nothing than
-	// crash.
-	virtual bool			ReadPixels( int x, int y, int width, int height, byte *rgb ) = 0;
+	// `presented` says *which* frame is wanted. False is the one drawn but not
+	// yet shown, which CaptureRenderToFile reads straight after issuing its
+	// commands; true is the one already on the screen, which R_ReadTiledPixels
+	// reads after session->UpdateScreen has swapped. The distinction is double
+	// buffering's, so it belongs to OpenGL alone: a backend that composes its
+	// frame into a target it owns has one picture either way, and nothing it
+	// can do with the question but ignore it.
+	//
+	// False from a backend that cannot do it at all. The callers - the
+	// objective camshots the game takes for its own UI, the screenshots and
+	// aviDemo - would rather write nothing than crash.
+	virtual bool			ReadPixels( int x, int y, int width, int height, byte *rgb,
+										bool presented ) = 0;
 };
 
 extern idRenderBackend *	renderBackend;
