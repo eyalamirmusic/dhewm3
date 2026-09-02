@@ -126,9 +126,27 @@ Two things about the level are worth knowing before editing the tour:
 - **It opens on a cinematic** that owns the camera for the first stretch, so the
   script sits through it before taking over. Record without that wait and you
   capture the cinematic instead of the level.
-- **`wait N` counts command-buffer executions, not frames.** The buffer is run
-  several times per frame, so N is roughly six times the number of frames it
-  actually holds.
+- **`wait N` counts command-buffer executions, not frames — and the two builds
+  do not consume them at the same rate.** `idEventLoop::RunEventLoop` runs the
+  buffer once per event it processes and once more when the queue is empty, so
+  what N buys is one iteration of *that* loop rather than one frame. Measured
+  with `com_fixedTic 1`, which pins the game clock to one tic per rendered
+  frame: `wait 3150` reaches **52.7 seconds** of level time on `dhewm3-eacp`
+  and **7.7 seconds** on `dhewm3`, because the SDL build drains about 6.85
+  events a frame where the eacp one drains one.
+
+  So **a live-game script is not a clock two builds share**, and a screenshot
+  taken at the same `wait` count in each of them is a picture of two different
+  moments. Pin the level clock instead: `com_fixedTic 1` and a count calibrated
+  per build — `wait N` is N/60 seconds on the eacp build and about N/411 on the
+  SDL one — and print `backEnd.viewDef->renderView.time` to check where a run
+  actually landed. The gate itself is immune and that is the point of it: a
+  recorded demo replays the render world frame by frame, so both builds draw the
+  same instants whatever their event rate.
+
+  This is not hypothetical. §6 of `plan.md` carried an "over-bright frame" as a
+  defect of the eacp backend for two steps on the strength of a comparison made
+  this way; pinned properly, both builds draw it.
 
 ## The reference demo is an artifact, not an output
 
