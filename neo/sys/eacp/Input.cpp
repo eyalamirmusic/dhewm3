@@ -3,8 +3,8 @@
 
 dhewm 3 on eacp - the event queue and the input layer.
 
-sys/events.cpp is 1928 lines of SDL and this build does not compile it. This is
-what replaces it: the same queue, the same Sys_* surface, and the same rules for
+sys/events.cpp was 1928 lines of SDL, and step 5 deleted it. This is what
+replaced it: the same queue, the same Sys_* surface, and the same rules for
 turning a physical key into one of Doom 3's keyNum_t - with eacp's callbacks as
 the producers instead of SDL_PollEvent.
 
@@ -503,7 +503,7 @@ int consoleKeyMappingIdx = 0;
 // Whether the layout has been looked at yet.
 //
 // Needed because Sys_InitInput, which is where this would otherwise be settled,
-// is called from inside R_InitOpenGL (renderer/RenderSystem_init.cpp:831) -
+// is called from inside R_InitOpenGL (renderer/RenderSystem_init.cpp:822) -
 // "input and sound systems need to be tied to the new window". With
 // com_skipRenderer 1 that function is never reached, so until the renderer
 // lands nothing calls it and the console key would answer 0 for the whole run.

@@ -46,7 +46,7 @@ set(demo_installer "${doom3demo_SOURCE_DIR}/doom3-linux-1.1.1286-demo.x86.run")
 
 # Where fs_basepath will point at runtime. On Windows that's the directory
 # holding dhewm3.exe; on macOS Sys_GetPath(PATH_BASE) takes the *parent* of the
-# .app bundle (sys/osx/DOOMController.mm), which is the same directory. Both are
+# .app bundle (sys/eacp/Platform.mm), which is the same directory. Both are
 # the target's runtime output dir, which multi-config generators suffix with the
 # configuration name.
 get_property(is_multi_config GLOBAL PROPERTY GENERATOR_IS_MULTI_CONFIG)
@@ -72,11 +72,6 @@ add_custom_command(
 
 add_custom_target(demo-data DEPENDS "${demo_basepath}/demo/demo00.pk4")
 
-# Hang it off the executables rather than relying on ALL: building just one of
-# them should still leave you with something you can run. Both land in the same
-# directory and read the same demo/ out of it.
+# Hang it off the executable rather than relying on ALL: building just that
+# target should still leave you with something you can run.
 add_dependencies(dhewm3 demo-data)
-
-if(TARGET dhewm3-eacp)
-	add_dependencies(dhewm3-eacp demo-data)
-endif()

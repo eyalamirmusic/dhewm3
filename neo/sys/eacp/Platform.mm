@@ -3,10 +3,9 @@
 
 dhewm 3 on eacp - paths, memory size, and the machine-age question.
 
-Lifted from sys/osx/DOOMController.mm, which the eacp target does not build:
-that file's SDL_main is a second entry point and a second main loop, and this
-target has Apps::run for both. What is left is the part that was never about
-SDL at all.
+Lifted from sys/osx/DOOMController.mm, which step 5 deleted: that file's
+SDL_main was a second entry point and a second main loop, and this target has
+Apps::run for both. What is left is the part that was never about SDL at all.
 
 ===========================================================================
 */

@@ -125,8 +125,8 @@ GLExtension_t GLimp_ExtensionPointer( const char *name ) {
 }
 
 // GLimp_GrabInput is in sys/eacp/Input.cpp, and it belongs there: it is the
-// input layer's, and the only reason it sits in sys/glimp.cpp in the SDL build
-// is that SDL's grab calls need the window handle that file owns. Here the
+// input layer's, and the only reason it sat in sys/glimp.cpp in the SDL build
+// was that SDL's grab calls need the window handle that file owned. Here the
 // window belongs to the view, which the input layer already tracks.
 
 bool GLimp_SetSwapInterval( int swapInterval ) {

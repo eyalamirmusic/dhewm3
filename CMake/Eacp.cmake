@@ -1,13 +1,9 @@
-# eacp - the platform layer this port is moving onto. See ../plan.md, Phase 2.
+# eacp - the platform layer this port runs on. See ../plan.md, Phase 2.
 #
 # Fetched at the repository root rather than from inside neo/, for one reason:
 # neo/ pins CMAKE_CXX_STANDARD to 11 for the Doom 3 code, and eacp is C++20.
 # eacp sets its own standard in its own directory scope, so the two never have
 # to agree - but only from a scope that has not already been set to 11.
-
-if(NOT EACP)
-	return()
-endif()
 
 include(CPM)
 

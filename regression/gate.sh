@@ -28,23 +28,23 @@
 # on the engine indefinitely: it is a windowed game being driven by a script,
 # and the ways it can sit there are not all worth enumerating.
 #
-# GAME (default dhewm3) picks which binary to run, because a build tree holds
-# both of them: dhewm3 is the SDL/GL build and dhewm3-eacp is the port. They are
-# two renderers and their hashes are not comparable with each other - compare
-# each build against itself, the way the README already says hashes are only
-# comparable within one machine and GPU.
+# A build tree holds one binary, named dhewm3, and BUILD says which tree:
 #
-#   GAME=dhewm3-eacp BUILD=$PWD/cmake-build-eacp ./regression/gate.sh capture x
+#   BUILD=$PWD/cmake-build-eacp ./regression/gate.sh capture x
 #
-# The eacp build is driven by the display link, which stops when the panel
-# sleeps (plan.md section 5, gap 13) - so hold the display awake for the run:
+# (GAME still overrides the name, which is what it was for when the tree held
+# the SDL/GL executable next to the port. Step 5 deleted that one.)
+#
+# The frame is driven by the display link, which stops when the panel sleeps
+# (plan.md section 5, gap 13) - so hold the display awake for the run:
 #
 #   caffeinate -du ./regression/gate.sh capture x
 #
 # GATE_ARGS (default empty) is appended to the engine's command line before the
-# +exec, for a capture that has to differ from capture.cfg in one setting on
-# both builds - which is how a cvar that changes every frame is checked against
-# the other renderer rather than against the baseline it cannot match:
+# +exec, for a capture that has to differ from capture.cfg in one setting -
+# which is how a cvar that changes every frame was checked against the other
+# renderer, while there was one, rather than against a baseline it could not
+# match:
 #
 #   GATE_ARGS='+set r_gamma 1.5 +set r_brightness 1.2' ./regression/gate.sh capture x
 #
@@ -65,8 +65,7 @@ if [ -x "$build/neo/$game.app/Contents/MacOS/$game" ]; then
 elif [ -x "$build/neo/$game" ]; then
 	exe=$build/neo/$game
 else
-	echo "no $game binary under $build - set BUILD to your build directory," >&2
-	echo "or GAME to the binary you meant (dhewm3, dhewm3-eacp)" >&2
+	echo "no $game binary under $build - set BUILD to your build directory" >&2
 	exit 1
 fi
 

@@ -916,7 +916,7 @@ static float joyAxisToMouseDelta(float axis, float deadzone)
 	return ret;
 }
 
-extern bool D3_IN_interactiveIngameGuiActive; // from sys/events.cpp
+extern bool D3_IN_interactiveIngameGuiActive; // from sys/eacp/Input.cpp
 void idUsercmdGenLocal::JoystickFakeMouse(float axis_x, float axis_y, float deadzone)
 {
 	if ( D3_IN_interactiveIngameGuiActive ) {

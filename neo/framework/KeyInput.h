@@ -219,8 +219,9 @@ typedef enum {
 	//  i.e. printable characters of sorts, *not* Ctrl, Alt, F1, Del, ...)
 	K_FIRST_SCANCODE = 256,
 
-	// !!! NOTE: if you add a scancode here, make sure to also add it to   !!!
-	// !!!       scancodemappings[] in sys/events.cpp (and preserve order) !!!
+	// !!! NOTE: if you add a scancode here, make sure to also add it to      !!!
+	// !!!       scancodeNames[] in sys/eacp/Input.cpp (and preserve order) - !!!
+	// !!!       there is a static_assert next to it that checks the count.   !!!
 	K_SC_A = K_FIRST_SCANCODE,
 	K_SC_B,
 	K_SC_C,
