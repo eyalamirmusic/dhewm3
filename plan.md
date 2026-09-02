@@ -856,11 +856,18 @@ retail install. Since step 5 the build tree the gate defaults to is
 `cmake-build-eacp`; the `cmake-build-debug` this was first written against still
 holds the Phase 1 SDL/GL binary, which is what `gate.sh`'s libSDL3 guard is for.
 Since step 7 that tree is configured with `-DCPM_eacp_SOURCE=$HOME/Code/eacp
--DCPM_imgui-eacp_SOURCE=$HOME/Code/imgui-eacp`. The first is the convenience
-`CMake/Eacp.cmake` describes, step 6's eacp change being on `main` as
-`df86cb6`; the second is still required, because step 7's imgui-eacp change
-stands in that working tree and is not yet on its `main` — a tree configured
-without it fetches `main` and does not build until it is committed.
+-DCPM_imgui-eacp_SOURCE=$HOME/Code/imgui-eacp`. Both are the convenience
+`CMake/Eacp.cmake` describes and neither is required: step 6's eacp change is on
+`main` as `df86cb6` and step 7's imgui-eacp change as `2617ce4`, and a tree
+configured with no override at all — `cmake-build-verify`, fetching eacp at
+`c051ca7` and imgui-eacp at `2617ce4` from GitHub — builds, links neither SDL
+nor OpenGL, and captures the same 297 frames as the step 7 binary. Getting to
+"the same" took four captures of each, because that afternoon the gate showed
+capture-to-capture jitter for the first time on this build: three of the eight
+captures each moved a single frame by at most nineteen pixels of at most two
+levels, and the two binaries agree to the byte on every capture that did not.
+`regression/README.md` records the numbers and what to do with a single moved
+frame.
 
 ### Phase 2 — cut the platform layer and the backend together ← **done, apart from the Windows host**
 
@@ -3242,11 +3249,10 @@ the event-feeding rules out of `ImGuiView` into `Gui::sendMousePosition` /
 `sendMouseButton` / `sendMouseWheel` / `sendKey` / `sendMouseExited`, so that
 this port and `ImGuiView` feed an `ImGuiIO` through one implementation of each
 rule rather than two — the rules worth sharing being which wheel delta is one
-ImGui notch and which of a key's characters count as typing. **Both are
-uncommitted**, the way step 6's eacp change was until it landed: they stand in
-the `~/Code/imgui-eacp` working tree awaiting the user's own commit — imgui-eacp's
-rules, like eacp's, do not let an agent commit there — with its own tests at **19
-of 19**, and this section will record the SHA once it exists.
+ImGui notch and which of a key's characters count as typing. **Both landed on
+imgui-eacp `main` as `2617ce4`**, the user's own commit — imgui-eacp's rules,
+like eacp's, do not let an agent make one — with its own tests at **19 of 19**
+and the diff exactly the one this step was built against.
 
 **Exactly one Dear ImGui in the binary, and nothing about two would have
 failed.** imgui-eacp fetches ImGui v1.92.5 by CPM and builds an `imgui` target

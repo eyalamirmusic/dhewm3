@@ -82,10 +82,22 @@ setting and comparing later runs to that, which is the same trick with one leg.
 unmodified binary differed on frame 99, by two pixels of two out of 255. It
 mattered because that frame also moved between captures taken months apart,
 which reads like a shared-code regression until a second capture of the same
-build shows it moving without one. The eacp build has been byte-identical across
-captures at every step, including the whole of step 5 - thirteen commits, every
-one of them 297 of 297 against the same baseline - so "identical" is a claim
-this build can make and the GL one never could.
+build shows it moving without one. The eacp build was byte-identical across
+captures at every step through step 7, including the whole of step 5 - thirteen
+commits, every one of them 297 of 297 against the same baseline - so "identical"
+is a claim this build could make and the GL one never could.
+
+**It jitters too, rarely, and by less.** Measured after step 7 while verifying
+a tree built against both dependencies' `main`: of eight captures across two
+binaries of the same source, three each moved a single frame - 71 by one pixel
+of one level, 80 by one pixel of one level, 168 by nineteen pixels of at most
+two levels - and the other five matched each other to the byte, the two
+binaries included. The three frames are not the same frame and none is the GL
+build's 99, so this is the machine's noise rather than a place in the tour. A
+compare that names one frame and nothing else is therefore not a regression
+until a second capture of the same binary moves it too; a change that moves
+sixteen frames, or one frame by a mean anyone can see, still is. Recapture,
+then believe the second one.
 
 **A live pinned-camera shot is not an instrument without `com_fixedTic 1`.**
 dhewm3 advances game time from the wall clock, so a `screenshot` after a
