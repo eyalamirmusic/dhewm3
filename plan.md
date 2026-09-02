@@ -4,8 +4,22 @@ Moving dhewm3 off SDL2 + OpenGL and onto [eacp](https://github.com/eyalamirmusic
 app lifecycle and message loop first, GPU rendering (Metal / D3D12) as the real work.
 
 **Status: Phase 0 is done and merged. Phase 1 has landed its gate and its seam.
-Phase 2 is under way: the app shell, the threading, the boot, the input and the
-renderer are in, and the renderer now draws. `dhewm3-eacp` puts **Doom 3's main
+Phase 2 is complete apart from the Windows host. There is one executable, named
+`dhewm3`, it renders through Metal by way of eacp, and it links neither SDL nor
+OpenGL — `otool -L` is the check and CI runs it. Step 5, the deletion, took
+**28,945 lines out across twelve code commits and a thirteenth for the
+documents**, and the gate was **297 of 297 identical on every one of them**. What
+went: the SDL/GL executable and everything only it compiled, the ARB2 path, the
+fixed-function draw path, the debug render tools, `renderbump`, the
+precompressed-texture writer, the palettised normal-map path, dmap's debug
+views, the `qgl` table and its 340 entry points, and SDL itself — the four
+reasons it was still linked and the five the code comment had missed. What the
+port keeps that the old bullet said to delete: `sys/threads.cpp`, which step 2a
+had already moved onto the standard library. The rest of this Status paragraph
+is the history of how the renderer got there.**
+
+**Phase 2's earlier steps: the app shell, the threading, the boot, the input and
+the renderer are in, and the renderer draws. The port puts **Doom 3's main
 menu on screen through Metal**, **loads a level**, **lights it** and
 **shadows it** — the world is done, all three of the steps 4d was broken into.
 `interaction.vfp` and `shadow.vp` are in the EDSL, the stencil shadow volumes
@@ -32,9 +46,12 @@ against 0.46, which is *below* the floor that stop had with the feature switched
 off on both sides. The over-bright frame 4e.3 carried as a loose defect is closed
 too, and was never the port's: it is the level's dropship headlight, drawn by
 both builds at the same instant, and what was wrong was a reproducer that
-compared two different moments. What is left of Phase 2 is the soft-particle
-program, which needs a new eacp gap opened before it and which the gate cannot
-see either way, and then step 5 — the deletion.**
+compared two different moments. Then step 5 deleted the renderer all of that was
+measured against, which is why every number above is written in the past tense
+and cannot be taken again. Three things are open beside the Windows host: the
+soft-particle program, which needs eacp gap 24 opened before it and which the
+gate cannot see either way; an ImGui backend for the eacp host, which is what
+would light the F10 settings menu back up; and gap 20's multisampling.**
 
 Reference implementation for almost everything on the platform side:
 `~/Code/PureDOOM/examples/EACP` — a complete engine hosted on eacp, with its own
@@ -42,7 +59,12 @@ Reference implementation for almost everything on the platform side:
 
 ---
 
-## 1. Where dhewm3 stands today
+## 1. Where dhewm3 stood when this started
+
+*This section is the starting snapshot and is kept in the present tense it was
+written in. None of it describes the tree now: step 5 (§6) deleted every file in
+the table below except `threads.cpp`, and the count of SDL files was short by
+five — see step 2b's "What is still SDL".*
 
 ### The platform layer is small and already contained
 
@@ -446,8 +468,14 @@ Numbers are never reused, so a hole is an entry that closed.
    `ModifierKeys` also does not say which side was pressed, so K_SHIFT and
    K_RIGHT_SHIFT (and the Ctrl and Alt pairs) cannot be told apart. The stock
    config binds the left names, so both keys act as the left one.
-10. **Gamepad** — dhewm3 has full SDL gamepad support in `events.cpp`. Either build
-    an eacp module or drop controller support for now (see scope cuts).
+10. **Gamepad** — dhewm3 had full SDL gamepad support in `events.cpp`, and step
+    5 deleted that file with the rest of the SDL host, so this gap is now the
+    whole of the feature rather than an alternative to it. What survives on the
+    engine side is everything that is not a device: the cvars, the `JOY_*` key
+    names and their bindings, `joy_gamepadLayout`, and
+    `D3_IN_interactiveIngameGuiActive` — all of it defined in
+    `sys/eacp/Input.cpp` and archiving as before, so a config written on upstream
+    dhewm3 carries over intact and would work the day eacp grows the module.
 11. **Texture arrays** — PureDOOM's gap #12. Would collapse per-texture draw
     batching; matters more for Doom 3's draw counts than it did for DOOM's.
 13. **Continuous mode stops when the display sleeps** — and so, now, does the
@@ -559,7 +587,9 @@ Numbers are never reused, so a hole is an entry that closed.
     screen with the most edges per pixel in the game, and 0.1 on a level view.
     Worth it for what the target buys, and cheap to close if it ever is not — an
     MSAA texture beside the target, resolved into it, is what the drawable path
-    already does.
+    already does. Step 5 kept `r_multiSamples` alive for it: the cvar is read in
+    eight places by the settings menu and `regression/capture.cfg` sets it, so
+    deleting it would have cost the harness a line for nothing.
 
 21. ~~**A texture cannot be read back to the CPU.**~~ — **closed**, and the
     entry is kept because what closing it turned out to need is worth knowing.
@@ -660,7 +690,11 @@ Numbers are never reused, so a hole is an entry that closed.
     in the gate can see it, before or after. `r_useSoftParticles 0` and even
     `r_skipParticles 1` move nothing beyond the SDL/GL build's own
     capture-to-capture noise over the whole 297-frame tour, so this is the one
-    piece of the port that will have to be verified by looking at it.
+    piece of the port that will have to be verified by looking at it. **And step
+    5 has now deleted the build that noise belonged to**, so there is no second
+    renderer to hold the result up against either — which is a reason to do it
+    carefully rather than a reason not to, and was known and accepted when the
+    order was chosen (§8).
 
     The shape of a fix is small on both sides: the depth usage and a depth
     member on `TextureFormat` in eacp, then `CopyDepthbufferToImage` and one
@@ -670,9 +704,10 @@ Numbers are never reused, so a hole is an entry that closed.
 
 - **`GPU::StreamingBuffers` already exists** (`Lib/eacp/GPU/Buffer/`) and is
   `idVertexCache`'s exact shape. An earlier draft of this plan had it as work to do.
-- **Doom 3's 3D textures are dead code.** `idImage::Generate3DImage`
-  (`neo/renderer/Image_load.cpp:736`) is defined and never called, so `TT_3D` never
-  happens and eacp needs no 3D texture. Worth knowing before anyone builds one.
+- **Doom 3's 3D textures were dead code.** `idImage::Generate3DImage` was defined
+  and never called, so `TT_3D` never happened and eacp needs no 3D texture. Step
+  5 deleted the function; `TT_3D` itself survives in `textureType_t` because the
+  storage-size accounting still names it.
 
 ---
 
@@ -726,7 +761,7 @@ The demo data is already unpacked at `cmake-build-debug/neo/demo/demo00.pk4`
 (`CMake/DemoData.cmake` fetches it at configure time), so the gate needs no
 retail install.
 
-### Phase 2 — cut the platform layer and the backend together ← **in progress**
+### Phase 2 — cut the platform layer and the backend together ← **done, apart from the Windows host**
 
 Both at once, on one branch:
 
@@ -736,6 +771,10 @@ Both at once, on one branch:
   for console events (`PushConsoleEvent`, `neo/sys/events.cpp:909`). Drive
   `common->Frame()` from `GPUView::update()`.
 - **Renderer**: implement `idRenderBackend` on `eacp::GPU`.
+
+*(`threads.cpp` in that first bullet is the error §8's item 5 carried for the
+whole port. It was rewritten rather than deleted, in step 2a, and the port
+keeps it.)*
 
 *Why not a throwaway GL view in eacp first?* It was considered — a legacy-GL-backed
 `View` would let the platform swap land independently with the game never breaking.
@@ -935,6 +974,16 @@ ImGui has an SDL backend, and the script debugger uses SDL mutexes. All four go
 with the GL backend in step 5. `SDL_Init` is compiled out of `Common.cpp` for
 this target — it would open a second video driver, which on macOS means a second
 `NSApplication` delegate fighting the one `Apps::run` installed.
+
+*Step 5 found that this list of four was short by five.* `sys/cpu.cpp` asked SDL
+for the CPU feature flags, `sys/posix/posix_main.cpp` for the clipboard and a
+pause instruction, `Common.cpp` for the version banner it printed unguarded
+(`using SDL v3.4.12`, `SDL video driver: (null)`), `Dhewm3SettingsMenu.cpp` for
+the display bounds it reported as `0 x 0`, and `sys/sys_imgui.cpp` for the window
+handle and the event type. Four of the nine were on the list because they were
+the ones somebody had gone looking for; the other five were found by grepping
+for the string rather than for the intent, which is the only method that finds
+the ones nobody remembered writing.
 
 #### Step 3 — the events, bridged — **done**
 
@@ -1788,8 +1837,10 @@ The picture matches the GL build's camshot.
 **What the port gets for it.** Every measurement after this is a hash. The
 comparisons up to here have been screen grabs agreeing to 0.3 of 255 — good
 enough to say a picture is right, useless for saying a change moved nothing —
-and `regression/gate.sh` now takes `GAME=dhewm3-eacp` and answers that question
-for this backend the way it has answered it for the GL one since Phase 1.
+and `regression/gate.sh` took `GAME=dhewm3-eacp` from here on and answered that
+question for this backend the way it had answered it for the GL one since Phase
+1. (Step 5 folded the two targets into one and `GAME` has nothing left to
+choose; `BUILD` defaults to `cmake-build-eacp` now.)
 
 Two things about running it, both in `gate.sh`'s own header now. The display has
 to be held awake (`caffeinate -du`), because the engine is driven by the display
@@ -2709,6 +2760,165 @@ The gate itself was never exposed to this and that is the argument for it — a
 recorded demo replays the render world frame by frame, so both builds draw the
 same instants whatever their event rate.
 
+#### Step 5 — the deletion — **done**
+
+Thirteen commits, `92eae3e` through `153c91a`. **28,945 lines deleted and 719
+added across the twelve that touch code**, and the thirteenth is the documents.
+Every one of the twelve was built and captured before the next started, and
+**every one compared 297 of 297 identical** against `frames-step5-base`, itself
+verified byte-identical to the post-4e.8 baseline before anything was deleted.
+
+The order is the argument. `qgl` is a table of 340 function pointers *defined in
+shared code* and assigned in exactly one place, `RenderBackend_GL.cpp` — so from
+C2 on, every surviving GL call site on this build was a null pointer and every
+surviving *caller* was a link error. That is what made the deletions provably
+invisible to the gate rather than hopefully invisible, and it is why the handful
+of sites that were genuinely reachable had to go first.
+
+1. **`92eae3e` Delete the platforms this port dropped.** 10,849 lines, 98 files,
+   none of them named by any CMakeLists: `neo/sys/linux/`, `neo/sys/aros/`,
+   `neo/sys/stub/`, `dist/linux/`, the dead `osx` and `win32` leftovers, and
+   `README.md`'s two license attributions for files that went with them. First
+   so that C2's diff is readable. Gate identical.
+2. **`8b16a69` Delete the SDL/GL host, and the port takes its name.** 5,874
+   lines: `RenderBackend_GL.cpp`, `glimp.cpp`, `events.cpp`, `DOOMController.mm`,
+   `SDLMain`, the Windows CI job — and the second `add_executable`. One target
+   named `dhewm3`, one `src_sys`, one `src_renderbackend`, the `EACP` option
+   gone and `include(Eacp)` unconditional. Not one file the eacp binary compiles
+   was edited, which is why the rename belongs here. The build tree was deleted
+   and reconfigured rather than rebuilt, because the port's bundle takes the
+   name the tree already held and `gate.sh` would have measured the stale GL
+   binary without complaining. Gate identical.
+3. **`c6823ed` Take the last GL calls off the frame's own path.** 442 lines.
+   `vid_restart`'s `qglGetError` became `renderBackend->CheckErrors()`;
+   `RB_ShowImages`, `R_RenderingFPS` and the `benchmark` command,
+   `R_StencilShot` and `idImage::WritePrecompressedImage` were deleted. These
+   were the sites that could actually be reached, so after this commit nothing
+   on the frame's path could make a GL call. Gate identical, and checked by hand
+   at the console.
+4. **`596080f` Delete renderbump.** 1,690 lines. A content-authoring tool that
+   draws through immediate-mode GL, registered as two unconditional console
+   commands, 52 null-pointer calls from the first keystroke.
+5. **`c0284a2` Keep the settings menu compiled, and dark.** 1,634 lines — the
+   two ImGui backends — and the guards that are the point of the commit. See
+   §7 for why it was kept rather than deleted.
+6. **`2c4ef53` Delete the ARB2 path.** 1,079 lines: `draw_arb2.cpp`, `BE_ARB2`
+   and the backend-selection apparatus it was the reason for, `r_renderer`, and
+   eight GL-only cvars. `R_FindARBProgram` survives as a static stub in
+   `Material.cpp` next to its only caller, and `glConfig.ARBFragmentProgramAvailable`
+   stays a field because `Material.cpp` exposes it to `.mtr` files as
+   `fragmentPrograms` — the thing to suspect if a frame had moved, and none did.
+7. **`257bb1c` Delete the debug render tools.** 2,381 lines. `tr_rendertools.cpp`
+   goes from 2,436 lines to 361: forty-odd `r_show*` views deleted, nine
+   functions kept because they never drew anything — the game records debug
+   lines, text and polygons through `idRenderWorld` every frame whether or not
+   anybody can see them. With it, `tr_trace.cpp` below `R_LocalTrace`,
+   `idRenderWorldLocal::ShowPortals`, and `tr_render.cpp`'s two caller-less
+   stage-texture functions.
+8. **`e46bb57` Delete the fixed-function draw path.** 2,504 lines.
+   `draw_common.cpp` — 1,899 lines, 284 `qgl` sites, the whole of what OpenGL
+   did inside a view — plus `tr_render.cpp`'s GL half, which leaves that file at
+   zero `qgl` sites, and MegaTexture's binding half.
+   `RB_BakeTextureMatrixIntoTexgen` was relocated into `tr_render.cpp` rather
+   than deleted: it has no GL in it and both backends call it. The linker is the
+   real check on this one.
+9. **`9d5b30b` Delete qgl.** 2,261 lines. The `QGLPROC` table, the forty
+   extension pointers, `R_CheckPortableExtensions`, the palettised normal-map
+   path whole, `Generate3DImage`, `idVertexCache`'s buffer-object half with
+   `r_useVertexBuffers` and `r_useIndexBuffers`, dmap's debug views, and finally
+   `qgl.h` and `qgl_proc.h`. What did **not** go with them is the pixel formats:
+   they are an enum of Doom 3's own now, in `renderer/GLFormats.h`, at OpenGL's
+   values and under OpenGL's names, because `RenderBackend.h` already argued
+   that half of that enum is the `.dds` file format's as much as the API's. The
+   GL *types* did go — `GLuint texnum` and `GLenum textureMinFilter` were
+   `SDL_opengl.h` leaking into `Image.h`.
+10. **`631bb4f` Take SDL out of the engine.** `idlib/Lib.cpp`'s endian macros
+    onto CMake's `D3_IS_BIG_ENDIAN` and `__builtin_bswap`; `cpu.cpp`'s SIMD
+    flags off `SDL_HasSSE2` and onto the `cpuid` this file already read for DAZ;
+    the clipboard from `SDL_GetClipboardText` to `NSPasteboard`, moved into
+    `macosx_misc.mm` because a pasteboard needs Objective-C; and `Common.cpp`'s
+    three `D3_EACP`-guarded blocks, `D3_EACP` itself, and the version banner
+    that had been printing `SDL video driver: (null)`.
+11. **`577cf31` Take SDL out of the script debugger.** `rvDebuggerServer`'s
+    `SDL_mutex` and `SDL_cond` members onto `std::mutex` and
+    `std::condition_variable`, the way `sys/threads.cpp` went in step 2a. With
+    them, `sys/sys_sdl.h`.
+12. **`696d1e5` Stop linking SDL.** Five lines of CMake, and the proof: if
+    anything above had been missed it would not link. `otool -L` on the bundle's
+    binary shows OpenAL, libcurl, libc++, and Cocoa / Metal / QuartzCore /
+    AppKit / Foundation and friends. No `libSDL3`, no `OpenGL.framework`.
+    Verified on a tree deleted and reconfigured from scratch.
+13. **`153c91a` Say what the program is.** `README.md`, `Configuration.md`,
+    `regression/README.md`, `gate.sh` and one cvar description.
+
+**The manual checks**, because the gate reaches none of these: `vid_restart`,
+`r_showImages 1` and `benchmark` at C3; `renderbump` and `renderbumpFlat` at C4;
+`dhewm3Settings` twice at C5; `vid_restart` again at C6, because
+`SetBackEndRenderer`'s dirty check changed; `startBuild`, `finishBuild`,
+`image_filter GL_LINEAR` with `reloadImages`, `listVertexCache` and `gfxInfo` at
+C9; the clipboard at C10, by priming it with a canary and running `error` —
+`idCommonLocal::Error` copies its message to the clipboard, which is the one
+clipboard path a script can reach, and it held `Testing drop error` afterwards;
+`com_enableDebuggerServer 1` and `0` at C11, which brings the server up on port
+27980 and takes it down again; and `gate.sh`'s new guard at C13, pointed at the
+Phase 1 `cmake-build-debug` that is still on this machine. Every one on a
+scratch `fs_savepath` and `fs_configpath`, every one exiting 0.
+
+**The final binary under `MTL_DEBUG_LAYER=1 MTL_SHADER_VALIDATION=1`**: 297
+frames captured, log clean — the two "Validation Enabled" lines and nothing
+else. Its hashes were not compared against a plain capture, because the
+validation layers move 99 of 297 frames by a mean of 0.000 and that is written
+down in `regression/README.md`.
+
+**Five latent crashes the scoping found, and where each was closed.** None of
+them was on the gate's path, which is exactly why they had survived: every one
+was a null `qgl` pointer waiting behind a console command or a cvar.
+`vid_restart` called `qglGetError` ungated (C3); `r_showImages 1` made
+`RB_SwapBuffers` call fourteen of them every frame (C3); `benchmark` called
+`qglFinish` (C3); `renderbump` was fifty-two of them from the first keystroke
+(C4); and `dhewm3Settings` reached `ImGui::SetNextWindowFocus()` on a null
+context and then `qglDisable` every frame afterwards (C5). A sixth turned up
+during C9 and is below.
+
+**What the scoping plan got wrong**, in three places, all of the same kind — a
+call graph read one level shallow:
+
+- **`RB_SetGL2D`.** C3 was written to delete it, and `renderbump.cpp` calls it,
+  so C3 would not have built. Fixed without reordering: C3 deleted
+  `RB_ShowImages`, which was its only caller *on the frame path*, and C4 took
+  `RB_SetGL2D` itself together with renderbump. C3's stated goal was met in
+  full.
+- **Three `tr_render.cpp` functions.** C7 grouped
+  `RB_RenderDrawSurfListWithFunction`, `RB_RenderTriangleSurface` and
+  `RB_DrawElementsImmediate` with the debug tools on the claim that only
+  `tr_rendertools.cpp` and `tr_trace.cpp` called them. `draw_common.cpp` calls
+  the first directly and reaches the other two through
+  `RB_T_RenderTriangleSurface`, so all three went with C8 — which is where the
+  three depth-hack functions they call were already scheduled, and they could
+  never have been split from them.
+- **dmap's `qgl` calls, and the sixth latent crash.** The plan recorded
+  `optimize.cpp`'s 99 sites as being inside `#if 0`. They are not: they are
+  ordinary code under a runtime `if ( dmapGlobals.drawflag )`, and `-draw` is
+  what sets that flag. `dmap` is a registered console command, so `dmap <map>
+  -draw` called `qglBegin` through a null pointer. C9 deleted the whole
+  debug-draw feature, `gldraw.cpp` included — half of which had been `#if 0`
+  since 2011 with empty stubs standing in for it.
+
+**Two things the plan predicted that did not happen.** The GL build's known
+frame-99 non-determinism did not show up in its final capture: `gl-4e8-after`
+and `gl-final` were identical, 297 of 297. And `FETCH_DEMO_DATA` is **OFF** in
+this build tree, so C2's reconfigure would not have restored the 483 MB
+`demo00.pk4` the gate needs — it had to be moved aside and moved back, which is
+worth knowing before anyone deletes a build tree here again.
+
+**The `threads.cpp` correction.** §8's item 5 listed `neo/sys/threads.cpp` for
+deletion, and had listed it since Phase 1. It is wrong and was wrong when it was
+written: step 2a rewrote that file on `std::thread`, `std::recursive_mutex` and
+`std::condition_variable_any` (`d7b9698`), it is SDL-free apart from five
+comments, and it is the sole definer of all eleven `Sys_*` threading entry
+points and of `struct sysThread_t`. Deleting it would have unbuilt the port. It
+is one of the files this port *keeps*.
+
 ### Shader inventory for Phase 2
 
 Roughly 10–15 EDSL programs, each in the sampling variants §4.3 sizes — 8 worst case
@@ -2814,9 +3024,17 @@ Explicitly **not** ported:
 
 - `neo/tools/` — radiant (220 qgl calls), CamWnd (107), guied, dmap. Windows-only,
   gated behind `ID_ALLOW_TOOLS`, and a large fraction of the total qgl count.
-- `neo/renderer/tr_rendertools.cpp` — 345 qgl calls, all debug visualisation. Stub it,
-  restore selectively if a specific view proves useful during the port.
-- Gamepad support, initially (see gap 10).
+  Step 5 found one exception to "Windows-only": `dmap`'s own debug views are
+  registered on every build and were reachable from the console, so they were
+  deleted rather than cut.
+- `neo/renderer/tr_rendertools.cpp` — 345 qgl calls, all debug visualisation.
+  Step 5 deleted the drawing and kept the file at 361 lines, because nine of its
+  functions never drew anything and shared code calls them every frame. The
+  `r_show*` cvars stay registered and inert, which is what a later port of a
+  view would want back.
+- Gamepad support, initially (see gap 10). Step 5 deleted the SDL that
+  implemented it; the cvars and the `JOY_*` binding names survive, so an
+  archived config carries over.
 - Depth bounds test (10 refs) — an optimisation, drop it.
 
 **Linux — dropped. Decided, not discovered.** eacp's README is not stale:
@@ -2838,9 +3056,30 @@ deleted when the eacp one passes the gate. No second backend to keep alive, no
 GL path to keep honest, and no reason for `idRenderBackend` to stay expressible
 in fixed-function terms a moment longer than the port needs.
 
-Nothing has been deleted yet. `neo/sys/linux/`, the SDL layer and the POSIX
-files still build, and there is no reason to remove them before Phase 2 wants
-their call sites — but nothing is owed to them either.
+**It has been deleted.** Step 5 (§6) took `neo/sys/linux/`, the SDL layer, the
+GL backend and everything that only it compiled — 28,945 lines. The POSIX files
+stayed, because `posix_main.cpp` and `posix_net.cpp` are window-system-free and
+own most of the `Sys_*` family; so did `sys/threads.cpp`, `sys/cpu.cpp`,
+`sys/sys_local.cpp` and `sys/osx/macosx_misc.mm`, all of which the eacp host
+needs. `neo/sys/win32/` stayed too: it is a platform this port has not reached
+rather than one it dropped, and the Windows host is a scheduled step.
+
+**One scope cut was reversed on the way, and it is worth recording why.** The
+in-game **settings menu** — dhewm3's own F10 ImGui window, which `README.md`
+lists as a headline feature — was scheduled for deletion in step 5 and is
+**kept, compiled and dark** instead. Deleting it would have been one commit and
+the stubs already existed; what argued against it is that it is not id's code
+being dropped but dhewm3's own being dropped, and a port has no business doing
+that silently. So `sys_imgui.cpp` and `Dhewm3SettingsMenu.cpp` stay in the
+build, stripped of SDL and OpenGL, with the null-context guards that make them
+safe: `Init` returns false with a warning rather than making a context nothing
+can draw, and `OpenWindow`, `EndFrame` and `CloseWindow` hold the same guard
+`NewFrame` already had. `dhewm3Settings` prints one line saying the menu is not
+available on this build yet. **An eacp ImGui backend is a step of its own**, and
+not a small one: ImGui vendors `imgui_impl_metal.mm`, but this port's renderer
+is `idRenderBackendEacp` rather than raw Metal, and what the old backend did
+around `ImGui::Render` was save and restore fixed-function GL state, which has
+no analogue here.
 
 ---
 
@@ -3030,26 +3269,66 @@ Phase 2 is the first work that compiles against eacp. In rough order:
        builds drain events at rates seven to one apart, so the reproducer's
        SDL/GL screenshots were forty seconds of level time short of the ship.
        `regression/README.md` says how to pin a live run now.
-5. **Delete** `glimp.cpp`, `events.cpp`, `neo/sys/linux/`, SDL, and fold
-   `dhewm3-eacp` back into `dhewm3`. **Not `threads.cpp`** — that was this
+5. ~~**Delete** `glimp.cpp`, `events.cpp`, `neo/sys/linux/`, SDL, and fold
+   `dhewm3-eacp` back into `dhewm3`.~~ — **done**, §6. Thirteen commits, 28,945
+   lines out, 297 of 297 on every one of them, and one target named `dhewm3`
+   that links neither SDL nor OpenGL. **Not `threads.cpp`** — that was this
    list's own error, carried since Phase 1: step 2a took it off SDL and onto
-   `std::thread` and `std::mutex`, and both targets have shared the result ever
+   `std::thread` and `std::mutex`, and both targets shared the result ever
    since. It is one of the files the port *keeps*.
 
-   One thing 4e.8 leaves for this step to be careful with. `R_FindARBProgram`
-   goes with `draw_arb2.cpp`, and until 4e.8 the material parser decided what a
-   `newStage` *is* on that function's return value — so a stub returning 0 would
-   have silently turned fifty materials back into fixed-function stages with no
-   image. It does not now: `Material.cpp` tests the program's name beside the
-   two handles, and the eacp backend never reads the handles at all. The gate
-   would catch a regression here — 48 frames — but the point is that it no
-   longer can happen.
+   The thing 4e.8 left for this step to be careful with turned out not to bite.
+   `R_FindARBProgram` went with `draw_arb2.cpp`, and until 4e.8 the material
+   parser decided what a `newStage` *is* on that function's return value — so a
+   stub returning 0 would have silently turned fifty materials back into
+   fixed-function stages with no image. It does not now: `Material.cpp` tests
+   the program's name beside the two handles, and the eacp backend never reads
+   the handles at all. C6 landed the stub at 297/297, `fragmentPrograms` and all.
 
-Off to one side of that order, and needed before the port is finished rather
-than before the next step: **the Windows host**. `dhewm3-eacp` is macOS-only
-from step 2b (§6), because `sys/win32/win_main.cpp` holds Windows' `Sys_*`
-entry points behind its own `WinMain`. Splitting that file the way
-`DOOMController.mm` was split is the whole of it.
+Three things are open, and none of them is in that order because none of them
+blocks another.
+
+**The Windows host.** The port is macOS-only from step 2b (§6), and step 5 made
+that the buildsystem's position rather than an accident: `neo/CMakeLists.txt`
+fails with a message naming this work rather than configuring a target that
+cannot link. `neo/sys/win32/` is kept in the tree for it. What step 5 leaves it,
+in short:
+
+- **`ID_ALLOW_TOOLS` is defined nowhere in this buildsystem** — not in any
+  `CMakeLists.txt`, not in `neo/config.h.in`. It guards nine blocks of
+  `win_main.cpp`, including all seventeen `qwgl*` pointers and
+  `Win_ChoosePixelFormat`, so `Win32Vars_t` is `hWnd`, `hInstance`, `osversion`
+  and three cvars. All of that is dead code today and simply deletes; it is not
+  entanglement to be untangled.
+- **Two files move over untouched**: `win_shared.cpp` (5 functions) and
+  `win_net.cpp` (30 — the exact analogue of `posix_net.cpp`). So does the
+  Windows clipboard, which is plain `OpenClipboard`/`GlobalLock` and never was
+  SDL's; it is `posix_main.cpp`'s that step 5 had to rewrite.
+- **The real work is the asymmetry.** `DOOMController.mm` → `Platform.mm` moved
+  only six functions, because `posix_main.cpp` already owned the whole
+  `Sys_Printf` / `Sys_Error` / DLL / time / clipboard / memory family in a
+  window-system-free file — 33 functions. Windows has no equivalent file:
+  `win_main.cpp` is 1,589 lines defining 33 live entry points behind `WinMain`
+  and a second `while(1) common->Frame()`, and lifting the path / DLL / time /
+  output family out from under them is the job. `Sys_VPrintf` has no Windows
+  definition at all and has to be written; `Sys_Error` is the one function that
+  has to be rewritten rather than moved, because its body is console calls, a
+  `GLimp_Shutdown` and a `GetMessage` pump; and `win_syscon.cpp`'s three console
+  entry points need replacements, with `posix_main.cpp`'s no-op `Sys_ShowConsole`
+  as the precedent.
+- **One collision to know about before starting**: `Sys_InitScanTable` is
+  defined unguarded in `win_input.cpp` and unguarded again in
+  `sys/eacp/Input.cpp`. A Windows eacp target that compiled both gets a
+  duplicate symbol.
+
+**An ImGui backend for the eacp host**, which is what would light the F10
+settings menu back up. §7 says what step 5 decided and why the menu was kept
+rather than deleted; the work is a platform backend and a renderer backend
+against `idRenderBackendEacp`, neither of which ImGui ships.
+
+**Soft particles**, behind gap 24. Unchanged by step 5 and still the one piece
+of the port that will have to be verified by looking at it rather than by the
+gate.
 
 **Why 4e.8 went before step 5 rather than after it, in one number.** At the
 tour's second camera stop the two builds disagreed by 0.458 of 255, and the heat
