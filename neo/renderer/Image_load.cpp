@@ -107,78 +107,6 @@ int idImage::BitsForInternalFormat( int internalFormat ) const {
 	return 0;
 }
 
-/*
-==================
-UploadCompressedNormalMap
-
-Create a 256 color palette to be used by compressed normal maps
-==================
-*/
-void idImage::UploadCompressedNormalMap( int width, int height, const byte *rgba, int mipLevel ) {
-	byte	*normals;
-	const byte	*in;
-	byte	*out;
-	int		i, j;
-	int		x, y, z;
-	int		row;
-
-	// OpenGL's pixel packing rule
-	row = width < 4 ? 4 : width;
-
-	normals = (byte *)_alloca( row * height );
-	if ( !normals ) {
-		common->Error( "R_UploadCompressedNormalMap: _alloca failed" );
-	}
-
-	in = rgba;
-	out = normals;
-	for ( i = 0 ; i < height ; i++, out += row, in += width * 4 ) {
-		for ( j = 0 ; j < width ; j++ ) {
-			x = in[ j * 4 + 0 ];
-			y = in[ j * 4 + 1 ];
-			z = in[ j * 4 + 2 ];
-
-			int c;
-			if ( x == 128 && y == 128 && z == 128 ) {
-				// the "nullnormal" color
-				c = 255;
-			} else {
-				c = ( globalImages->originalToCompressed[x] << 4 ) | globalImages->originalToCompressed[y];
-				if ( c == 255 ) {
-					c = 254;	// don't use the nullnormal color
-				}
-			}
-			out[j] = c;
-		}
-	}
-
-	if ( mipLevel == 0 ) {
-		// Optionally write out the paletized normal map to a .tga
-		if ( globalImages->image_writeNormalTGAPalletized.GetBool() ) {
-			char filename[MAX_IMAGE_NAME];
-			ImageProgramStringToCompressedFileName( imgName, filename );
-			char *ext = strrchr(filename, '.');
-			if ( ext ) {
-				strcpy(ext, "_pal.tga");
-				R_WritePalTGA( filename, normals, globalImages->compressedPalette, width, height);
-			}
-		}
-	}
-
-	if ( glConfig.sharedTexturePaletteAvailable ) {
-		qglTexImage2D( GL_TEXTURE_2D,
-					mipLevel,
-					GL_COLOR_INDEX8_EXT,
-					width,
-					height,
-					0,
-					GL_COLOR_INDEX,
-					GL_UNSIGNED_BYTE,
-					normals );
-	}
-}
-
-
 //=======================================================================
 
 
@@ -208,7 +136,7 @@ SelectInternalFormat
 This may need to scan six cube map images
 ===============
 */
-GLenum idImage::SelectInternalFormat( const byte **dataPtrs, int numDataPtrs, int width, int height,
+int idImage::SelectInternalFormat( const byte **dataPtrs, int numDataPtrs, int width, int height,
 									 textureDepth_t minimumDepth ) const {
 	int		i, c;
 	const byte	*scan;
@@ -267,11 +195,12 @@ GLenum idImage::SelectInternalFormat( const byte **dataPtrs, int numDataPtrs, in
 
 	// catch normal maps first
 	if ( minimumDepth == TD_BUMP ) {
-		// DG: put the glConfig.sharedTexturePaletteAvailable check first because nowadays it's usually false
-		if ( glConfig.sharedTexturePaletteAvailable && globalImages->image_useCompression.GetBool() && globalImages->image_useNormalCompression.GetInteger() == 1 ) {
-			// image_useNormalCompression should only be set to 1 on nv_10 and nv_20 paths
-			return GL_COLOR_INDEX8_EXT;
-		} else if ( globalImages->image_useCompression.GetBool() && globalImages->image_useNormalCompression.GetInteger() && glConfig.textureCompressionAvailable ) {
+		// image_useNormalCompression 1 used to mean GL_COLOR_INDEX8_EXT here, a
+		// palettised normal map for the nv_10 and nv_20 paths through
+		// GL_EXT_shared_texture_palette. That extension has been gone from
+		// hardware for twenty years and step 5 deleted the path with it, so 1
+		// and 2 now mean the same thing.
+		if ( globalImages->image_useCompression.GetBool() && globalImages->image_useNormalCompression.GetInteger() && glConfig.textureCompressionAvailable ) {
 			if ( useBC7compression ) {
 				return GL_COMPRESSED_RGBA_BPTC_UNORM;
 			} else {
@@ -618,19 +547,7 @@ void idImage::GenerateImage( const byte *pic, int width, int height,
 	Bind();
 
 
-	if ( internalFormat == GL_COLOR_INDEX8_EXT ) {
-		/*
-		if ( depth == TD_BUMP ) {
-			for ( int i = 0; i < scaled_width * scaled_height * 4; i += 4 ) {
-				scaledBuffer[ i ] = scaledBuffer[ i + 3 ];
-				scaledBuffer[ i + 3 ] = 0;
-			}
-		}
-		*/
-		UploadCompressedNormalMap( scaled_width, scaled_height, scaledBuffer, 0 );
-	} else {
-		renderBackend->UploadImageLevel( this, 0, 0, internalFormat, scaled_width, scaled_height, GL_RGBA, scaledBuffer );
-	}
+	renderBackend->UploadImageLevel( this, 0, 0, internalFormat, scaled_width, scaled_height, GL_RGBA, scaledBuffer );
 
 	// create and upload the mip map levels, which we do in all cases, even if we don't think they are needed
 	int		miplevel;
@@ -661,12 +578,8 @@ void idImage::GenerateImage( const byte *pic, int width, int height,
 		}
 
 		// upload the mip map
-		if ( internalFormat == GL_COLOR_INDEX8_EXT ) {
-			UploadCompressedNormalMap( scaled_width, scaled_height, scaledBuffer, miplevel );
-		} else {
-			renderBackend->UploadImageLevel( this, 0, miplevel, internalFormat, scaled_width, scaled_height,
-				GL_RGBA, scaledBuffer );
-		}
+		renderBackend->UploadImageLevel( this, 0, miplevel, internalFormat, scaled_width, scaled_height,
+			GL_RGBA, scaledBuffer );
 	}
 
 	if ( scaledBuffer != 0 ) {
@@ -674,140 +587,6 @@ void idImage::GenerateImage( const byte *pic, int width, int height,
 	}
 
 	SetImageFilterAndRepeat();
-
-	// see if we messed anything up
-	GL_CheckErrors();
-}
-
-
-/*
-==================
-Generate3DImage
-==================
-*/
-void idImage::Generate3DImage( const byte *pic, int width, int height, int picDepth,
-					   textureFilter_t filterParm, bool allowDownSizeParm,
-					   textureRepeat_t repeatParm, textureDepth_t minDepthParm ) {
-	int			scaled_width, scaled_height, scaled_depth;
-
-	PurgeImage();
-
-	filter = filterParm;
-	allowDownSize = allowDownSizeParm;
-	repeat = repeatParm;
-	depth = minDepthParm;
-
-	// if we don't have a rendering context, just return after we
-	// have filled in the parms.  We must have the values set, or
-	// an image match from a shader before OpenGL starts would miss
-	// the generated texture
-	if ( !glConfig.isInitialized ) {
-		return;
-	}
-
-	// make sure it is a power of 2
-	scaled_width = MakePowerOfTwo( width );
-	scaled_height = MakePowerOfTwo( height );
-	scaled_depth = MakePowerOfTwo( picDepth );
-	if ( scaled_width != width || scaled_height != height || scaled_depth != picDepth ) {
-		common->Error( "R_Create3DImage: not a power of 2 image" );
-	}
-
-	// FIXME: allow picmip here
-
-	// generate the texture number
-	qglGenTextures( 1, &texnum );
-
-	// select proper internal format before we resample
-	// this function doesn't need to know it is 3D, so just make it very "tall"
-	internalFormat = SelectInternalFormat( &pic, 1, width, height * picDepth, minDepthParm );
-
-	uploadHeight = scaled_height;
-	uploadWidth = scaled_width;
-	uploadDepth = scaled_depth;
-
-
-	type = TT_3D;
-
-	// upload the main image level
-	Bind();
-
-	qglTexImage3D(GL_TEXTURE_3D, 0, internalFormat, scaled_width, scaled_height, scaled_depth,
-		0, GL_RGBA, GL_UNSIGNED_BYTE, pic );
-
-	// create and upload the mip map levels
-	int		miplevel;
-	byte	*scaledBuffer, *shrunk;
-
-	scaledBuffer = (byte *)R_StaticAlloc( scaled_width * scaled_height * scaled_depth * 4 );
-	memcpy( scaledBuffer, pic, scaled_width * scaled_height * scaled_depth * 4 );
-	miplevel = 0;
-	while ( scaled_width > 1 || scaled_height > 1 || scaled_depth > 1 ) {
-		// preserve the border after mip map unless repeating
-		shrunk = R_MipMap3D( scaledBuffer, scaled_width, scaled_height, scaled_depth,
-			(bool)(repeat != TR_REPEAT) );
-		R_StaticFree( scaledBuffer );
-		scaledBuffer = shrunk;
-
-		scaled_width >>= 1;
-		scaled_height >>= 1;
-		scaled_depth >>= 1;
-		if ( scaled_width < 1 ) {
-			scaled_width = 1;
-		}
-		if ( scaled_height < 1 ) {
-			scaled_height = 1;
-		}
-		if ( scaled_depth < 1 ) {
-			scaled_depth = 1;
-		}
-		miplevel++;
-
-		// upload the mip map
-		qglTexImage3D(GL_TEXTURE_3D, miplevel, internalFormat, scaled_width, scaled_height, scaled_depth,
-			0, GL_RGBA, GL_UNSIGNED_BYTE, scaledBuffer );
-	}
-	R_StaticFree( scaledBuffer );
-
-	// set the minimize / maximize filtering
-	switch( filter ) {
-	case TF_DEFAULT:
-		qglTexParameterf(GL_TEXTURE_3D, GL_TEXTURE_MIN_FILTER, globalImages->textureMinFilter );
-		qglTexParameterf(GL_TEXTURE_3D, GL_TEXTURE_MAG_FILTER, globalImages->textureMaxFilter );
-		break;
-	case TF_LINEAR:
-		qglTexParameterf(GL_TEXTURE_3D, GL_TEXTURE_MIN_FILTER, GL_LINEAR );
-		qglTexParameterf(GL_TEXTURE_3D, GL_TEXTURE_MAG_FILTER, GL_LINEAR );
-		break;
-	case TF_NEAREST:
-		qglTexParameterf(GL_TEXTURE_3D, GL_TEXTURE_MIN_FILTER, GL_NEAREST );
-		qglTexParameterf(GL_TEXTURE_3D, GL_TEXTURE_MAG_FILTER, GL_NEAREST );
-		break;
-	default:
-		common->FatalError( "R_CreateImage: bad texture filter" );
-	}
-
-	// set the wrap/clamp modes
-	switch( repeat ) {
-	case TR_REPEAT:
-		qglTexParameterf( GL_TEXTURE_3D, GL_TEXTURE_WRAP_S, GL_REPEAT );
-		qglTexParameterf( GL_TEXTURE_3D, GL_TEXTURE_WRAP_T, GL_REPEAT );
-		qglTexParameterf( GL_TEXTURE_3D, GL_TEXTURE_WRAP_R, GL_REPEAT );
-		break;
-	case TR_CLAMP_TO_BORDER:
-		qglTexParameterf( GL_TEXTURE_3D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_BORDER );
-		qglTexParameterf( GL_TEXTURE_3D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_BORDER );
-		break;
-	case TR_CLAMP_TO_ZERO:
-	case TR_CLAMP_TO_ZERO_ALPHA:
-	case TR_CLAMP:
-		qglTexParameterf( GL_TEXTURE_3D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE );
-		qglTexParameterf( GL_TEXTURE_3D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE );
-		qglTexParameterf( GL_TEXTURE_3D, GL_TEXTURE_WRAP_R, GL_CLAMP_TO_EDGE );
-		break;
-	default:
-		common->FatalError( "R_CreateImage: bad texture repeat" );
-	}
 
 	// see if we messed anything up
 	GL_CheckErrors();
@@ -1118,9 +897,9 @@ bool idImage::CheckPrecompressedImage( bool fullLoad ) {
 		return false;
 	}
 
-	// if we don't support color index textures, we must load the full image
-	// should we just expand the 256 color image to 32 bit for upload?
-	if ( (ddspf_dwFlags & DDSF_ID_INDEXCOLOR) && !glConfig.sharedTexturePaletteAvailable ) {
+	// A paletted .dds needed GL_EXT_shared_texture_palette, which went with the
+	// rest of the palettised path in step 5. Load the full image instead.
+	if ( ddspf_dwFlags & DDSF_ID_INDEXCOLOR ) {
 		R_StaticFree( data );
 		return false;
 	}

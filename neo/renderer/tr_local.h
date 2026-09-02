@@ -489,7 +489,7 @@ typedef struct {
 
 typedef struct {
 	renderCommand_t		commandId, *next;
-	GLenum	buffer;
+	int		buffer;			// GL_BACK, the only one left; see GLFormats.h
 	int		frameCount;
 } setBufferCommand_t;
 
@@ -787,7 +787,6 @@ public:
 	viewDef_t				lockSurfacesRealViewDef; // of actual player position
 
 	viewEntity_t			identitySpace;		// can use if we don't know viewDef->worldSpace is valid
-	int						stencilIncr, stencilDecr;	// GL_INCR / INCR_WRAP_EXT, GL_DECR / GL_DECR_EXT
 
 	renderCrop_t			renderCrops[MAX_RENDER_CROPS];
 	int						currentRenderCrop;
@@ -871,8 +870,6 @@ extern idCVar r_useInfiniteFarZ;		// 1 = use the no-far-clip-plane trick
 extern idCVar r_useScissor;				// 1 = scissor clip as portals and lights are processed
 extern idCVar r_usePortals;				// 1 = use portals to perform area culling, otherwise draw everything
 extern idCVar r_useCombinerDisplayLists;// if 1, put all nvidia register combiner programming in display lists
-extern idCVar r_useVertexBuffers;		// if 0, don't use ARB_vertex_buffer_object for vertexes
-extern idCVar r_useIndexBuffers;		// if 0, don't use ARB_vertex_buffer_object for indexes
 extern idCVar r_useEntityCallbacks;		// if 0, issue the callback immediately at update time, rather than defering
 extern idCVar r_lightAllBackFaces;		// light all the back faces, even when they would be shadowed
 extern idCVar r_useDepthBoundsTest;     // use depth bounds test to reduce shadow fill
@@ -1049,8 +1046,6 @@ void R_DoneFreeType( void );
 void R_SetColorMappings( void );
 
 void R_ScreenShot_f( const idCmdArgs &args );
-
-bool R_CheckExtension( const char *name );
 
 
 /*
@@ -1272,101 +1267,6 @@ void RB_DetermineLightScale( void );
 void RB_DrawElementsWithCounters( const srfTriangles_t *tri );
 void RB_DrawShadowElementsWithCounters( const srfTriangles_t *tri, int numIndexes );
 void RB_BindVariableStageImage( const textureStage_t *texture, const float *shaderRegisters );
-
-/*
-============================================================
-
-DRAW_*
-
-============================================================
-*/
-
-void	R_CheckPortableExtensions( void );
-
-typedef enum {
-	PROG_INVALID,
-	VPROG_INTERACTION,
-	VPROG_ENVIRONMENT,
-	VPROG_BUMPY_ENVIRONMENT,
-	VPROG_STENCIL_SHADOW,
-	VPROG_TEST,
-	FPROG_INTERACTION,
-	FPROG_ENVIRONMENT,
-	FPROG_BUMPY_ENVIRONMENT,
-	FPROG_TEST,
-	VPROG_AMBIENT,
-	FPROG_AMBIENT,
-	VPROG_GLASSWARP,
-	FPROG_GLASSWARP,
-	// SteveL #3878: soft particles
-	VPROG_SOFT_PARTICLE,
-	FPROG_SOFT_PARTICLE,
-	//
-	PROG_USER
-} program_t;
-
-/*
-
-  All vertex programs use the same constant register layout:
-
-c[4]	localLightOrigin
-c[5]	localViewOrigin
-c[6]	lightProjection S
-c[7]	lightProjection T
-c[8]	lightProjection Q
-c[9]	lightFalloff	S
-c[10]	bumpMatrix S
-c[11]	bumpMatrix T
-c[12]	diffuseMatrix S
-c[13]	diffuseMatrix T
-c[14]	specularMatrix S
-c[15]	specularMatrix T
-
-
-c[20]	light falloff tq constant
-
-// texture 0 was cube map
-// texture 1 will be the per-surface bump map
-// texture 2 will be the light falloff texture
-// texture 3 will be the light projection texture
-// texture 4 is the per-surface diffuse map
-// texture 5 is the per-surface specular map
-// texture 6 is the specular half angle cube map
-
-*/
-
-typedef enum {
-	PP_LIGHT_ORIGIN = 4,
-	PP_VIEW_ORIGIN,
-	PP_LIGHT_PROJECT_S,
-	PP_LIGHT_PROJECT_T,
-	PP_LIGHT_PROJECT_Q,
-	PP_LIGHT_FALLOFF_S,
-	PP_BUMP_MATRIX_S,
-	PP_BUMP_MATRIX_T,
-	PP_DIFFUSE_MATRIX_S,
-	PP_DIFFUSE_MATRIX_T,
-	PP_SPECULAR_MATRIX_S,
-	PP_SPECULAR_MATRIX_T,
-	PP_COLOR_MODULATE,
-	PP_COLOR_ADD, // 17
-
-	PP_LIGHT_FALLOFF_TQ = 20,	// only for NV programs - DG: unused
-	PP_GAMMA_BRIGHTNESS = 21, // DG: for gamma in shader: { r_brightness, r_brightness, r_brightness, 1/r_gamma }
-	// DG: for soft particles from TDM: reciprocal of _currentDepth size.
-	//     Lets us convert a screen position to a texcoord in _currentDepth
-	PP_CURDEPTH_RECIPR  = 22,
-	// DG: for soft particles from TDM: particle radius, given as { radius, 1/(fadeRange), 1/radius }
-	//     fadeRange is the particle diameter for alpha blends (like smoke), but the particle radius for additive
-	//     blends (light glares), because additive effects work differently. Fog is half as apparent when a wall
-	//     is in the middle of it. Light glares lose no visibility when they have something to reflect off.
-	PP_PARTICLE_RADIUS  = 23,
-	// DG: for soft particles from TDM: color channel mask.
-	//     Particles with additive blend need their RGB channels modifying to blend them out
-	//     Particles with an alpha blend need their alpha channel modifying.
-	PP_PARTICLE_COLCHAN_MASK = 24,
-} programParameter_t;
-
 
 /*
 ============================================================

@@ -406,7 +406,6 @@ add_globbed_headers(src_cm "cm")
 set(src_dmap
 	tools/compilers/dmap/dmap.cpp
 	tools/compilers/dmap/facebsp.cpp
-	tools/compilers/dmap/gldraw.cpp
 	tools/compilers/dmap/glfile.cpp
 	tools/compilers/dmap/leakfile.cpp
 	tools/compilers/dmap/map.cpp
@@ -807,11 +806,12 @@ if(CORE)
 	target_include_directories(dhewm3 PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/libs/imgui")
 	target_link_libraries(dhewm3 PRIVATE idlib eacp-gpu OpenAL::OpenAL "-framework Cocoa")
 
-	# SDL is still linked, and it is not the platform layer any more: what is
-	# left of it is renderer/qgl.h reaching for SDL_opengl.h's GL types, idlib's
-	# endian macros, Dear ImGui's SDL backend, the script debugger's mutexes,
-	# and a handful of odds and ends in cpu.cpp, posix_main.cpp and Common.cpp.
-	# The rest of step 5 takes them; none of them opens a window.
+	# SDL is still linked, and it is not the platform layer any more. Deleting
+	# qgl.h took the biggest of its remaining reasons - SDL_opengl.h was where
+	# the GL types came from. What is left is idlib's endian macros, the script
+	# debugger's mutexes, and a handful of odds and ends in cpu.cpp,
+	# posix_main.cpp and Common.cpp. The rest of step 5 takes them; none of them
+	# opens a window.
 	target_link_libraries(dhewm3 PRIVATE SDL3::SDL3)
 
 	if(CURL_FOUND)

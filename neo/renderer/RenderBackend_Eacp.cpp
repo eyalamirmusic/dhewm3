@@ -731,13 +731,11 @@ void idRenderBackendEacp::Init( void ) {
 	glConfig.textureEnvCombineAvailable = false;
 	glConfig.registerCombinersAvailable = false;
 	glConfig.envDot3Available = false;
-	glConfig.sharedTexturePaletteAvailable = false;
 
 	// The ARB programs, which this backend does not run and R_ARB2_Init is
 	// never called to look for.
 	glConfig.ARBVertexProgramAvailable = false;
 	glConfig.ARBFragmentProgramAvailable = false;
-	glConfig.allowARB2Path = false;
 
 	// idVertexCache keeps its blocks in system memory when this is false, and
 	// hands out plain pointers rather than buffer offsets. That is the shape
@@ -3991,7 +3989,10 @@ void idRenderBackendEacp::DrawIndexed( const srfTriangles_t *tri, int numIndexes
 	// The index cache holds system memory here for the same reason the vertex
 	// cache does - this backend generates no buffer objects - so both branches
 	// end in a real pointer and the difference is only where it came from.
-	const glIndex_t *	indexes = ( tri->indexCache && r_useIndexBuffers.GetBool() )
+	// Nothing fills indexCache in since step 5 deleted r_useIndexBuffers, whose
+	// whole purpose was to put indexes in an ARB_vertex_buffer_object; the
+	// branch stays because it is what an eacp index buffer would slot into.
+	const glIndex_t *	indexes = tri->indexCache
 		? (const glIndex_t *)vertexCache.Position( tri->indexCache )
 		: tri->indexes;
 
@@ -4063,7 +4064,7 @@ here even though it names nothing on this backend.
 ====================
 */
 void idRenderBackendEacp::AllocImage( idImage *image ) {
-	static GLuint	nextName = 1;
+	static unsigned int	nextName = 1;
 
 	image->texnum = nextName++;
 	image->backendTexture = NULL;

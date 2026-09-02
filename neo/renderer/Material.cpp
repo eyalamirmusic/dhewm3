@@ -1082,7 +1082,7 @@ decides whether a stage *is* a newStage is the program's name beside these,
 which the parser records and the backend reads.
 =================
 */
-static int R_FindARBProgram( GLenum target, const char *program ) {
+static int R_FindARBProgram( int target, const char *program ) {
 	return 0;
 }
 

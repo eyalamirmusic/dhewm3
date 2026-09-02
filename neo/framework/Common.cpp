@@ -2318,27 +2318,6 @@ void Com_LocalizeMapsTest_f( const idCmdArgs &args ) {
 }
 
 /*
-=================
-Com_StartBuild_f
-=================
-*/
-void Com_StartBuild_f( const idCmdArgs &args ) {
-	globalImages->StartBuild();
-}
-
-/*
-=================
-Com_FinishBuild_f
-=================
-*/
-void Com_FinishBuild_f( const idCmdArgs &args ) {
-	if ( game ) {
-		game->CacheDictionaryMedia( NULL );
-	}
-	globalImages->FinishBuild( ( args.Argc() > 1 ) );
-}
-
-/*
 ==============
 Com_Help_f
 ==============
@@ -2430,8 +2409,6 @@ void idCommonLocal::InitCommands( void ) {
 	cmdSystem->AddCommand( "localizeMapsTest", Com_LocalizeMapsTest_f, CMD_FL_SYSTEM, "Create test files that shows which strings will be localized." );
 
 	// build helpers
-	cmdSystem->AddCommand( "startBuild", Com_StartBuild_f, CMD_FL_SYSTEM|CMD_FL_CHEAT, "prepares to make a build" );
-	cmdSystem->AddCommand( "finishBuild", Com_FinishBuild_f, CMD_FL_SYSTEM|CMD_FL_CHEAT, "finishes the build process" );
 
 #ifdef ID_DEDICATED
 	cmdSystem->AddCommand( "help", Com_Help_f, CMD_FL_SYSTEM, "shows help" );

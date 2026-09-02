@@ -70,13 +70,7 @@ void idVertexCache::ActuallyFree( vertCache_t *block ) {
 		staticAllocTotal -= block->size;
 		staticCountTotal--;
 
-		if ( block->vbo ) {
-#if 0		// this isn't really necessary, it will be reused soon enough
-			// filling with zero length data is the equivalent of freeing
-			qglBindBufferARB(GL_ARRAY_BUFFER_ARB, block->vbo);
-			qglBufferDataARB(GL_ARRAY_BUFFER_ARB, 0, 0, GL_DYNAMIC_DRAW_ARB);
-#endif
-		} else if ( block->virtMem ) {
+		if ( block->virtMem ) {
 			Mem_Free( block->virtMem );
 			block->virtMem = NULL;
 		}
@@ -105,11 +99,9 @@ void idVertexCache::ActuallyFree( vertCache_t *block ) {
 ==============
 idVertexCache::Position
 
-this will be a real pointer with virtual memory,
-but it will be an int offset cast to a pointer with
-ARB_vertex_buffer_object
-
-The ARB_vertex_buffer_object will be bound
+A real pointer. It used to be an offset into an ARB_vertex_buffer_object when
+the cache had one, and the caller could not tell the two apart - which is why
+the return type is void* and every caller casts it.
 ==============
 */
 void *idVertexCache::Position( vertCache_t *buffer ) {
@@ -117,29 +109,7 @@ void *idVertexCache::Position( vertCache_t *buffer ) {
 		common->FatalError( "idVertexCache::Position: bad vertCache_t" );
 	}
 
-	// the ARB vertex object just uses an offset
-	if ( buffer->vbo ) {
-		if ( r_showVertexCache.GetInteger() == 2 ) {
-			if ( buffer->tag == TAG_TEMP ) {
-				common->Printf( "GL_ARRAY_BUFFER_ARB = %i + %zd (%i bytes)\n", buffer->vbo, buffer->offset, buffer->size );
-			} else {
-				common->Printf( "GL_ARRAY_BUFFER_ARB = %i (%i bytes)\n", buffer->vbo, buffer->size );
-			}
-		}
-		if ( buffer->indexBuffer ) {
-			qglBindBufferARB( GL_ELEMENT_ARRAY_BUFFER_ARB, buffer->vbo );
-		} else {
-			qglBindBufferARB( GL_ARRAY_BUFFER_ARB, buffer->vbo );
-		}
-		return (void *)buffer->offset;
-	}
-
-	// virtual memory is a real pointer
 	return (void *)((byte *)buffer->virtMem + buffer->offset);
-}
-
-void idVertexCache::UnbindIndex() {
-	qglBindBufferARB( GL_ELEMENT_ARRAY_BUFFER_ARB, 0 );
 }
 
 
@@ -157,17 +127,6 @@ void idVertexCache::Init() {
 		r_vertexBufferMegs.SetInteger( 8 );
 	}
 
-	virtualMemory = false;
-
-	// use ARB_vertex_buffer_object unless explicitly disabled
-	if( r_useVertexBuffers.GetInteger() && glConfig.ARBVertexBufferObjectAvailable ) {
-		common->Printf( "using ARB_vertex_buffer_object memory\n" );
-	} else {
-		virtualMemory = true;
-		r_useIndexBuffers.SetBool( false );
-		common->Printf( "WARNING: vertex array range in virtual memory (SLOW)\n" );
-	}
-
 	// initialize the cache memory blocks
 	freeStaticHeaders.next = freeStaticHeaders.prev = &freeStaticHeaders;
 	staticHeaders.next = staticHeaders.prev = &staticHeaders;
@@ -181,9 +140,7 @@ void idVertexCache::Init() {
 
 	byte	*junk = (byte *)Mem_Alloc( frameBytes );
 	for ( int i = 0 ; i < NUM_VERTEX_FRAMES ; i++ ) {
-		allocatingTempBuffer = true;	// force the alloc to use GL_STREAM_DRAW_ARB
 		Alloc( junk, frameBytes, &tempBuffers[i] );
-		allocatingTempBuffer = false;
 		tempBuffers[i]->tag = TAG_FIXED;
 		// unlink these from the static list, so they won't ever get purged
 		tempBuffers[i]->next->prev = tempBuffers[i]->prev;
@@ -244,19 +201,9 @@ void idVertexCache::Alloc( void *data, int size, vertCache_t **buffer, bool inde
 			block->next->prev = block;
 			block->prev->next = block;
 
-			// idBlockAlloc hands back raw memory, and "only one of vbo /
-			// virtMem will be set" is what every reader of these two fields
-			// assumes - so both have to start as neither. In the buffer-object
-			// path qglGenBuffersARB writes vbo immediately and the bug never
-			// shows; with r_useVertexBuffers 0, or on a backend that has no
-			// buffer objects to generate, vbo keeps whatever was in that heap
-			// block and Alloc below takes the GL branch on garbage.
-			block->vbo = 0;
+			// idBlockAlloc hands back raw memory, so virtMem has to start NULL
+			// rather than as whatever was in that heap block.
 			block->virtMem = NULL;
-
-			if( !virtualMemory ) {
-				qglGenBuffersARB( 1, & block->vbo );
-			}
 		}
 	}
 
@@ -291,22 +238,8 @@ void idVertexCache::Alloc( void *data, int size, vertCache_t **buffer, bool inde
 	block->indexBuffer = indexBuffer;
 
 	// copy the data
-	if ( block->vbo ) {
-		if ( indexBuffer ) {
-			qglBindBufferARB( GL_ELEMENT_ARRAY_BUFFER_ARB, block->vbo );
-			qglBufferDataARB( GL_ELEMENT_ARRAY_BUFFER_ARB, (GLsizeiptrARB)size, data, GL_STATIC_DRAW_ARB );
-		} else {
-			qglBindBufferARB( GL_ARRAY_BUFFER_ARB, block->vbo );
-			if ( allocatingTempBuffer ) {
-				qglBufferDataARB( GL_ARRAY_BUFFER_ARB, (GLsizeiptrARB)size, data, GL_STREAM_DRAW_ARB );
-			} else {
-				qglBufferDataARB( GL_ARRAY_BUFFER_ARB, (GLsizeiptrARB)size, data, GL_STATIC_DRAW_ARB );
-			}
-		}
-	} else {
-		block->virtMem = Mem_Alloc( size );
-		SIMDProcessor->Memcpy( block->virtMem, data, size );
-	}
+	block->virtMem = Mem_Alloc( size );
+	SIMDProcessor->Memcpy( block->virtMem, data, size );
 }
 
 /*
@@ -427,14 +360,7 @@ vertCache_t	*idVertexCache::AllocFrameTemp( void *data, int size ) {
 
 	// copy the data
 	block->virtMem = tempBuffers[listNum]->virtMem;
-	block->vbo = tempBuffers[listNum]->vbo;
-
-	if ( block->vbo ) {
-		qglBindBufferARB( GL_ARRAY_BUFFER_ARB, block->vbo );
-		qglBufferSubDataARB( GL_ARRAY_BUFFER_ARB, block->offset, (GLsizeiptrARB)size, data );
-	} else {
-		SIMDProcessor->Memcpy( (byte *)block->virtMem + block->offset, data, size );
-	}
+	SIMDProcessor->Memcpy( (byte *)block->virtMem + block->offset, data, size );
 
 	return block;
 }
@@ -473,14 +399,6 @@ void idVertexCache::EndFrame() {
 
 	}
 #endif
-
-	if( !virtualMemory ) {
-		// unbind vertex buffers so normal virtual memory will be used in case
-		// r_useVertexBuffers / r_useIndexBuffers
-		qglBindBufferARB( GL_ARRAY_BUFFER_ARB, 0 );
-		qglBindBufferARB( GL_ELEMENT_ARRAY_BUFFER_ARB, 0 );
-	}
-
 
 	currentFrame = tr.frameCount;
 	listNum = currentFrame % NUM_VERTEX_FRAMES;
@@ -543,29 +461,4 @@ void idVertexCache::List( void ) {
 	common->Printf( "%5i free static headers\n", numFreeStaticHeaders );
 	common->Printf( "%5i free dynamic headers\n", numFreeDynamicHeaders );
 
-	if ( !virtualMemory  ) {
-		common->Printf( "Vertex cache is in ARB_vertex_buffer_object memory (FAST).\n");
-	} else {
-		common->Printf( "Vertex cache is in virtual memory (SLOW)\n" );
-	}
-
-	if ( r_useIndexBuffers.GetBool() ) {
-		common->Printf( "Index buffers are accelerated.\n" );
-	} else {
-		common->Printf( "Index buffers are not used.\n" );
-	}
-}
-
-/*
-=============
-idVertexCache::IsFast
-
-just for gfxinfo printing
-=============
-*/
-bool idVertexCache::IsFast() {
-	if ( virtualMemory ) {
-		return false;
-	}
-	return true;
 }

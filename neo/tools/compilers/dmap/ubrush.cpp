@@ -154,31 +154,6 @@ uBrush_t *CopyBrush (uBrush_t *brush)
 
 
 /*
-================
-DrawBrushList
-================
-*/
-void DrawBrushList (uBrush_t *brush)
-{
-	int		i;
-	side_t	*s;
-
-	GLS_BeginScene ();
-	for ( ; brush ; brush=brush->next)
-	{
-		for (i=0 ; i<brush->numsides ; i++)
-		{
-			s = &brush->sides[i];
-			if (!s->winding)
-				continue;
-			GLS_Winding (s->winding, 0);
-		}
-	}
-	GLS_EndScene ();
-}
-
-
-/*
 =============
 PrintBrush
 =============

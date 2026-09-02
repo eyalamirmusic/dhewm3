@@ -128,7 +128,6 @@
 // materials, sound shaders, and guis. We should unify them.
 
 // renderer
-#include "renderer/qgl.h"
 #include "renderer/Cinematic.h"
 #include "renderer/Material.h"
 #include "renderer/Model.h"

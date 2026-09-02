@@ -32,33 +32,20 @@ If you have questions concerning this license or the applicable additional terms
 #include "idlib/containers/List.h"
 #include "framework/FileSystem.h"
 #include "renderer/Material.h"
-#include "renderer/qgl.h"
+#include "renderer/GLFormats.h"
 
 /*
 ====================================================================
 
 IMAGE
 
-idImage have a one to one correspondance with OpenGL textures.
+idImage is a texture: the file it came from, the format it was decided into,
+the mip chain, the LRU that keeps it resident and the purge that does not.
 
-No texture is ever used that does not have a corresponding idImage.
-
-no code outside this unit should call any of these OpenGL functions:
-
-qglGenTextures
-qglDeleteTextures
-qglBindTexture
-
-qglTexParameter
-
-qglTexImage
-qglTexSubImage
-
-qglCopyTexImage
-qglCopyTexSubImage
-
-qglEnable( GL_TEXTURE_* )
-qglDisable( GL_TEXTURE_* )
+Nothing here talks to a graphics API. Every texture object is created,
+uploaded to, bound and destroyed through idRenderBackend - which is the whole
+of what Phase 1 put under this file. What idImage still owns is the decision,
+and it is written in GL_* format names; renderer/GLFormats.h says why.
 
 ====================================================================
 */
@@ -191,9 +178,6 @@ public:
 	void		GenerateImage( const byte *pic, int width, int height,
 					   textureFilter_t filter, bool allowDownSize,
 					   textureRepeat_t repeat, textureDepth_t depth );
-	void		Generate3DImage( const byte *pic, int width, int height, int depth,
-						textureFilter_t filter, bool allowDownSize,
-						textureRepeat_t repeat, textureDepth_t minDepth );
 	void		GenerateCubeImage( const byte *pic[6], int size,
 						textureFilter_t filter, bool allowDownSize,
 						textureDepth_t depth );
@@ -230,15 +214,14 @@ public:
 	void		ActuallyLoadImage( bool checkForPrecompressed, bool fromBackEnd );
 	void		StartBackgroundImageLoad();
 	int			BitsForInternalFormat( int internalFormat ) const;
-	void		UploadCompressedNormalMap( int width, int height, const byte *rgba, int mipLevel );
-	GLenum		SelectInternalFormat( const byte **dataPtrs, int numDataPtrs, int width, int height,
+	int			SelectInternalFormat( const byte **dataPtrs, int numDataPtrs, int width, int height,
 									 textureDepth_t minimumDepth ) const;
 	void		ImageProgramStringToCompressedFileName( const char *imageProg, char *fileName ) const;
 	int			NumLevelsForImageSize( int width, int height ) const;
 
 	// data commonly accessed is grouped here
 	static const int TEXTURE_NOT_LOADED = -1;
-	GLuint				texnum;					// gl texture binding, will be TEXTURE_NOT_LOADED if not loaded
+	unsigned int		texnum;					// the backend's name for this texture, TEXTURE_NOT_LOADED if not loaded
 	textureType_t		type;
 	int					frameUsed;				// for texture usage in frame statistics
 	int					bindCount;				// incremented each bind
@@ -322,7 +305,6 @@ ID_INLINE idImage::idImage() {
 // data is RGBA
 void	R_WriteTGA( const char *filename, const byte *data, int width, int height, bool flipVertical = false );
 // data is an 8 bit index into palette, which is RGB (no A)
-void	R_WritePalTGA( const char *filename, const byte *data, const byte *palette, int width, int height, bool flipVertical = false );
 // data is in top-to-bottom raster order unless flipVertical is set
 
 
@@ -381,11 +363,6 @@ public:
 	// Called only by renderSystem::EndLevelLoad
 	void				EndLevelLoad();
 
-	// used to clear and then write the dds conversion batch file
-	void				StartBuild();
-	void				FinishBuild( bool removeDups = false );
-	void				AddDDSCommand( const char *cmd );
-
 	void				PrintMemInfo( MemInfo_t *mi );
 
 	// cvars
@@ -399,10 +376,8 @@ public:
 	static idCVar		image_useAllFormats;		// allow alpha/intensity/luminance/luminance+alpha
 	static idCVar		image_usePrecompressedTextures;	// use .dds files if present
 	static idCVar		image_writeNormalTGA;		// debug tool to write out .tgas of the final normal maps
-	static idCVar		image_writeNormalTGAPalletized;		// debug tool to write out palletized versions of the final normal maps
 	static idCVar		image_writeTGA;				// debug tool to write out .tgas of the non normal maps
-	static idCVar		image_useNormalCompression;	// 1 = use 256 color compression for normal maps if available, 2 = use rxgb compression
-	static idCVar		image_useOffLineCompression; // will write a batch file with commands for the offline compression
+	static idCVar		image_useNormalCompression;	// 2 = use rxgb compression for normal maps
 	static idCVar		image_preload;				// if 0, dynamically load all images
 	static idCVar		image_cacheMinK;			// maximum K of precompressed files to read at specification time,
 													// the remainder will be dynamically cached
@@ -446,21 +421,15 @@ public:
 	//--------------------------------------------------------
 
 	idImage *			AllocImage( const char *name );
-	void				SetNormalPalette();
 	void				ChangeTextureFilter();
 
 	idList<idImage*>	images;
-	idStrList			ddsList;
-	idHashIndex			ddsHash;
 
 	bool				insideLevelLoad;			// don't actually load images now
 
-	byte				originalToCompressed[256];	// maps normal maps to 8 bit textures
-	byte				compressedPalette[768];		// the palette that normal maps use
-
 	// default filter modes for images
-	GLenum				textureMinFilter;
-	GLenum				textureMaxFilter;
+	int					textureMinFilter;
+	int					textureMaxFilter;
 	float				textureAnisotropy;
 	float				textureLODBias;
 

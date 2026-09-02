@@ -120,10 +120,6 @@ void GLimp_ActivateContext() {
 void GLimp_DeactivateContext() {
 }
 
-GLExtension_t GLimp_ExtensionPointer( const char *name ) {
-	return NULL;
-}
-
 // GLimp_GrabInput is in sys/eacp/Input.cpp, and it belongs there: it is the
 // input layer's, and the only reason it sat in sys/glimp.cpp in the SDL build
 // was that SDL's grab calls need the window handle that file owned. Here the

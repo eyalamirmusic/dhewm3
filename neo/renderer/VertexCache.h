@@ -27,7 +27,6 @@ If you have questions concerning this license or the applicable additional terms
 */
 
 #include "framework/CVarSystem.h"
-#include "renderer/qgl.h"
 
 // vertex cache calls should only be made by the front end
 
@@ -41,8 +40,8 @@ typedef enum {
 } vertBlockTag_t;
 
 typedef struct vertCache_s {
-	GLuint			vbo;
-	void			*virtMem;			// only one of vbo / virtMem will be set
+	void			*virtMem;			// the block itself; step 5 deleted the
+										// ARB_vertex_buffer_object alternative
 	bool			indexBuffer;		// holds indexes instead of vertexes
 
 	intptr_t		offset;
@@ -60,9 +59,6 @@ public:
 	void			Init();
 	void			Shutdown();
 
-	// just for gfxinfo printing
-	bool			IsFast();
-
 	// called when vertex programs are enabled or disabled, because
 	// the cached data is no longer valid
 	void			PurgeAll();
@@ -74,13 +70,9 @@ public:
 	// These allocations can be purged, which will zero the pointer.
 	void			Alloc( void *data, int bytes, vertCache_t **buffer, bool indexBuffer = false );
 
-	// This will be a real pointer with virtual memory,
-	// but it will be an int offset cast to a pointer of ARB_vertex_buffer_object
+	// A real pointer into the block. It used to be an offset cast to a pointer
+	// when the block lived in an ARB_vertex_buffer_object instead.
 	void *			Position( vertCache_t *buffer );
-
-	// if r_useIndexBuffers is enabled, but you need to draw something without
-	// an indexCache, this must be called to reset GL_ELEMENT_ARRAY_BUFFER_ARB
-	void			UnbindIndex();
 
 	// automatically freed at the end of the next frame
 	// used for specular texture coordinates and gui drawing, which
@@ -123,10 +115,6 @@ private:
 
 	int				currentFrame;			// for purgable block tracking
 	int				listNum;				// currentFrame % NUM_VERTEX_FRAMES, determines which tempBuffers to use
-
-	bool			virtualMemory;			// not fast stuff
-
-	bool			allocatingTempBuffer;	// force GL_STREAM_DRAW_ARB
 
 	vertCache_t		*tempBuffers[NUM_VERTEX_FRAMES];		// allocated at startup
 	bool			tempOverflow;			// had to alloc a temp in static memory

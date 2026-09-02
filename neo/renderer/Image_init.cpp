@@ -61,9 +61,7 @@ idCVar idImageManager::image_useNormalCompression( "image_useNormalCompression",
 idCVar idImageManager::image_usePrecompressedTextures( "image_usePrecompressedTextures", "1", CVAR_RENDERER | CVAR_ARCHIVE | CVAR_INTEGER,
 		"1 = use .dds files if present 2 = only use .dds files if they contain BPTC (BC7) textures (those have higher quality than S3TC/DXT) 0 = use uncompressed textures" );
 idCVar idImageManager::image_writeNormalTGA( "image_writeNormalTGA", "0", CVAR_RENDERER | CVAR_BOOL, "write .tgas of the final normal maps for debugging" );
-idCVar idImageManager::image_writeNormalTGAPalletized( "image_writeNormalTGAPalletized", "0", CVAR_RENDERER | CVAR_BOOL, "write .tgas of the final palletized normal maps for debugging" );
 idCVar idImageManager::image_writeTGA( "image_writeTGA", "0", CVAR_RENDERER | CVAR_BOOL, "write .tgas of the non normal maps for debugging" );
-idCVar idImageManager::image_useOffLineCompression( "image_useOfflineCompression", "0", CVAR_RENDERER | CVAR_BOOL, "write a batch file for offline compression of DDS files" );
 idCVar idImageManager::image_cacheMinK( "image_cacheMinK", "200", CVAR_RENDERER | CVAR_ARCHIVE | CVAR_INTEGER, "maximum KB of precompressed files to read at specification time" );
 idCVar idImageManager::image_cacheMegs( "image_cacheMegs", "20", CVAR_RENDERER | CVAR_ARCHIVE, "maximum MB set aside for temporary loading of full-sized precompressed images" );
 idCVar idImageManager::image_useCache( "image_useCache", "0", CVAR_RENDERER | CVAR_ARCHIVE | CVAR_BOOL, "1 = do background load image caching" );
@@ -681,7 +679,7 @@ static void makeNormalizeVectorCubeMap( idImage *image ) {
 
 	size = NORMAL_MAP_SIZE;
 
-	pixels[0] = (GLubyte*) Mem_Alloc(size*size*4*6);
+	pixels[0] = (byte *) Mem_Alloc(size*size*4*6);
 
 	for (i = 0; i < 6; i++) {
 		pixels[i] = pixels[0] + i*size*size*4;
@@ -1302,109 +1300,6 @@ void R_ListImages_f( const idCmdArgs &args ) {
 }
 
 /*
-==================
-SetNormalPalette
-
-Create a 256 color palette to be used by compressed normal maps
-==================
-*/
-void idImageManager::SetNormalPalette( void ) {
-	int		i, j;
-	idVec3	v;
-	float	t;
-	//byte temptable[768];
-	byte	*temptable = compressedPalette;
-	int		compressedToOriginal[16];
-
-	// make an ad-hoc separable compression mapping scheme
-	for ( i = 0 ; i < 8 ; i++ ) {
-		float	f, y;
-
-		f = ( i + 1 ) / 8.5;
-		y = idMath::Sqrt( 1.0 - f * f );
-		y = 1.0 - y;
-
-		compressedToOriginal[7-i] = 127 - (int)( y * 127 + 0.5 );
-		compressedToOriginal[8+i] = 128 + (int)( y * 127 + 0.5 );
-	}
-
-	for ( i = 0 ; i < 256 ; i++ ) {
-		if ( i <= compressedToOriginal[0] ) {
-			originalToCompressed[i] = 0;
-		} else if ( i >= compressedToOriginal[15] ) {
-			originalToCompressed[i] = 15;
-		} else {
-			for ( j = 0 ; j < 14 ; j++ ) {
-				if ( i <= compressedToOriginal[j+1] ) {
-					break;
-				}
-			}
-			if ( i - compressedToOriginal[j] < compressedToOriginal[j+1] - i ) {
-				originalToCompressed[i] = j;
-			} else {
-				originalToCompressed[i] = j + 1;
-			}
-		}
-	}
-
-#if 0
-	for ( i = 0; i < 16; i++ ) {
-		for ( j = 0 ; j < 16 ; j++ ) {
-
-			v[0] = ( i - 7.5 ) / 8;
-			v[1] = ( j - 7.5 ) / 8;
-
-			t = 1.0 - ( v[0]*v[0] + v[1]*v[1] );
-			if ( t < 0 ) {
-				t = 0;
-			}
-			v[2] = idMath::Sqrt( t );
-
-			temptable[(i*16+j)*3+0] = 128 + floor( 127 * v[0] + 0.5 );
-			temptable[(i*16+j)*3+1] = 128 + floor( 127 * v[1] );
-			temptable[(i*16+j)*3+2] = 128 + floor( 127 * v[2] );
-		}
-	}
-#else
-	for ( i = 0; i < 16; i++ ) {
-		for ( j = 0 ; j < 16 ; j++ ) {
-
-			v[0] = ( compressedToOriginal[i] - 127.5 ) / 128;
-			v[1] = ( compressedToOriginal[j] - 127.5 ) / 128;
-
-			t = 1.0 - ( v[0]*v[0] + v[1]*v[1] );
-			if ( t < 0 ) {
-				t = 0;
-			}
-			v[2] = idMath::Sqrt( t );
-
-			temptable[(i*16+j)*3+0] = (byte)(128 + floor( 127 * v[0] + 0.5 ));
-			temptable[(i*16+j)*3+1] = (byte)(128 + floor( 127 * v[1] ));
-			temptable[(i*16+j)*3+2] = (byte)(128 + floor( 127 * v[2] ));
-		}
-	}
-#endif
-
-	// color 255 will be the "nullnormal" color for no reflection
-	temptable[255*3+0] =
-	temptable[255*3+1] =
-	temptable[255*3+2] = 128;
-
-	if ( !glConfig.sharedTexturePaletteAvailable ) {
-		return;
-	}
-
-	qglColorTableEXT( GL_SHARED_TEXTURE_PALETTE_EXT,
-					   GL_RGB,
-					   256,
-					   GL_RGB,
-					   GL_UNSIGNED_BYTE,
-					   temptable );
-
-	qglEnable( GL_SHARED_TEXTURE_PALETTE_EXT );
-}
-
-/*
 ==============
 AllocImage
 
@@ -1686,9 +1581,6 @@ ReloadAllImages
 */
 void idImageManager::ReloadAllImages() {
 	idCmdArgs args;
-
-	// build the compressed normal map palette
-	SetNormalPalette();
 
 	args.TokenizeString( "reloadImages reload", false );
 	R_ReloadImages_f( args );
@@ -2089,82 +1981,6 @@ void idImageManager::EndLevelLoad() {
 	common->Printf( "%5i kept from previous\n", keepCount );
 	common->Printf( "%5i new loaded\n", loadCount );
 	common->Printf( "all images loaded in %5.1f seconds\n", (end-start) * 0.001 );
-}
-
-/*
-===============
-idImageManager::StartBuild
-===============
-*/
-void idImageManager::StartBuild() {
-	ddsList.Clear();
-	ddsHash.Free();
-}
-
-/*
-===============
-idImageManager::FinishBuild
-===============
-*/
-void idImageManager::FinishBuild( bool removeDups ) {
-	idFile *batchFile;
-	if ( removeDups ) {
-		ddsList.Clear();
-		char *buffer = NULL;
-		fileSystem->ReadFile( "makedds.bat", (void**)&buffer );
-		if ( buffer ) {
-			idStr str = buffer;
-			while ( str.Length() ) {
-				int n = str.Find( '\n' );
-				if ( n > 0 ) {
-					idStr line = str.Left( n + 1 );
-					idStr right;
-					str.Right( str.Length() - n - 1, right );
-					str = right;
-					ddsList.AddUnique( line );
-				} else {
-					break;
-				}
-			}
-		}
-	}
-	batchFile = fileSystem->OpenFileWrite( ( removeDups ) ? "makedds2.bat" : "makedds.bat" );
-	if ( batchFile ) {
-		int i;
-		int ddsNum = ddsList.Num();
-
-		for ( i = 0; i < ddsNum; i++ ) {
-			batchFile->WriteFloatString( "%s", ddsList[ i ].c_str() );
-			batchFile->Printf( "@echo Finished compressing %d of %d.  %.1f percent done.\n", i+1, ddsNum, ((float)(i+1)/(float)ddsNum)*100.f );
-		}
-		fileSystem->CloseFile( batchFile );
-	}
-	ddsList.Clear();
-	ddsHash.Free();
-}
-
-/*
-===============
-idImageManager::AddDDSCommand
-===============
-*/
-void idImageManager::AddDDSCommand( const char *cmd ) {
-	int i, key;
-
-	if ( !( cmd && *cmd ) ) {
-		return;
-	}
-
-	key = ddsHash.GenerateKey( cmd, false );
-	for ( i = ddsHash.First( key ); i != -1; i = ddsHash.Next( i ) ) {
-		if ( ddsList[i].Icmp( cmd ) == 0 ) {
-			break;
-		}
-	}
-
-	if ( i == -1 ) {
-		ddsList.Append( cmd );
-	}
 }
 
 /*

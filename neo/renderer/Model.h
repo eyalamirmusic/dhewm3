@@ -48,18 +48,10 @@ If you have questions concerning this license or the applicable additional terms
 #define MD5_VERSION				10
 
 // using shorts for triangle indexes can save a significant amount of traffic, but
-// to support the large models that renderBump loads, they need to be 32 bits
-#if 1
-
-#define GL_INDEX_TYPE		GL_UNSIGNED_INT
+// to support the large models that renderBump loads, they need to be 32 bits.
+// (The GL_INDEX_TYPE that used to name the matching GL enum went with qgl.h in
+// step 5; it had no readers left.)
 typedef int glIndex_t;
-
-#else
-
-#define GL_INDEX_TYPE		GL_UNSIGNED_SHORT
-typedef short glIndex_t;
-
-#endif
 
 
 typedef struct {
