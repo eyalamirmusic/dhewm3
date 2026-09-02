@@ -75,8 +75,6 @@ if(APPLE)
 	endif()
 endif()
 
-find_package(SDL3 REQUIRED CONFIG COMPONENTS SDL3-shared)
-
 # Note: this deliberately requires openal-soft's CMake config package. macOS also
 # ships an OpenAL.framework, but it's deprecated and puts its headers in OpenAL/
 # instead of the AL/ that dhewm3 (and every other openal-soft user) includes.
@@ -112,14 +110,13 @@ function(check_universal_dependency target)
 			message(FATAL_ERROR
 				"${lib}\n"
 				"  is ${have} only, but this is a universal build (${CMAKE_OSX_ARCHITECTURES}).\n"
-				"  Either point CMAKE_PREFIX_PATH at universal builds of SDL3 and openal-soft,\n"
+				"  Either point CMAKE_PREFIX_PATH at a universal build of openal-soft,\n"
 				"  or configure a native-only build with -DCMAKE_OSX_ARCHITECTURES=${CMAKE_SYSTEM_PROCESSOR}")
 		endif()
 	endforeach()
 endfunction()
 
 if(APPLE)
-	check_universal_dependency(SDL3::SDL3-shared)
 	check_universal_dependency(OpenAL::OpenAL)
 endif()
 
@@ -255,7 +252,6 @@ endif()
 add_compile_definitions(D3_OSTYPE="${os}")
 # Both supported platforms are little endian on every architecture they run on.
 add_compile_definitions(D3_IS_BIG_ENDIAN=0)
-add_compile_definitions(D3_SDL3=1)
 
 if(REPRODUCIBLE_BUILD)
 	add_compile_definitions(ID_REPRODUCIBLE_BUILD)
@@ -778,7 +774,6 @@ set(src_sys
 # --------------------------------------------------------------------------- #
 
 add_library(idlib STATIC ${src_idlib})
-target_link_libraries(idlib PUBLIC SDL3::Headers) # for SDL_endian.h
 set_target_properties(idlib PROPERTIES POSITION_INDEPENDENT_CODE ON)
 source_group(TREE ${CMAKE_CURRENT_SOURCE_DIR} PREFIX neo FILES ${src_idlib})
 
@@ -804,15 +799,12 @@ if(CORE)
 	source_group(TREE ${CMAKE_CURRENT_SOURCE_DIR} PREFIX neo FILES ${src_core} ${src_sys} ${src_renderbackend})
 
 	target_include_directories(dhewm3 PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/libs/imgui")
+	# eacp is the platform layer and OpenAL is the sound one. SDL was here for
+	# the whole of Phase 1 and most of Phase 2; step 5 took its last four
+	# reasons - qgl.h's GL types, idlib's endian macros, the script debugger's
+	# mutexes, and the odds and ends in cpu.cpp, posix_main.cpp and Common.cpp -
+	# and this line is the proof: a surviving reference would not link.
 	target_link_libraries(dhewm3 PRIVATE idlib eacp-gpu OpenAL::OpenAL "-framework Cocoa")
-
-	# SDL is still linked, and it is not the platform layer any more. Deleting
-	# qgl.h took the biggest of its remaining reasons - SDL_opengl.h was where
-	# the GL types came from. What is left is idlib's endian macros, the script
-	# debugger's mutexes, and a handful of odds and ends in cpu.cpp,
-	# posix_main.cpp and Common.cpp. The rest of step 5 takes them; none of them
-	# opens a window.
-	target_link_libraries(dhewm3 PRIVATE SDL3::SDL3)
 
 	if(CURL_FOUND)
 		target_link_libraries(dhewm3 PRIVATE CURL::libcurl)

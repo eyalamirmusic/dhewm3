@@ -19,25 +19,22 @@ jobs:
     steps:
     - name: Check out repository code
       uses: actions/checkout@v6
-    - name: Build universal SDL3 and openal-soft
+    - name: Build universal openal-soft
       # Homebrew only ships single-architecture libraries, so a universal dhewm3
-      # needs universal builds of its dependencies.
+      # needs universal builds of its dependencies. SDL3 was built here too until
+      # step 5 stopped linking it.
       run: |
         set -e
         mkdir -p deps && cd deps
-        git clone --depth 1 -b release-3.4.14 https://github.com/libsdl-org/SDL.git sdl3
         git clone --depth 1 -b 1.25.2 https://github.com/kcat/openal-soft.git openal
-        for dep in sdl3 openal; do
-          cmake -S $dep -B build-$dep \
-            -DCMAKE_BUILD_TYPE=Release \
-            -DCMAKE_OSX_ARCHITECTURES="arm64;x86_64" \
-            -DCMAKE_INSTALL_PREFIX="$PWD/prefix" \
-            -DCMAKE_IGNORE_PREFIX_PATH=/opt/homebrew \
-            -DSDL_TESTS=OFF -DSDL_EXAMPLES=OFF \
-            -DALSOFT_EXAMPLES=OFF -DALSOFT_UTILS=OFF
-          cmake --build build-$dep --parallel
-          cmake --install build-$dep
-        done
+        cmake -S openal -B build-openal \
+          -DCMAKE_BUILD_TYPE=Release \
+          -DCMAKE_OSX_ARCHITECTURES="arm64;x86_64" \
+          -DCMAKE_INSTALL_PREFIX="$PWD/prefix" \
+          -DCMAKE_IGNORE_PREFIX_PATH=/opt/homebrew \
+          -DALSOFT_EXAMPLES=OFF -DALSOFT_UTILS=OFF
+        cmake --build build-openal --parallel
+        cmake --install build-openal
     - name: Build
       run: |
         cmake -B build -DCMAKE_PREFIX_PATH="$PWD/deps/prefix"
@@ -52,8 +49,8 @@ jobs:
         # Copy release assets
         cp -r build/neo/dhewm3.app publish/$PKGDIR/
         cp build/neo/base.dylib build/neo/d3xp.dylib publish/$PKGDIR/
-        # Copy the universal SDL3 and OpenAL the game was linked against
-        cp deps/prefix/lib/libSDL3.0.dylib deps/prefix/lib/libopenal.*.dylib publish/$PKGDIR/
+        # Copy the OpenAL the game was linked against
+        cp deps/prefix/lib/libopenal.*.dylib publish/$PKGDIR/
         # Copy misc assets
         cp base/gamepad.cfg publish/$PKGDIR/base/
         cp base/gamepad-d3xp.cfg publish/$PKGDIR/d3xp/
@@ -61,11 +58,23 @@ jobs:
         cp README.md publish/$PKGDIR/README.txt
         cp Changelog.md publish/$PKGDIR/Changelog.txt
         cp Configuration.md publish/$PKGDIR/Configuration.txt
-    - name: Verify the binaries are universal
+    - name: Report the binary architectures
+      # This step used to be called "Verify the binaries are universal" and it
+      # never verified anything: lipo -info prints and exits 0 whatever it finds,
+      # and the Build step above sets no CMAKE_OSX_ARCHITECTURES, which this
+      # fork's CMake does not set either - so what comes out is a native build of
+      # whatever runner it ran on. Whether eacp builds arm64;x86_64 is a separate
+      # question and has not been tested.
       run: |
         lipo -info publish/${{ env.pkgname }}/dhewm3.app/Contents/MacOS/dhewm3
         lipo -info publish/${{ env.pkgname }}/base.dylib
         lipo -info publish/${{ env.pkgname }}/d3xp.dylib
+    - name: Verify no SDL and no OpenGL are linked
+      run: |
+        set -e
+        deps=$(otool -L publish/${{ env.pkgname }}/dhewm3.app/Contents/MacOS/dhewm3)
+        echo "$deps"
+        ! echo "$deps" | grep -qi 'libSDL\|OpenGL.framework'
     - name: Upload testbuild package
       uses: actions/upload-artifact@v7
       with:
