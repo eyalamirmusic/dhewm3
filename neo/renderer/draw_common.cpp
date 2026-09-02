@@ -1896,7 +1896,4 @@ void	RB_STD_DrawView( void ) {
 	if ( processed < numDrawSurfs ) {
 		RB_STD_DrawShaderPasses( drawSurfs+processed, numDrawSurfs-processed );
 	}
-
-	RB_RenderDebugTools( drawSurfs, numDrawSurfs );
-
 }

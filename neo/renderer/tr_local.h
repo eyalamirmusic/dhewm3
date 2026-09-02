@@ -1296,8 +1296,6 @@ void RB_DrawElementsWithCounters( const srfTriangles_t *tri );
 void RB_DrawShadowElementsWithCounters( const srfTriangles_t *tri, int numIndexes );
 void RB_STD_FillDepthBuffer( drawSurf_t **drawSurfs, int numDrawSurfs );
 void RB_BindVariableStageImage( const textureStage_t *texture, const float *shaderRegisters );
-void RB_BindStageTexture( const float *shaderRegisters, const textureStage_t *texture, const drawSurf_t *surf );
-void RB_FinishStageTexture( const textureStage_t *texture, const drawSurf_t *surf );
 void RB_StencilShadowPass( const drawSurf_t *drawSurfs );
 void RB_STD_DrawView( void );
 void RB_STD_FogAllLights( void );
@@ -1605,14 +1603,7 @@ void RB_AddDebugLine( const idVec4 &color, const idVec3 &start, const idVec3 &en
 void RB_ClearDebugLines( int time );
 void RB_AddDebugPolygon( const idVec4 &color, const idWinding &winding, const int lifeTime, const bool depthTest );
 void RB_ClearDebugPolygons( int time );
-void RB_DrawBounds( const idBounds &bounds );
-void RB_ShowLights( drawSurf_t **drawSurfs, int numDrawSurfs );
-void RB_ShowLightCount( drawSurf_t **drawSurfs, int numDrawSurfs );
-void RB_PolygonClear( void );
-void RB_ScanStencilBuffer( void );
-void RB_ShowDestinationAlpha( void );
 void RB_ShowOverdraw( void );
-void RB_RenderDebugTools( drawSurf_t **drawSurfs, int numDrawSurfs );
 void RB_ShutdownDebugTools( void );
 
 /*
@@ -1676,7 +1667,6 @@ typedef struct {
 } localTrace_t;
 
 localTrace_t R_LocalTrace( const idVec3 &start, const idVec3 &end, const float radius, const srfTriangles_t *tri );
-void RB_ShowTrace( drawSurf_t **drawSurfs, int numDrawSurfs );
 
 /*
 =============================================================
