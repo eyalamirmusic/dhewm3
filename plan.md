@@ -48,10 +48,10 @@ too, and was never the port's: it is the level's dropship headlight, drawn by
 both builds at the same instant, and what was wrong was a reproducer that
 compared two different moments. Then step 5 deleted the renderer all of that was
 measured against, which is why every number above is written in the past tense
-and cannot be taken again. One thing is open beside the Windows host: gap 20's
-multisampling. Step 6 took the soft-particle program off that list, and eacp
-gap 24 with it: #3878 draws on this backend, off a depth buffer eacp can now be
-asked to make sampleable. The gate is 297 of 297 identical either way, which is
+and cannot be taken again. What stood open beside the Windows host is closed
+now, one step at a time. Step 6 took the soft-particle program off that list, and
+eacp gap 24 with it: #3878 draws on this backend, off a depth buffer eacp can now
+be asked to make sampleable. The gate is 297 of 297 identical either way, which is
 what 4e.8 said it would be, so the picture is measured at ten pinned cameras
 instead — seven of them move, the largest by 0.59 of 255. Step 7 turned the F10
 settings menu back on by integrating **imgui-eacp** rather than writing a
@@ -65,7 +65,18 @@ was not shader or pipeline compiles but MTLBuffer churn underneath
 by doubling. eacp's streaming buffers are an arena per frame in flight now and a
 write comes back as a `GPU::BufferRange`, which took that save's slow frames
 from **42 to 2**, its worst frame from **707 to 277 ms** and its peak RSS from
-**4.9 to 3.4 GB**, at 297 of 297 identical.**
+**4.9 to 3.4 GB**, at 297 of 297 identical. Step 9 took back the one thing 4e.1
+had knowingly given up: a texture render target multisamples now — a
+`TextureDescriptor::sampleCount`, a multisampled texture beside the target that
+is resolved into it at the end of **every pass** rather than at the end of the
+frame and whose samples are kept as well as resolved, and the depth plane
+resolved into a single-sampled twin so that #3877's capture can still bind it —
+and `r_multiSamples` drives it, which is what step 5 kept the cvar alive for. The
+gate is **297 of 297** either way, `capture.cfg` asking for no samples, so the
+feature is measured by replaying the reference demo twice at the same 297
+instants, once at 0 samples and once at 4: **0.140 of 255** over the whole tour,
+**0.574** on its worst frame, and the difference image is silhouettes and
+nothing else — inside the washroom mirror as well as around it.**
 
 Reference implementation for almost everything on the platform side:
 `~/Code/PureDOOM/examples/EACP` — a complete engine hosted on eacp, with its own
@@ -371,26 +382,31 @@ turned up — the gaps this port found by walking real content rather than by
 reading eacp. 12 and 17 stopped the next step rather than degrading it, and both
 are closed, in §6 under step 4b′. 19 does not stop anything today, because it is
 D3D12's alone and the eacp host is macOS-only for other reasons; it stops
-Windows. 20 is a price already paid, in multisampling, for what step 4e.1
-bought. **21 is closed too**, in §6 under step 4e.2, and it is the one that was
-stopping something worth having: eacp grew `Texture::read` and `Frame::flush`,
-and this build's frames are hashes now rather than screen grabs. **22 is closed
-by step 4e.3**, which needed a pass to survive being interrupted — the copy that
-fills `_currentRender` has to end the pass, and everything drawn after it has to
-be occluded by the depth buffer that pass was writing. **And 5 is closed by step
-4e.5**, the one entry on the list that was written before the port began and
-survived to be needed exactly as written: the Mars sky and every pane of glass
-in the demo's first level sample a cube map. **And 24 is closed by step 6**, the
-one entry here that stood between this port and a feature it had decided to
-keep: a render target's depth can be asked for sampleable now, and the soft
-particles draw. 23 is what is left of the pair those two made, both having been
-found by looking at content rather than by reading eacp. 25 is what closing 24
-left behind: the drawable's own depth buffer still cannot be sampled, so the
-answer to "can I read my own depth" now depends on where the app is drawing.
+Windows. 20 was a price already paid, in multisampling, for what step 4e.1
+bought, and **step 9 has bought it back**. **21 is closed too**, in §6 under
+step 4e.2, and it is the one that was stopping something worth having: eacp grew
+`Texture::read` and `Frame::flush`, and this build's frames are hashes now rather
+than screen grabs. **22 is closed by step 4e.3**, which needed a pass to survive
+being interrupted — the copy that fills `_currentRender` has to end the pass, and
+everything drawn after it has to be occluded by the depth buffer that pass was
+writing. **And 5 is closed by step 4e.5**, the one entry on the list that was
+written before the port began and survived to be needed exactly as written: the
+Mars sky and every pane of glass in the demo's first level sample a cube map.
+**And 24 is closed by step 6**, the one entry here that stood between this port
+and a feature it had decided to keep: a render target's depth can be asked for
+sampleable now, and the soft particles draw. 23 is what is left of the pair those
+two made, both having been found by looking at content rather than by reading
+eacp. 25 is what closing 24 left behind: the drawable's own depth buffer still
+cannot be sampled, so the answer to "can I read my own depth" now depends on
+where the app is drawing.
 **And 28 is closed by step 8**, which is the odd one: it was raised against
 something this section had already checked off as *not* a gap, and it took
 measuring the seconds of stutter after a level load rather than reading eacp to
-see that the right shape had the wrong allocator under it.
+see that the right shape had the wrong allocator under it. **And 20 is closed by
+step 9**, which is the other odd one: every other entry here is something eacp
+did not have and this port went looking for, where 20 was something the port had
+and traded away on purpose in 4e.1 — so closing it is the one time the list moved
+backwards to pick a thing up rather than forwards to reach one.
 
 Numbers are never reused, so a hole is an entry that closed.
 
@@ -565,6 +581,11 @@ Numbers are never reused, so a hole is an entry that closed.
     wrote. The entry stays because it is still true of the drawable, and because
     the reason it stopped mattering is that this port gave up multisampling
     (gap 20) rather than that eacp gained `StoreAndMultisampleResolve`.
+    **Step 9 changed the second half of that sentence.** Closing gap 20 gave a
+    texture target `StoreAndMultisampleResolve` — the samples kept as well as
+    resolved — so `clear = false` over one loads the samples at four of them
+    exactly as it loaded the pixels at one. The entry still stands of the
+    *drawable*, which is where it was read.
 
     **Step 4e.4 is where that was spent.** Every 3D view opens a pass of its
     own now, clearing the depth and stencil planes and loading the colour the
@@ -596,21 +617,107 @@ Numbers are never reused, so a hole is an entry that closed.
     the constant moves `bufferRegisterBase` with it, which is why it is a change
     to eacp rather than a number to edit.
 
-20. **A texture render target cannot be multisampled.**
-    `Frame::beginPass(texture)` is single-sampled by design — its own comment
-    says a texture target "has nothing to resolve into", the texture being what
-    a resolve would produce — while the drawable path attaches an MSAA texture
-    and resolves into the drawable. So the shape is there on one path and absent
-    on the other, and an app that moves its composition into a texture (step
-    4e.1, and PureDOOM before it) gives up multisampling to do it.
-
-    Measured rather than assumed: 0.8 of 255 on Doom 3's main menu, which is the
-    screen with the most edges per pixel in the game, and 0.1 on a level view.
-    Worth it for what the target buys, and cheap to close if it ever is not — an
-    MSAA texture beside the target, resolved into it, is what the drawable path
-    already does. Step 5 kept `r_multiSamples` alive for it: the cvar is read in
+20. ~~**A texture render target cannot be multisampled.**~~ — **closed**, and
+    kept because it is the only entry here that was a *price* rather than a
+    lack. `Frame::beginPass(texture)` was single-sampled by design — its own
+    comment said a texture target "has nothing to resolve into", the texture
+    being what a resolve would produce — while the drawable path attached an
+    MSAA texture and resolved into the drawable. So the shape was there on one
+    path and absent on the other, and an app that moved its composition into a
+    texture (step 4e.1, and PureDOOM before it) gave up multisampling to do it.
+    Step 5 kept `r_multiSamples` alive for exactly this: the cvar is read in
     eight places by the settings menu and `regression/capture.cfg` sets it, so
     deleting it would have cost the harness a line for nothing.
+
+    **Closed by step 9**, and the shape is `TextureDescriptor::sampleCount`
+    beside the `renderTarget` and `depth` flags it already had. Above 1 the
+    target grows a multisampled colour texture beside itself — the pass renders
+    into that one and resolves into the target — and the depth buffer, where
+    there is one, is created at the same count, which brings the stencil plane
+    with it since both APIs put the two in one attachment of one format.
+    `Texture::sampleCount()` is what a pipeline drawing there sets
+    `RenderPipelineDescriptor::sampleCount` to, and `Device::supportsSampleCount`
+    is `supportsTextureSampleCount:` on Metal and a
+    `MULTISAMPLE_QUALITY_LEVELS` query over BGRA8, RGBA8 and the combined
+    depth-stencil format on D3D12, all three of which have to answer yes.
+
+    **A field on the descriptor rather than on the pass**, for the reason
+    `TextureDescriptor::depth` already carries: the multisampled texture has to
+    live exactly as long as the target, so a per-pass count would mean
+    allocating per pass or caching by count — and the number is one an app has
+    to know *before* it builds anything, every pipeline that draws there being
+    compiled against it. That is a property of the target, not of one pass over
+    it. And not a `MultisampledRenderTarget` class beside `Texture` either: it
+    would duplicate `isRenderTarget`, `read`, `hasDepth`, `hasStencil` and
+    `update` and need a second `Frame::beginPass` overload, while nothing that
+    *binds* a target needs to know — what it samples and what `read()` reads is
+    the resolved texture either way.
+
+    **A count the device will not render at is refused rather than clamped**: it
+    yields an invalid texture, which is the answer `computeWrite` already gives
+    for a format it cannot store to. Dropping quietly to one sample would leave
+    every pipeline compiled against a number the pass does not have and the draw
+    rejected somewhere else entirely, so `Device::supportsSampleCount` exists to
+    let a caller clamp on purpose — which is what the port does (step 9).
+
+    **The resolve is at the end of every pass rather than at the end of the
+    frame, and the samples are kept as well as resolved**, which is the whole of
+    what made this fit around 4e.3 and 4e.4. Metal attaches the multisampled
+    texture with `resolveTexture` = the target and
+    `MTLStoreActionStoreAndMultisampleResolve`, never the plain
+    `MultisampleResolve` the drawable path uses because a drawable has no next
+    pass; D3D12 renders into a second resource with its own RTV and records
+    `ResolveSubresource` in `RenderPass::end()`. Per-pass is what makes
+    `_currentRender` correct, the copy reading the target *between* two passes so
+    the target has to hold a finished picture at every boundary; keeping the
+    samples is what makes a resumed pass correct, since a pass that only resolved
+    would leave the next `clear = false` one loading a flattened picture back
+    into a multisampled attachment. 4e.4's pass-per-view then costs nothing at
+    all: `loadAction` applies to the attachment, which on such a target *is* the
+    multisampled texture, so `clear = false` loads the samples.
+
+    **`sampleableDepth` costs a second depth buffer here, and that is where the
+    design was decided.** Step 6's depth capture is a full-screen draw that
+    *samples* the frame target's depth (gap 24) rather than a blit, so the
+    problem multisampling raises is a **bind**: the shaders the codegen emits
+    declare a `depth2d`, and neither Metal nor D3D12 will bind a `depth2d_ms` or
+    a `Texture2DMS` to that. Teaching the EDSL a multisampled depth slot would
+    have reached ShaderBuilder, both emitters, both backends' bind paths and
+    dhewm3's own depth-copy shader; refusing `sampleCount > 1` together with
+    `sampleableDepth` would have cost this port soft particles at four samples.
+    So the depth plane is **resolved into a single-sampled twin** and that is
+    what is bound — nothing above eacp changes, the shader still declares a
+    `depth2d` and `setFragmentDepthTexture` still takes the target — at the cost
+    of one depth-sized texture, paid only by a target that asked for both. The
+    stencil plane is not resolved: nothing samples it, and no filter over a
+    count would mean anything.
+
+    `Tests/GPU/MultisampledTargetTests.cpp` is eight cases, each with its
+    single-sampled control: that a target says how many samples it takes, that a
+    count on a non-render-target is ignored, that three samples is refused and
+    leaves an *invalid* texture rather than a clamped one, that the edge of a
+    triangle comes back blended in at least four pixels where the one-sample
+    control has **zero** such pixels and two pixels away from the edge the two
+    agree, that a suspended pass keeps both colour and stencil and that the
+    mid-suspension read sees the resolve, and that a four-sample target's
+    sampleable depth reads back the z the pass wrote — the last of which fails
+    without Metal's `MTLMultisampleDepthResolveFilterSample0`, which is how that
+    filter went from an assumption to a measurement. The GPU suite goes from
+    **274 to 282, all passing**, clean under `MTL_DEBUG_LAYER=1` with
+    `MTL_SHADER_VALIDATION=1`, and the whole tree is **1411 of 1411**.
+
+    **Uncommitted**, standing in the `~/Code/eacp` working tree on `develop`
+    awaiting the user's own commit, as steps 7's and 8's dependency changes did
+    before it — eacp's rules do not let an agent make one. The D3D12 half is
+    written and unrun, the eacp host being macOS-only (§8), and it carries the
+    one place the two backends will not agree pixel for pixel: D3D12 has no
+    equivalent of the sample-0 depth resolve, `ResolveSubresourceRegion` offering
+    only `MIN` and `MAX` for a depth format, so it takes `RESOLVE_MODE_MAX` — the
+    furthest sample. That differs from Metal's only on a silhouette pixel of the
+    *captured* depth, which is a soft particle's fade distance and nothing else;
+    everywhere else the samples agree and so do the backends. It is a note rather
+    than a gap of its own, documented at
+    `D3D12TextureData::resolvedDepthResource`.
 
 21. ~~**A texture cannot be read back to the CPU.**~~ — **closed**, and the
     entry is kept because what closing it turned out to need is worth knowing.
@@ -3500,6 +3607,273 @@ own pin until eacp's `develop` reaches `main` or that pin moves. Inside this
 build the `find_package(EACP)` is answered by the eacp this tree already added
 (step 7), so it builds here.
 
+#### Step 9 — the render target multisampled, and gap 20 — **done**
+
+The one entry on §5's list that was a price this port paid rather than something
+eacp did not have. Step 4e.1 moved the frame into an app-owned render target
+because everything the rest of 4e wanted — `_currentRender`, a pass per view, a
+frame read back to the CPU — needs a texture that an earlier pass wrote and a
+later one can touch, and it paid for that in multisampling: a texture target on
+eacp was single-sampled by design, *being* what a resolve would produce, so the
+view went to one sample and every pipeline was compiled for one. The trade was
+written down as gap 20 at the time and step 5 kept `r_multiSamples` alive for the
+day it was taken back. This is that day.
+
+**The eacp shape is one field on the descriptor.**
+`TextureDescriptor::sampleCount` above 1 on a `renderTarget` grows a multisampled
+colour texture beside the target: the pass renders into that one and resolves
+into the target, which is exactly what the drawable path already did with a
+drawable at the far end of the resolve. The depth buffer, where the target has
+one, is created at the same count — and that brings the stencil plane with it,
+both APIs putting the two into one attachment of one format, so nothing had to be
+added for the stencil at all. `Texture::sampleCount()` is what a pipeline drawing
+there has to set `RenderPipelineDescriptor::sampleCount` to, and
+`Device::supportsSampleCount` is how a caller finds out what it may ask for.
+
+**Two alternatives were on the table and the descriptor beat both.** A
+`RenderPassDescriptor::sampleCount` would have had to allocate the multisampled
+texture per pass or cache it by count, because it has to live exactly as long as
+the target — which is the reasoning `TextureDescriptor::depth` already carries in
+its own comment — and, more decisively, the number is one the app has to know
+*before* it builds anything, every pipeline that draws there being compiled
+against it. That makes it a property of the target rather than of one pass over
+it. A separate `MultisampledRenderTarget` class would have duplicated
+`isRenderTarget`, `read`, `hasDepth`, `hasStencil` and `update` and needed a
+second `Frame::beginPass` overload, for a distinction nothing that *binds* a
+target can see: what a shader samples and what `read()` reads is the resolved
+texture either way. And a count the device refuses makes the texture **invalid**
+rather than quietly dropping to one sample — the answer `computeWrite` already
+gives for a format it cannot store to — because a silent drop would leave every
+pipeline compiled against a number the pass does not have and the draw rejected
+somewhere else entirely.
+
+**Four things in this port already depended on how a pass over that target
+behaves, and they are worth taking in the order they narrowed the answer, because
+the fourth is where the design was decided.**
+
+The **depth and stencil attachment has to match the count**, which is the API's
+rule on both backends rather than a choice; the depth texture is created
+multisampled (`MTLTextureType2DMultisample`, and a `TEXTURE2DMS` DSV on D3D12)
+and eacp already derived the format from `TextureDescriptor::stencil`, so nothing
+else was needed.
+
+**4e.3's suspended pass** — `DepthAction::Resume`, gap 22 — is the constraint
+that shaped the whole thing, and the answer is that **the resolve happens at the
+end of every pass and the samples are kept as well as resolved**. Metal attaches
+the multisampled texture with `resolveTexture` = the target and
+`StoreAndMultisampleResolve`, never the plain `MultisampleResolve` the drawable
+path uses, a drawable having no next pass; D3D12 renders into a second resource
+with its own RTV and records `ResolveSubresource` into the target from
+`RenderPass::end()`. Per-pass rather than per-frame is what keeps
+`_currentRender` correct, since that copy reads the target *between* two passes
+and the target therefore has to hold a finished picture at every pass boundary —
+a texture target is readable between passes and no pass knows whether it is the
+last one. Keeping the samples is what keeps the *resumed* pass correct: a pass
+that only resolved would leave the next `clear = false` pass loading a flattened
+picture back into a multisampled attachment, and everything drawn after the copy
+would be composited onto that.
+
+**4e.4's pass per view** then came free and falls out of the same shape.
+`loadAction` applies to the colour attachment, which on a multisampled target
+*is* the multisampled texture, so `clear = false` loads the samples rather than
+the resolve. Nothing had to be said about it beyond not discarding them.
+
+**Step 6's depth capture is the one that decided the design.** The obstacle is
+not what it looks like from a distance. eacp has no blit and the capture is a
+full-screen *draw* that samples the frame target's depth through
+`RenderPass::setFragmentDepthTexture` — which is what gap 24 turned out to mean
+and what step 6 above says — so the problem multisampling raises is a **bind**:
+the shaders eacp's codegen emits declare a `depth2d`, and Metal will not bind a
+`depth2d_ms` to one, nor D3D12 a `Texture2DMS` to a `Texture2D`. Three answers
+were possible. Teaching the EDSL a multisampled depth slot reaches ShaderBuilder,
+ShaderEmitter, both emitters, both backends' bind paths and this port's own
+depth-copy shader, which is far too large for what it buys. Refusing
+`sampleCount > 1` together with `sampleableDepth` would have cost this port soft
+particles at four samples, which is precisely what step 6 was for. So the third:
+**resolve the depth plane into a single-sampled twin and bind that**. Nothing
+above eacp changes at all — the shader still declares a `depth2d`,
+`hasSampleableDepth()` still answers the same question, `setFragmentDepthTexture`
+still takes the target — and the cost is one depth-sized texture, paid only by a
+target that asked for both. The filter is
+`MTLMultisampleDepthResolveFilterSample0` rather than Min or Max, because what
+reads it wants the depth of the surface at that pixel, which is what a
+single-sampled render would have written there; the stencil plane is not resolved
+at all, nothing sampling it and no filter over a count meaning anything for it.
+`Texture::read` after a `Frame::flush` needed nothing either: `read()` reads the
+resolve *destination*, and the per-pass resolve is what makes it current.
+
+**In the port, the number is decided once and reaches three places.**
+`R_EacpMultiSamples()` turns `r_multiSamples` into a count the device will
+actually render at: **0 and 1 both mean one sample**, which is what the cvar
+means — it defaults to 0, the settings menu writes 0 for "No Antialiasing" and
+`regression/capture.cfg` sets 0 — and anything above that is rounded *down* to a
+power of two, the menu offering 2, 4, 8 and 16 and neither API having a shape for
+the numbers in between, then walked down until `Device::supportsSampleCount` says
+yes. Walked rather than refused, because the cvar is archived: a config written on
+one machine is read on another, and the alternative to clamping is a black window
+on a GPU that offers four. What it costs is a line in the log saying which number
+was taken. On this machine (Apple M5 Max):
+
+| `r_multiSamples` | what the log says |
+| --- | --- |
+| 0, 1 | `eacp: no multisampling` |
+| 2 | `eacp: 2x multisampling` |
+| 3 | `eacp: 2x multisampling, clamped from the 3 asked for` |
+| 8 | `eacp: 8x multisampling` |
+| 16, 32 | `eacp: 8x multisampling, clamped from the 16 asked for` |
+
+`Init()` reads it once, prints that line beside `GPU: <device name>`, and when it
+differs from the stored value drops the frame target, the whole of
+`eacpRenderProgs`' program and pipeline cache and the ImGui renderer — all three
+of which are rebuilt on demand, which is the whole of applying the change. It has
+to be `Init()` rather than `Shutdown()` and it has to be read per-Init rather
+than per-frame, and both halves have a reason. A pipeline is compiled against the
+count, so reading a cvar that can move between two draws would mean a draw
+rejected for disagreeing with its pass; and `vid_restart` on this port does
+**not** call `renderBackend->Shutdown()` — it goes `GLimp_Shutdown` →
+`R_InitOpenGL` → `renderBackend->Init()` — so `Init` is the only place a change
+can be noticed at all. The three destinations are `EnsureFrameTarget`'s
+`descriptor.sampleCount`, `BuildPipeline`'s, and the ImGui overlay's
+`Gui::DrawTarget`, the last of those because step 7 draws the settings menu
+inside the engine's own frame and both backends reject a draw whose pipeline
+disagrees with its pass. The seam between the backend and `RenderProgs_Eacp.cpp`
+is one new function, `R_EacpFrameSampleCount()`, answered by the backend that
+owns the target the way `R_EacpGetView` is.
+
+**Three pipelines stay at one sample and their comments now say why rather than
+"like every texture target".** The blit onto the drawable, the capture into an
+image's texture and the depth copy into `_currentDepth` all draw into
+single-sampled destinations: the drawable takes a full-screen quad of an
+already-resolved picture, and four samples there would only rasterize the same
+pixels four times; an image is somewhere pixels are copied *to*; and
+`_currentDepth` reads a depth that eacp has already resolved on its own side.
+`neo/sys/eacp/View.cpp` keeps `setSampleCount(1)` and its comment was the one
+piece of prose in the tree that this step made false — it said the drawable
+carries no multisampling "however this is set" because a texture target has none
+to give, and now the reason is the other one: multisampling belongs to the target,
+where the scene is rasterized, and by the time the blit runs the picture has been
+resolved.
+
+**The gate is 297 of 297 identical against both baselines, first try**, `step7d`
+and `arena`, with no recapture needed. That is the expectation rather than a null
+result, and `capture.cfg`'s own `seta r_multiSamples 0` is what makes it one: at
+one sample this change is a no-op down to the byte, and the gate is the proof
+that the new field costs the existing path nothing.
+
+**So the feature is measured by replaying the same demo twice, and that is a
+better instrument than this port has used for a picture before.**
+`regression/reference.demo` played back with `aviDemo` at 640x480 — the gate's own
+`com_aviDemoSamples 1` and `com_aviDemoTics 2`, only the size raised — once at
+`r_multiSamples 0` and once at `4`. Demo playback is frame-exact, so the two runs
+render the same 297 instants and the pair differences pixel by pixel with no
+clock between them:
+
+| frame | camera stop | mean of 255 | worst pixel | pixels moved | by > 8 |
+| --- | --- | --- | --- | --- | --- |
+| `reference_00008` | stop 1, `setviewpos 264 -1320 160 180` | 0.135 | 82 | 1.48% | 0.59% |
+| `reference_00107` | stop 7, `setviewpos -1748 -1340 268 90` | **0.574** | 127 | 6.55% | 2.29% |
+| `reference_00140` | stop 9, the washroom mirror | 0.140 | 71 | 3.13% | 0.62% |
+| `reference_00223` | stop 14, `setviewpos -3644 -2564 266 270` | 0.160 | 133 | 3.29% | 0.49% |
+| `reference_00280` | late in the tour | 0.023 | 56 | 1.06% | 0.07% |
+| **whole tour** | 297 frames | **0.140** | 133 | | |
+
+Frame 107 is the busiest frame of the tour and its **0.574** is the most any
+frame moved; the ten worst are all inside that stop's span, and the quietest
+frame moved 0.014. **Live pinned cameras at 2048x1536 agree and have a 0.000
+noise floor**: the washroom mirror reads **0.048 of 255** between 0 and 4 samples
+against two runs of one configuration that are byte-identical, and the F10
+settings overlay reads 0.073 drawn over the startup screen — which on a `+exec`
+run is the console, for the reason below — and 0.020 over a 3D view. One camera
+is not usable, and `regression/README.md` says why before it is tried — the
+tour's first stop looks at a fog light bound to a mover, and two runs of the
+*same* build differ there by 3.943 of 255, so the 4.161 between the two settings
+says nothing at all.
+
+**`vid_restart` was measured as a round trip rather than as a raise.** One
+session: screenshot the washroom camera, `seta r_multiSamples 4` +
+`vid_restart`, screenshot, `seta r_multiSamples 0` + `vid_restart`, screenshot.
+The log goes `no multisampling` → `4x multisampling` → `no multisampling`, the
+raise gives **exactly the 0.048 a fresh run at four samples gives**, and coming
+back down gives a picture **byte-identical** to the one before the raise. So
+dropping the target, the program cache and the ImGui renderer is the whole of
+applying the change, in both directions. The whole run was under
+`MTL_DEBUG_LAYER=1` with `MTL_SHADER_VALIDATION=1`, as was a 4-sample level run
+covering the load, the mirror, the depth capture, the `_currentRender` copy and
+the pass suspend/resume: nothing in either log but the two "Validation Enabled"
+lines.
+
+**By eye, it is edges that moved and not interiors**, which is the check that
+this is antialiasing rather than a shift. The amplified difference image of frame
+140 is silhouettes and nothing else — the sinks, the wall trim, the mirror's
+frame — with completely black interiors, **including the geometry reflected
+inside the mirror**, which is what says 4e.4's subview pass is multisampled too;
+a 4× crop of the left sink shows the staircase along its rim softened and the
+flat surfaces unchanged. The F10 settings overlay draws correctly at four samples
+over both the startup screen and a live 3D view, which is the ImGui pipeline
+carrying the count.
+The `_currentRender` route was checked with `g_testPostProcess
+textures/sfx/vpstatic` — `heatHaze.vfp` with `fragmentMap 0 _currentRender`, so
+drawing it dumps the frame into the image through a suspended pass and samples it
+back distorted — and the effect is there and is the same effect, though not
+numerically comparable, the material scrolling with game time. The `_scratch`
+route 4e.3 used is `give berserk 60` (the report's `give berserk` did nothing
+because it lacks the duration), and at four samples the copy is the scene, whole,
+in the right place: 3.046 of 255 against the 1-sample run, but the signed
+per-channel means are −2.4, −3.2, −3.1, which is nearly the whole of it — **a
+uniform darkening of about three levels, not a shift or a blur**. The best
+integer shift is (0, 0) and box-blurring the 1-sample image makes the match
+worse rather than better, so it is almost certainly the effect's own time phase
+rather than the sample count; it could not be pinned, for the reason below.
+
+**Four things were found on the way, and the first is a real defect that is not
+this step's.** `com_fixedTic 1` makes a live in-game `screenshot` come back
+entirely black on this build — a TGA of the right dimensions with every byte zero
+— at every size tried, and it is the in-game frame only: the same run screenshots
+the console screen fine, and with `com_fixedTic 0` every shot is a picture. It
+reproduces at **0 samples as well as 4**, on the current binary, independently of
+this step's own measurements, so it is not the multisampling. Step 6 above took
+ten pinned cameras with `com_fixedTic 1` and got pictures, and nothing in
+`Session.cpp`'s `com_fixedTic` code has changed since, so the break is somewhere
+in step 7, the arena or this step. **It is being bisected as this is written and
+the result is not in this document.** What it costs meanwhile is exactly the
+instrument `regression/README.md` recommends for a live shot, which is why the
+numbers above come from demo playback — the README itself calls that immune — and
+why the `_scratch` comparison had to stay qualitative.
+
+**The live menu turns out not to be an instrument either**, and that retires a
+number this plan has quoted since 4e.1. The demo *does* have a main menu —
+`guis/mainmenu.gui` is missing from the demo pk4, which is why every gate log
+since 4e.4 warns about it, but `idSessionLocal::Init` falls back to
+`guis/demo_mainmenu.gui`, which is there — and a scripted run does not show it
+because `idCommonLocal::Init` starts the menu only `if ( !AddStartupCommands() )`
+and a `+exec` on the command line *is* a startup command, so every cfg-driven run
+boots to the fullscreen console. (`disconnect` in the cfg brings the menu up.)
+The first measurements of this step called that console screen "the main menu";
+re-measured on the real one, the menu's animation runs on the GUI clock, which is
+wall time, and `com_fixedTic` pins only the game tick — two runs of one setting
+differ by 1.580 of 255 against a 0-vs-4 reading of 1.719, and with
+`com_fixedTic 1` by 0.747 against 1.909. The signal is not separable from the
+noise. So **4e.1's "0.8 of 255 on Doom 3's main menu" stands unreproduced**, and
+the frame-exact replay's 0.140 over the tour is this feature's measurement.
+
+The other two are smaller. The build tree had to be reconfigured:
+`cmake-build-release` held neither `CPM_eacp_SOURCE` nor `CPM_imgui-eacp_SOURCE`
+and was building a fetched clone of eacp under `_deps/` — at `522e2a4`, which is
+`~/Code/eacp`'s own HEAD, so the baselines it captured are comparable — and it
+now carries both overrides, which is the arrangement step 8's last paragraph
+describes. And **16x is not reachable on this GPU**: the M5 Max tops out at 8, so
+the settings menu's 16x entry clamps and says so. The multisampled path itself is
+exercised at **4** samples throughout; 2 and 8 were checked only as far as the
+target being created and the log line being right.
+
+**Where eacp's half stands.** Uncommitted, in the `~/Code/eacp` working tree on
+`develop`, awaiting the user's own commit as step 7's and step 8's dependency
+changes did before it: 15 files, about 770 lines, plus
+`Tests/GPU/MultisampledTargetTests.cpp` at 639. The GPU suite goes from **274 to
+282, all passing** and clean under the validation layers, and the whole tree is
+**1411 of 1411**. The D3D12 half is written and unrun, and §5's gap 20 has the
+one backend difference worth knowing about it.
+
 ### Shader inventory for Phase 2
 
 Roughly 10–15 EDSL programs, each in the sampling variants §4.3 sizes — 8 worst case
@@ -3743,7 +4117,8 @@ Phase 2 is the first work that compiles against eacp. In rough order:
        into an app-owned texture and the drawable is a blit of it, which is
        what a pass that reads what an earlier one wrote needs — PureDOOM's
        `captureTarget`, §3. Same counters, same picture at 0.3 of 255, one
-       multisampling given up (gap 20).
+       multisampling given up (gap 20). [**Taken back**, step 9 in §6: a
+       texture target multisamples now and `r_multiSamples` reaches it again.]
      - ~~**4e.2. `ReadPixels`.**~~ — **done**, §6. eacp grew the texture
        readback gap 21 asked for *and* a `Frame::flush` beside it, because a
        read inside the frame that drew the pixels otherwise returns the frame
@@ -3819,7 +4194,11 @@ Phase 2 is the first work that compiles against eacp. In rough order:
        - **The soft-particle program (#3878) — after step 5**, and gap 24 is
          raised for it now. It is not a program that can simply be written:
          it reads the frame's depth, and eacp's depth attachment is created
-         render-target-only with no sampleable format to blit it into. The
+         render-target-only with no sampleable format to blit it into. [The
+         word "blit" is this entry's and predates step 6, which found that
+         eacp has no blit at all and that a depth copy on this stack is a
+         *draw* that samples the attachment — the same fact that later decided
+         how step 9 multisamples a target carrying one.] The
          feature is worth having — 702 of the 1332 base particle stages
          qualify for the softening by geometry, so it is a per-frame
          difference on most of Doom 3's atmosphere, and it is dhewm3's own
@@ -3869,9 +4248,10 @@ Phase 2 is the first work that compiles against eacp. In rough order:
    the handles at all. C6 landed the stub at 297/297, `fragmentPrograms` and all.
 
 One thing is open, and it is the Windows host. The two that stood beside it are
-struck through below, with the steps that closed them, and a third struck-through
-entry sits with them that was never on this list at all — step 8 was found by
-running the build rather than by planning for it.
+struck through below, with the steps that closed them, and two more
+struck-through entries sit with them that were never on this list at all — step 8
+was found by running the build rather than by planning for it, and step 9 took
+back something 4e.1 had traded away on purpose.
 
 **The Windows host.** The port is macOS-only from step 2b (§6), and step 5 made
 that the buildsystem's position rather than an accident: `neo/CMakeLists.txt`
@@ -3934,6 +4314,24 @@ GPU buffer allocated and freed per streamed draw underneath
 per write took the measured save's slow frames from 42 to 2, its worst frame from
 707 to 277 ms and its peak RSS from 4.9 to 3.4 GB, at 297 of 297 identical. It is
 the first thing here measured in milliseconds rather than in levels of 255.
+
+~~**Gap 20's multisampling.**~~ — **done**, step 9 in §6, and §5's gap 20 with
+it. Never on this list either, because it was not something missing but something
+4e.1 spent: a texture target on eacp was single-sampled, so moving the frame into
+one cost the port the multisampling and step 5 kept `r_multiSamples` alive
+against the day it came back. `TextureDescriptor::sampleCount` is that day — the
+target grows a multisampled texture beside itself, resolved into it at the end of
+*every* pass with the samples kept, which is what leaves 4e.3's suspended pass,
+4e.4's colour load, step 6's depth capture and `ReadPixels` all reading a
+finished picture; the sampleable depth costs a resolved twin, because the shaders
+eacp generates declare a `depth2d` and neither API will bind a multisampled one
+to that. The gate is 297 of 297 against both baselines with `capture.cfg` asking
+for no samples, so the feature is measured instead by replaying the reference
+demo at 0 and 4 samples — frame-exact, 297 instants each — at 0.140 of 255 over
+the tour and 0.574 on its worst frame, with the live mirror camera at 0.048
+against a 0.000 floor and a `vid_restart` round trip that comes back
+byte-identical. eacp's half is uncommitted on `develop`, awaiting the user's own
+commit.
 
 **Why 4e.8 went before step 5 rather than after it, in one number.** At the
 tour's second camera stop the two builds disagreed by 0.458 of 255, and the heat
