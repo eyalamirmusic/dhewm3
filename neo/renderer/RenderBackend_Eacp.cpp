@@ -250,6 +250,14 @@ public:
 	virtual bool	ReadPixels( int x, int y, int width, int height, byte *rgb,
 								bool presented );
 
+	// Not idRenderBackend's: what the frame target multisamples at, which the
+	// pipelines on the other side of the RenderProgs seam have to match. Reached
+	// through R_EacpFrameSampleCount below, the way the view is reached through
+	// R_EacpGetView. 1 until Init has decided.
+	int				FrameSampleCount( void ) const {
+						return frameTargetSamples > 0 ? frameTargetSamples : 1;
+					}
+
 private:
 	// Everything one draw needs that is not the geometry: a material stage's
 	// expression, said in the terms idEacpStageProgram takes rather than the
@@ -534,6 +542,14 @@ private:
 	int								frameTargetWidth;
 	int								frameTargetHeight;
 
+	// How many samples a pass into that target takes: r_multiSamples, clamped
+	// to what the device will render at, and 1 for the cvar's 0 as well as its
+	// 1. Read once per Init rather than per frame, because it is not only the
+	// target's - every pipeline that draws there is compiled against it - which
+	// is why changing it needs a vid_restart and why Init is where the change
+	// is noticed.
+	int								frameTargetSamples;
+
 	// What the open pass was last told to rasterize into, and what the
 	// suspended one was told before it closed. Pass state on eacp - a new pass
 	// starts on the whole target - and Doom 3 sets both once per view rather
@@ -666,6 +682,11 @@ static void R_EacpDrawInteraction( const drawInteraction_t *din ) {
 idRenderBackendEacp::idRenderBackendEacp() {
 	frameTargetWidth = 0;
 	frameTargetHeight = 0;
+
+	// Not 1: zero is "nothing has been decided yet", which is what makes the
+	// first Init take the same branch a changed cvar does and there be one path
+	// rather than two.
+	frameTargetSamples = 0;
 	hasViewport = false;
 	hasScissor = false;
 	suspendedHasViewport = false;
@@ -695,6 +716,47 @@ idRenderBackendEacp::idRenderBackendEacp() {
 	warnedShowShadows = false;
 	warnedDepthPassShadows = false;
 	warnedShadowVertexProgram = false;
+}
+
+/*
+======================
+R_EacpMultiSamples
+
+r_multiSamples turned into a count the device will actually render at.
+
+**0 and 1 are both "no multisampling"**, which is what the cvar means: it
+defaults to 0, the settings menu writes 0 for "No Antialiasing", and
+regression/capture.cfg sets 0. Anything above that is rounded *down* to a power
+of two - the menu offers 2, 4, 8 and 16, and neither API has a shape for the
+numbers in between - and then walked down until the device says yes.
+
+Walked down rather than refused, because the cvar is archived: a config written
+on one machine is read on another, and 16x is the one the menu's own tooltip
+warns about. What that costs is a line in the log saying which number was
+actually taken, and the alternative is a black window on a GPU that offers 4.
+======================
+*/
+static int R_EacpMultiSamples( void ) {
+	int	wanted = r_multiSamples.GetInteger();
+
+	if ( wanted < 2 ) {
+		return 1;
+	}
+
+	// Down to a power of two, and no higher than what either backend offers.
+	int	count = 16;
+
+	while ( count > wanted ) {
+		count >>= 1;
+	}
+
+	GPU::Device &	device = GPU::Device::shared();
+
+	while ( count > 1 && !device.supportsSampleCount( count ) ) {
+		count >>= 1;
+	}
+
+	return count;
 }
 
 /*
@@ -802,7 +864,66 @@ void idRenderBackendEacp::Init( void ) {
 
 	common->Printf( "GPU: %s\n", device.name().c_str() );
 
+	// **The one thing here that is a decision rather than a statement**, and the
+	// one that has to be made before anything is compiled: since 4e.1 the frame
+	// is composed into a render target, and eacp gap 20 closed is what lets that
+	// target multisample. Every pipeline drawing into it carries the count, so
+	// this is read once here rather than per frame - and a change is applied by
+	// dropping what was built against the old number, which is why the settings
+	// menu's vid_restart is what the engine expects.
+	const int	samples = R_EacpMultiSamples();
+
+	if ( samples != r_multiSamples.GetInteger() && r_multiSamples.GetInteger() > 1 ) {
+		common->Printf( "eacp: %ix multisampling, clamped from the %i asked for\n",
+						samples, r_multiSamples.GetInteger() );
+	} else if ( samples > 1 ) {
+		common->Printf( "eacp: %ix multisampling\n", samples );
+	} else {
+		common->Printf( "eacp: no multisampling\n" );
+	}
+
+	if ( samples != frameTargetSamples ) {
+		frameTargetSamples = samples;
+
+		// The target, and everything compiled to draw into it. A pipeline's
+		// sample count has to match its pass on both backends, so a program
+		// built for the old number would have every draw rejected - and the
+		// ImGui overlay draws inside this frame, so its pipeline is one of them.
+		// All three are rebuilt on demand, which is what makes dropping them the
+		// whole of applying the change.
+		frameTarget.reset();
+		frameTargetWidth = 0;
+		frameTargetHeight = 0;
+
+		eacpRenderProgs.Shutdown();
+
+#ifndef IMGUI_DISABLE
+		// Dropped rather than handed back: GLimp_Shutdown destroyed the ImGui
+		// context on the way into this vid_restart and GLimp_Init built a new
+		// one, so the ImTextureData these were named in are already gone and
+		// there is nothing left to tell. What this releases is the GPU side.
+		imguiRenderer.reset();
+#endif
+	}
+
 	glConfig.isInitialized = true;
+}
+
+/*
+======================
+R_EacpFrameSampleCount
+
+What the frame target multisamples at, for the pipelines that draw into it -
+RenderProgs_Eacp.cpp's BuildPipeline, which is on the other side of the seam
+from the backend that owns the target.
+
+1 before Init has run, which is what a pipeline built with no target yet should
+be: the target is created at the same number and a pass that disagreed with its
+pipeline would be rejected rather than drawn wrong.
+======================
+*/
+int R_EacpFrameSampleCount( void ) {
+	return renderBackendEacp.FrameSampleCount();
 }
 
 /*
@@ -823,6 +944,7 @@ void idRenderBackendEacp::Shutdown( void ) {
 	frameTarget.reset();
 	frameTargetWidth = 0;
 	frameTargetHeight = 0;
+	frameTargetSamples = 0;
 
 	// What the content actually cost, rather than what plan.md section 4.3
 	// sized it at: two numbers, at the one moment the whole run is known.
@@ -879,6 +1001,14 @@ bool idRenderBackendEacp::EnsureFrameTarget( void ) {
 	// resolution - and what it costs is a usage bit on Metal and one descriptor
 	// on D3D12, neither of which is worth a vid_restart to save.
 	descriptor.sampleableDepth = true;
+
+	// r_multiSamples, clamped by Init to what the device renders at (eacp gap
+	// 20). 1 is what the target was before this and is byte-for-byte the same
+	// picture; above it, eacp draws into a multisampled texture beside this one
+	// and resolves into it at the end of every pass - which is what keeps the
+	// _currentRender copy, the depth capture and ReadPixels reading a finished
+	// picture rather than a half-resolved one.
+	descriptor.sampleCount = FrameSampleCount();
 
 	frameTarget.create( GPU::Device::shared(), descriptor, (const void *)NULL );
 
@@ -1206,10 +1336,12 @@ bool idRenderBackendEacp::EnsureImGuiRenderer( void ) {
 
 	Gui::DrawTarget	target;
 
-	// Single-sampled, which is the render target's rather than a preference
-	// (§5, gap 20), and BGRA8Unorm, which EnsureFrameTarget picked so that these
-	// pipelines could draw into either it or the drawable.
-	target.sampleCount = 1;
+	// The render target's sample count rather than a preference: the overlay is
+	// drawn inside the engine's own frame, into the target the game was composed
+	// into, and both backends reject a draw whose pipeline disagrees with its
+	// pass. BGRA8Unorm for the same reason - EnsureFrameTarget picked it so that
+	// these pipelines could draw into either it or the drawable.
+	target.sampleCount = FrameSampleCount();
 	target.colorFormat = GPU::PixelFormat::BGRA8Unorm;
 	target.depth = true;
 	target.stencil = true;

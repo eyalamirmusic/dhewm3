@@ -25,18 +25,18 @@ View::View()
     // plane whether or not anything tests it.
     setStencil(true);
 
-    // One sample, which is a consequence rather than a preference.
+    // One sample, which is a consequence rather than a preference, and stays one
+    // now that r_multiSamples means something again.
     //
     // Since step 4e the frame is composed into an app-owned render target and
-    // the drawable is a blit of it, and a texture target on eacp is
-    // single-sampled - it *is* what a resolve would produce, so there is
-    // nothing to resolve into. What reaches the screen therefore carries no
-    // multisampling however this is set, and asking the drawable for four
-    // samples would only make the blit rasterize the same picture four times.
+    // the drawable is a blit of it. Multisampling belongs to the target, where
+    // the scene is rasterized (TextureDescriptor::sampleCount, eacp gap 20); by
+    // the time the blit runs, the picture has already been resolved, and asking
+    // the drawable for four samples would only make one full-screen quad
+    // rasterize four times to produce the same pixels.
     //
-    // Doom 3 agrees with the number: r_multiSamples defaults to 0. What it did
-    // *not* get before this was any say - the view was on GPUView's default of
-    // four, and the renderer had no way to reach it.
+    // What the view did *not* have before step 4e was any say at all - it was on
+    // GPUView's default of four, and the renderer had no way to reach it.
     setSampleCount(1);
 
     // The engine's frame is driven off the display link rather than on demand:

@@ -41,6 +41,17 @@ class idImage;
 // below, which is a template and so has to live here.
 void R_EacpShaderCompileFailed( const char *what );
 
+// How many samples a pass into the frame target takes - r_multiSamples, clamped
+// by the backend's Init to what the device renders at, and 1 for the cvar's 0.
+// Every pipeline built here that draws into that target has to carry it, both
+// backends rejecting a draw whose pipeline disagrees with its pass.
+//
+// Answered by the backend, which owns the target, rather than read off the cvar:
+// the number is fixed for the life of a pipeline, and a cvar can move between
+// two draws. Changing it is a vid_restart, which is where the backend drops
+// everything compiled against the old one.
+int R_EacpFrameSampleCount( void );
+
 /*
 ================================================================================
 

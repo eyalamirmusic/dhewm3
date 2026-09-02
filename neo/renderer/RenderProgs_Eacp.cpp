@@ -1625,13 +1625,12 @@ idEacpRenderProgs::BuildPipeline( const GPU::ShaderLibrary &library,
 	descriptor.topology = GPU::PrimitiveTopology::Triangles;
 
 	// The render target's, which is the same colour format the drawable has -
-	// deliberately, so that these pipelines could draw into either - and
-	// single-sampled, because a texture target on eacp has nothing to resolve
-	// into and no multisampling to offer. Both backends reject a draw whose
-	// pipeline disagrees with the pass it is issued into, so this is not a
-	// preference.
+	// deliberately, so that these pipelines could draw into either - at the
+	// count r_multiSamples asked for and the device allowed (eacp gap 20). Both
+	// backends reject a draw whose pipeline disagrees with the pass it is issued
+	// into, so neither of these is a preference.
 	descriptor.colorFormat = GPU::PixelFormat::BGRA8Unorm;
-	descriptor.sampleCount = 1;
+	descriptor.sampleCount = R_EacpFrameSampleCount();
 
 	descriptor.blend = R_EacpBlendState( stateBits );
 	descriptor.colorWriteMask = R_EacpColorWriteMask( stateBits );
@@ -2240,11 +2239,13 @@ idEacpRenderProgs::BlitDraw
 The frame onto the screen, and one of the two pipelines here that PipelineFor
 does not build.
 
-Everything else draws into the render target, which is single-sampled and
-carries a depth-stencil buffer; this draws into the *drawable*, which is
-whatever GPUView was configured with. The two have to be described differently
-or the backend rejects the draw - so this builds its descriptor by hand rather
-than pretending the difference away with an argument to the shared one.
+Everything else draws into the render target, which carries a depth-stencil
+buffer and multisamples at whatever r_multiSamples asked for; this draws into
+the *drawable*, which is whatever GPUView was configured with - one sample,
+since the picture reaching it is already resolved. The two have to be described
+differently or the backend rejects the draw, so this builds its descriptor by
+hand rather than pretending the difference away with an argument to the shared
+one.
 
 There is no state to key it on. It is one quad, opaque, with no test of any
 kind, drawn once a frame.
@@ -2312,7 +2313,8 @@ A third description of the same shader, and each of the three fields that
 differ is the destination's rather than a choice. The image's texture is
 RGBA8Unorm, being every other image on this backend's format and what a
 material samples; it carries no depth buffer, an image having no use for one;
-and it is single-sampled like everything a texture target does.
+and it is single-sampled, an image being somewhere pixels are *copied to*
+rather than rasterized into - what it is copied from has already resolved.
 ====================
 */
 idEacpRenderProgs::blitDraw_t idEacpRenderProgs::CaptureDraw( void ) {
@@ -2367,7 +2369,10 @@ first 3D view, so in practice the first frame that draws a world.
 Three fields again, and all three are the destination's: R32Float because a
 window depth needs the mantissa (see TextureFormat::R32Float), no depth
 attachment because the depth here is what is being *read*, and single-sampled
-like every texture target.
+because _currentDepth is a plain image. What is read is single-sampled too even
+when the frame target is not: eacp resolves the depth plane into a buffer a
+shader can declare, which is what TextureDescriptor::sampleCount costs a
+sampleable-depth target and why nothing here changes with r_multiSamples.
 ====================
 */
 idEacpRenderProgs::depthCopyDraw_t idEacpRenderProgs::DepthCopyDraw( void ) {
