@@ -557,6 +557,12 @@ private:
 	// interaction is drawn through, so it has to be carried to the draw.
 	eacpStencil_t		lightStencil;
 
+	// Whether the shader passes being drawn are the post-process half, which
+	// on OpenGL is the isPostProcess RB_STD_DrawShaderPasses hands to
+	// RB_SetProgramEnvironment and here is read by the draws that set the gamma
+	// uniform.
+	bool				postProcessPass;
+
 	// One warning per unimplemented path rather than one per frame, which is
 	// the difference between a note and an unusable console.
 	bool				warnedCopyFramebuffer;
@@ -607,6 +613,7 @@ idRenderBackendEacp::idRenderBackendEacp() {
 	depthRangeFar = 1.0f;
 	appliedDepthHack = 0.0f;
 	lightStencil = ES_IGNORE;
+	postProcessPass = false;
 	warnedCopyFramebuffer = false;
 	warnedCompressed = false;
 	warnedExternalFormat = false;
@@ -1650,10 +1657,9 @@ none.
 The ARB path expresses that by swapping one texture: the normalization cube map
 that turns the interpolated vector to the light into a unit one becomes
 _ambient, whose every texel is the same value, so the "direction to the light"
-comes out the same everywhere on every surface. This backend has no cube map
-(gap 5) and needs none - the whole point of the substitution is that the answer
-does not depend on the lookup - so the constant is computed here and handed over
-as a uniform.
+comes out the same everywhere on every surface. This backend needs no cube map
+for it - the whole point of the substitution is that the answer does not depend
+on the lookup - so the constant is computed here and handed over as a uniform.
 
 It is read *back out of* R_AmbientNormalImage rather than taken from
 tr.ambientLightVector directly, and the difference is not rounding. That
@@ -1685,6 +1691,38 @@ static Float4 R_EacpAmbientLightVector( bool ambientLight ) {
 					 texel[1] / 255.0f * 2.0f - 1.0f,
 					 texel[2] / 255.0f * 2.0f - 1.0f,
 					 1.0f );
+}
+
+/*
+====================
+R_EacpGammaBrightness
+
+program.env[21] as RB_SetProgramEnvironment and RB_ARB2_DrawInteraction fill it:
+r_brightness and 1 / r_gamma with r_gammaInShader on, and the identity with it
+off - or inside the post-process half of the shader passes, where the shared
+code sets the identity too "to avoid applying them twice", a post-process stage
+reading a _currentRender that has already been corrected.
+
+The identity is also what a hardware ramp would leave the shader doing, and it
+is all r_gammaInShader 0 can mean on this host: GLimp_SetGamma has no display
+ramp to set and says so.
+
+The fourth value is the flag R_EacpGammaCorrected branches on, folded here so the
+shader compares one number: 1 when either setting is away from 1, and 0 when
+both are, which is when the correction would be pow( x, 1 ) - a value the shader
+is not asked to compute for the reason that function gives.
+====================
+*/
+static Float4 R_EacpGammaBrightness( bool postProcess ) {
+	if ( !r_gammaInShader.GetBool() || postProcess ) {
+		return asFloat4( 1.0f, 1.0f, 0.0f, 0.0f );
+	}
+
+	const float	brightness = r_brightness.GetFloat();
+	const float	gamma = r_gamma.GetFloat();
+	const bool	apply = ( brightness != 1.0f ) || ( gamma != 1.0f );
+
+	return asFloat4( brightness, 1.0f / gamma, apply ? 1.0f : 0.0f, 0.0f );
 }
 
 /*
@@ -2242,6 +2280,11 @@ void idRenderBackendEacp::DrawInteraction( const drawInteraction_t *din ) {
 
 	program->ambientLightVector = R_EacpAmbientLightVector( din->ambientLight != 0 );
 
+	// Never the post-process half: an interaction is drawn before the shader
+	// passes begin, which is what RB_ARB2_DrawInteraction's own unconditional
+	// env[21] amounts to.
+	program->gammaBrightness = R_EacpGammaBrightness( false );
+
 	program->bumpImage = *textures[0];
 	program->lightFalloffImage = *textures[1];
 	program->lightImage = *textures[2];
@@ -2281,7 +2324,13 @@ int idRenderBackendEacp::DrawShaderPasses( drawSurf_t **drawSurfs, int numDrawSu
 		return numDrawSurfs;
 	}
 
-	if ( drawSurfs[0]->material->GetSort() >= SS_POST_PROCESS ) {
+	// RB_STD_DrawShaderPasses' isPostProcess, kept for the draws below rather
+	// than handed to a program environment: it decides whether a reflection
+	// stage gets the gamma correction, and the shared code's answer is that the
+	// post-process half does not.
+	postProcessPass = ( drawSurfs[0]->material->GetSort() >= SS_POST_PROCESS );
+
+	if ( postProcessPass ) {
 		if ( r_skipPostProcess.GetBool() ) {
 			return 0;
 		}
@@ -3360,6 +3409,10 @@ void idRenderBackendEacp::DrawCubeStage( const srfTriangles_t *tri, const eacpSt
 
 	draw.program->cubeImage = *texture;
 
+	// Read by the reflect texgen alone, and set on every variant because the
+	// uniform block is the same size whichever of them is drawing.
+	draw.program->gammaBrightness = R_EacpGammaBrightness( postProcessPass );
+
 	drawProgram = draw.program;
 	drawPipeline = draw.pipeline;
 
@@ -3412,6 +3465,8 @@ void idRenderBackendEacp::DrawBumpyReflectStage( const srfTriangles_t *tri,
 
 	draw.program->cubeImage = *cube;
 	draw.program->bumpImage = *bump;
+
+	draw.program->gammaBrightness = R_EacpGammaBrightness( postProcessPass );
 
 	drawProgram = draw.program;
 	drawPipeline = draw.pipeline;

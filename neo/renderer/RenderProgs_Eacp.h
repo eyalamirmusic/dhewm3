@@ -201,6 +201,38 @@ enum eacpStencil_t {
 /*
 ================================================================================
 
+	idEacpGammaProgram
+
+	What r_gammaInShader adds to a program, for the programs that get it.
+
+	On OpenGL the correction is a MUL_SAT and three POWs that R_LoadARBProgram
+	splices into the source of every ARB fragment program the engine loads
+	(draw_arb2.cpp, "dhewm3tmpres") - and *only* those. A fixed-function stage
+	has no program to splice into, so the 2D, the ambient passes, the fog and
+	the blend lights are drawn on that build with no gamma at all, and this
+	build draws them the same way. What had a fragment program there, and so
+	derives from this here, is the interaction and the two reflection programs.
+
+	The uniform is program.env[21] with a flag beside it: ( r_brightness,
+	1 / r_gamma, apply, 0 ). GammaCorrected says why the flag exists.
+
+================================================================================
+*/
+
+class idEacpGammaProgram : public eacp::GPU::ShaderProgram {
+public:
+	eacp::GPU::Uniform<eacp::GPU::Float4>		gammaBrightness;
+
+protected:
+	// The fragment colour through the correction, for a define() to hand to
+	// setFragment. A member rather than a free function because the branch it
+	// records goes through ShaderProgram's protected var() and ifThen().
+	eacp::GPU::Float4		GammaCorrected( const eacp::GPU::Float4 &color );
+};
+
+/*
+================================================================================
+
 	idEacpStageProgram
 
 	The generic material stage: a texture sampled at a transformed coordinate,
@@ -337,7 +369,7 @@ enum eacpCubeTexgen_t {
 ================================================================================
 */
 
-class idEacpCubeProgram : public eacp::GPU::ShaderProgram {
+class idEacpCubeProgram : public idEacpGammaProgram {
 public:
 							idEacpCubeProgram( eacpCubeTexgen_t texgen,
 											   eacp::GPU::TextureSampling sampling );
@@ -361,8 +393,12 @@ public:
 
 	eacp::GPU::Uniform<eacp::GPU::TextureCube>	cubeImage;
 
+	// idEacpGammaProgram's gammaBrightness is read by ECT_REFLECT alone:
+	// environment.vfp is a fragment program on the ARB path and gets the
+	// injected correction, where a skybox and a diffuse cube are fixed-function
+	// texgens there and get none.
 	EACP_SHADER( modelViewProjection, localViewOrigin, texgenMatrix,
-				 colorModulate, colorAdd, cubeImage )
+				 colorModulate, colorAdd, cubeImage, gammaBrightness )
 
 private:
 	eacpCubeTexgen_t		texgen;
@@ -398,7 +434,7 @@ private:
 ================================================================================
 */
 
-class idEacpBumpyReflectProgram : public eacp::GPU::ShaderProgram {
+class idEacpBumpyReflectProgram : public idEacpGammaProgram {
 public:
 							idEacpBumpyReflectProgram( eacp::GPU::TextureSampling cube,
 													   eacp::GPU::TextureSampling bump );
@@ -421,9 +457,12 @@ public:
 	eacp::GPU::Uniform<eacp::GPU::TextureCube>	cubeImage;
 	eacp::GPU::Uniform<eacp::GPU::Texture2D>	bumpImage;
 
+	// idEacpGammaProgram's gammaBrightness, as on the interaction program:
+	// bumpyEnvironment.vfp is a fragment program on the ARB path and gets the
+	// injected correction.
 	EACP_SHADER( modelViewProjection, localViewOrigin,
 				 modelRowX, modelRowY, modelRowZ,
-				 cubeImage, bumpImage )
+				 cubeImage, bumpImage, gammaBrightness )
 };
 
 /*
@@ -520,7 +559,7 @@ public:
 ================================================================================
 */
 
-class idEacpInteractionProgram : public eacp::GPU::ShaderProgram {
+class idEacpInteractionProgram : public idEacpGammaProgram {
 public:
 	// The five samplings, in the order the textures are declared below. One
 	// program per distinct tuple - see idEacpRenderProgs::InteractionDraw.
@@ -579,6 +618,9 @@ public:
 	// and w selects it - 1 for an ambient light, 0 for every other kind.
 	eacp::GPU::Uniform<eacp::GPU::Float4>		ambientLightVector;
 
+	// gammaBrightness is idEacpGammaProgram's, and it is in the list below
+	// because RB_ARB2_DrawInteraction sets env[21] on every interaction.
+
 	eacp::GPU::Uniform<eacp::GPU::Texture2D>	bumpImage;
 	eacp::GPU::Uniform<eacp::GPU::Texture2D>	lightFalloffImage;
 	eacp::GPU::Uniform<eacp::GPU::Texture2D>	lightImage;
@@ -590,7 +632,7 @@ public:
 				 bumpMatrixS, bumpMatrixT, diffuseMatrixS, diffuseMatrixT,
 				 specularMatrixS, specularMatrixT,
 				 colorModulate, colorAdd, diffuseColor, specularColor,
-				 ambientLightVector,
+				 ambientLightVector, gammaBrightness,
 				 bumpImage, lightFalloffImage, lightImage, diffuseImage, specularImage )
 };
 

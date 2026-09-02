@@ -55,6 +55,43 @@ the numbers are the same: 297 identical across two captures, 297 moved with
 size does not reach these - and **none of the 297 pairs hash the same**, which
 is what two renderers agreeing to the eye and not to the bit looks like.
 
+## What step 4e.5 learned about the gate
+
+Four things, none of them about the renderer.
+
+**`GATE_ARGS` is extra `+set` pairs for the engine**, appended before the
+`+exec`. It exists for a cvar that changes every frame - `r_gamma`, say - which
+can never match the baseline and has to be checked against the *other* build
+captured the same way:
+
+```sh
+GATE_ARGS='+set r_gamma 1.5 +set r_brightness 1.2' \
+	GAME=dhewm3-eacp BUILD=$PWD/cmake-build-eacp caffeinate -du ./regression/gate.sh capture eacp-gamma
+GATE_ARGS='+set r_gamma 1.5 +set r_brightness 1.2' ./regression/gate.sh capture gl-gamma
+```
+
+**The SDL/GL build is not byte-deterministic.** Two captures of the same
+unmodified binary differ on frame 99, by two pixels of two out of 255. It
+matters because that frame also moves between a capture taken months apart from
+another, which reads like a shared-code regression until a second capture of the
+same build shows it moving without one. The eacp build has been byte-identical
+across captures at every step, so "identical" is a claim only that build can
+make, and one moved frame on GL is noise until the images say otherwise.
+
+**A live pinned-camera shot is not an instrument without `com_fixedTic 1`.**
+dhewm3 advances game time from the wall clock, so a `screenshot` after a
+`setviewpos` lands on a different game tick every run - and the tour's first
+stop is looking at a fog light bound to a mover. Two live runs of one build read
+30.8 and 35.3 mean there. `com_fixedTic 1` runs one tick per frame and makes the
+sequence a function of the command buffer alone, at which point two runs are
+byte-identical. The demo playback the gate uses never had the problem.
+
+**The Metal validation layers move the eacp build's frames.** A capture under
+`MTL_SHADER_VALIDATION=1` differs from one without on 99 of 297 frames, by a
+mean of 0.000 of 255 and a worst pixel of 25 - instrumented shaders and a
+different floating-point schedule, not a bug. Run the validation capture for its
+log and compare hashes only between captures taken the same way.
+
 ## Both paths have to be pinned, not just fs_savepath
 
 dhewm3 keeps `dhewm.cfg` on `fs_configpath`, which is separate from

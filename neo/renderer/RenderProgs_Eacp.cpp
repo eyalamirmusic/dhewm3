@@ -165,6 +165,49 @@ void R_EacpShaderCompileFailed( const char *what ) {
 /*
 ================================================================================
 
+	idEacpGammaProgram
+
+================================================================================
+*/
+
+/*
+====================
+idEacpGammaProgram::GammaCorrected
+
+The correction R_LoadARBProgram splices into an ARB fragment program, in the
+EDSL:
+
+    rgb = pow( saturate( rgb * brightness ), 1 / gamma )
+
+It sits behind a branch on the uniform's flag rather than being computed and
+multiplied out, and that is not an optimisation. At the default settings the
+expression is pow( x, 1.0 ), which neither shading language promises to return
+as exactly x, and a frame that differs by an ulp from the one before this
+uniform existed is a frame the gate cannot tell from a regression. The branch is
+on a uniform, so every fragment of a draw takes the same side of it, which is
+the cheap kind.
+
+The saturate is written out although an 8-bit attachment would clamp anyway,
+because the pow reads the value before the attachment does, and a negative base
+is what the original's MUL_SAT is there to keep away from POW. Alpha is left
+alone, as the injected code leaves result.color.w.
+====================
+*/
+GPU::Float4 idEacpGammaProgram::GammaCorrected( const GPU::Float4 &color ) {
+	auto	rgb = var( color.xyz() );
+
+	ifThen( gammaBrightness.z() > 0.5f, [&]() {
+		auto	scaled = GPU::min( GPU::max( rgb.get() * gammaBrightness.x(), 0.0f ), 1.0f );
+
+		rgb = GPU::pow( scaled, gammaBrightness.y() );
+	} );
+
+	return GPU::float4( rgb.get(), color.w() );
+}
+
+/*
+================================================================================
+
 	idEacpCubeProgram
 
 ================================================================================
@@ -226,7 +269,10 @@ void idEacpCubeProgram::define( void ) {
 		// which is the reflection of the eye vector about the normal.
 		auto	reflection = unitNormal * ( GPU::dot( eye, unitNormal ) * 2.0f ) - eye;
 
-		setFragment( GPU::sample( cubeImage, reflection ) * surfaceColor );
+		// Through the gamma correction, which the two texgens below are not:
+		// this one is a fragment program on the ARB path and they are
+		// fixed-function.
+		setFragment( GammaCorrected( GPU::sample( cubeImage, reflection ) * surfaceColor ) );
 		return;
 	}
 
@@ -339,15 +385,20 @@ void idEacpBumpyReflectProgram::define( void ) {
 	// **Alpha is zero because the original writes nothing there at all, and zero
 	// is the value that cannot change what is already in the buffer.**
 	// `MOV result.color.xyz, R0` leaves w undefined by the ARB specification, so
-	// there is no number here to copy - what there is instead is what the three
-	// materials in the demo pk4 that reach this program do with it. Two of them
-	// (`textures/glass/glass1` and `glass2`) set `maskalpha`, so the channel is
-	// not written; the third (`textures/decals/p_oppressive`) is `blend add`,
-	// where a source alpha of zero leaves the destination's exactly as it was.
-	// So this is the one value that is invisible on every path the content
-	// actually takes, which is the best a fragment program's undefined output
-	// can be reproduced as.
-	setFragment( GPU::float4( GPU::sample( cubeImage, reflection ).xyz(), 0.0f ) );
+	// there is no number here to copy - what there is instead is what the
+	// materials the demo's maps place that reach this program do with it.
+	// `textures/sfx/chiglass1blue` and `textures/decals/p_oppressive` are
+	// `blend add`, where the destination alpha becomes src + dst;
+	// `textures/outside/outfactory_new2` is `blend gl_dst_alpha, gl_one`, where
+	// it becomes src * dst + dst. A source alpha of zero leaves the
+	// destination's exactly as it was under both, so zero is the one value that
+	// is invisible on every path the content actually takes, which is the best
+	// a fragment program's undefined output can be reproduced as. (The three
+	// `maskalpha` glasses - glass1, glass2, mc_medglass - never reach this
+	// program: they have no lighting stage, so no implicit bump map, and take
+	// idEacpCubeProgram's ECT_REFLECT instead.)
+	setFragment( GammaCorrected( GPU::float4( GPU::sample( cubeImage, reflection ).xyz(),
+											  0.0f ) ) );
 }
 
 /*
@@ -561,7 +612,7 @@ void idEacpInteractionProgram::define( void ) {
 	// authored half-bright so that a highlight has somewhere to go.
 	auto	specular = ramp * ramp * specularColor * ( specularTexel + specularTexel );
 
-	setFragment( light * ( diffuse + specular ) * surfaceColor );
+	setFragment( GammaCorrected( light * ( diffuse + specular ) * surfaceColor ) );
 }
 
 /*

@@ -40,6 +40,16 @@
 # sleeps (plan.md section 5, gap 13) - so hold the display awake for the run:
 #
 #   caffeinate -du ./regression/gate.sh capture x
+#
+# GATE_ARGS (default empty) is appended to the engine's command line before the
+# +exec, for a capture that has to differ from capture.cfg in one setting on
+# both builds - which is how a cvar that changes every frame is checked against
+# the other renderer rather than against the baseline it cannot match:
+#
+#   GATE_ARGS='+set r_gamma 1.5 +set r_brightness 1.2' ./regression/gate.sh capture x
+#
+# It goes before +exec so that the cfg's own seta lines still win, the same
+# way they win over a stale dhewm.cfg.
 
 set -eu
 
@@ -84,8 +94,10 @@ run_engine() {	# run_engine <cfg> <logfile>
 		mkdir -p "$work/$gamedir/demos"
 		cp "$keep_demo" "$work/$gamedir/demos/reference.demo"
 	}
+	# GATE_ARGS is split on purpose: it is extra +set pairs for the engine.
+	# shellcheck disable=SC2086
 	"$exe" +set fs_basepath "$basepath" +set fs_savepath "$work" \
-	       +set fs_configpath "$work" +exec "$1" > "$2" 2>&1 &
+	       +set fs_configpath "$work" ${GATE_ARGS:-} +exec "$1" > "$2" 2>&1 &
 	engine_pid=$!
 }
 
