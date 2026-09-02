@@ -16,6 +16,11 @@ useful commandline arguments, for example how to tell dhewm3 where the game data
 
 ## dhewm3 Settings Menu
 
+**Not available on this fork.** The menu is Dear ImGui drawn through SDL and OpenGL, and
+step 5 deleted both; there is no ImGui backend for the eacp host yet. `F10` does nothing
+and `dhewm3Settings` prints a line saying so. Everything below describes what upstream
+dhewm3 does, and is what an eacp backend would restore.
+
 When built with [Dear ImGui](https://github.com/ocornut/imgui) integration (which is the default
 when using SDL2), dhewm3 has an advanced settings menu with many settings that the main menu doesn't
 offer, including a *Control Bindings* menu that supports as many keys per command as you want and is
@@ -54,6 +59,12 @@ most keyboard layouts. However you can disable that, so you can bind that key li
 (for example to select the chainsaw), by setting `in_ignoreConsoleKey 1`.
 
 ## Using Gamepads
+
+**Not available on this fork.** Gamepad support was SDL's, from the device enumeration to
+the button names, and step 5 deleted SDL. The cvars and the `JOY_*` binding names below
+still exist and archive across builds, so a config written on upstream dhewm3 carries
+over intact - nothing sets those inputs on this build. Everything below describes what
+upstream dhewm3 does.
 
 Starting with 1.5.3, dhewm3 supports using gamepads, as long as they're supported by SDL2.  
 This includes XBox Controllers (and compatible ones), Playstation 3-5 controllers,
@@ -204,36 +215,43 @@ This can be configured with the following CVars:
 - `in_namePressed` if set to `1`, the currently pressed key/button (on keyboard/mouse/gamepad)
   is printed to the console - useful when setting key-bindings in the console or a config. Default is `0`.
 
-- `in_kbd` allows you to set your keyboard layout so the console key works better. Mostly useful with SDL1.2
+- `in_kbd` allows you to set your keyboard layout so the console key works better.
+  `auto` (the default) detects it from the current layout.
 - `in_tty` tab completion and history for input from the **terminal** (on Unix-likes, like Linux, macOS, BSD, ...)
 
 - `r_fullscreenDesktop` configures fullscreen windows (when `r_fullscreen` is `1`).  
   `0`: "real"/"exclusive" fullscreen mode, might switch screen resolution  
   `1`: "desktop" fullscreen mode, which keeps desktop resolution and is more like a borderless fullscreen window
 - `r_windowResizable` if set to `1` (the default), the dhewm3 window (when in windowed mode..)
-   can be freely resized. Needs SDL2; with 2.0.5 and newer it's applied immediately, otherwise when
-   creating the window (startup or `vid_restart`).
+   can be freely resized.
 - `r_fillWindowAlphaChan` Make sure alpha channel of windows default framebuffer is completely opaque
   at the end of each frame. Needed at least when using Wayland.  
   `1`: do this, `0`: don't do it, `-1`: let dhewm3 decide (default)
 
+  *On this fork the window is eacp's and none of the four above reaches it yet: the window
+  is created at a fixed size, in windowed mode, and cannot be resized or made fullscreen
+  from the console. The cvars are kept because they archive, and because the window
+  parameters are a scheduled step (`plan.md` §5, gap 8).*
+
 - `r_useSoftParticles` Soften particle transitions when player walks through them or they cross solid geometry.
-   Needs r_enableDepthCapture. Can slow down rendering! `1`: enable (default), `0`: disable
+   Needs r_enableDepthCapture. Can slow down rendering! `1`: enable (default), `0`: disable.
+   Not implemented on this fork: the soft-particle program is the one piece of the
+   renderer that was not ported (`plan.md` §8), so particles have hard edges whatever
+   this is set to.
 - `r_enableDepthCapture` Enable capturing depth buffer to texture. `0`: disable, `1`: enable,  
   `-1`: enable automatically (if soft particles are enabled; the default).   
    This can be used in custom materials with the "_currentDepth" texture.
 - `r_gammaInShader` If set to `1` (the default), gamma and brightness are applied in shaders
    instead of using hardware gamma. May cause visual glitches with some mods like Sikkmod.
-- `r_useCarmacksReverse` Use Z-Fail ("Carmack's Reverse") when rendering shadows (default `1`)
-- `r_useStencilOpSeparate` Use glStencilOpSeparate() (if available) when rendering shadow (default `1`)
+- `r_useCarmacksReverse` Use Z-Fail ("Carmack's Reverse") when rendering shadows (default `1`).
+   On this fork only `1` is implemented, and setting it to `0` warns once and keeps drawing
+   Z-Fail shadows.
 - `r_scaleMenusTo43` Render full-screen menus in 4:3 by adding black bars on the left/right if necessary (default `1`)
 - `r_supportNoSpecular` Allow using the "nospecular" parm of lights under certain circumstances. If set to:
     - `0` "nospecular" will always be ignored, as it's the case in Vanilla Doom3
     - `1` "nospecular" is always used, even in old maps where it changes what they look like
     - `-1` (the default) "nospecular" is only used in (new) maps that explicitly enable it
       by setting `"allow_nospecular" "1"` in the worldspawn, existing maps continue to ignore it
-- `r_glDebugContext` Enable OpenGL debug context and printing warnings/errors from the graphics driver.  
-  Changing that CVar requires a `vid_restart` (or set it as startup argument)
 
 - `image_usePrecompressedTextures` can now also be set to `2`.
     - `1` Use precompressed textures (.dds files), no matter which format they're in

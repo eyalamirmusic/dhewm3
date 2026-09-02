@@ -28,12 +28,19 @@
 # on the engine indefinitely: it is a windowed game being driven by a script,
 # and the ways it can sit there are not all worth enumerating.
 #
-# A build tree holds one binary, named dhewm3, and BUILD says which tree:
+# A build tree holds one binary, named dhewm3. BUILD says which tree, and
+# defaults to cmake-build-eacp, the one this port is built in:
 #
-#   BUILD=$PWD/cmake-build-eacp ./regression/gate.sh capture x
+#   BUILD=$PWD/some-other-tree ./regression/gate.sh capture x
 #
 # (GAME still overrides the name, which is what it was for when the tree held
 # the SDL/GL executable next to the port. Step 5 deleted that one.)
+#
+# A binary that links libSDL3 is refused. After step 5 no honest build of this
+# tree does, so one that does is a stale tree left over from before it - and a
+# capture taken from the wrong binary is the one way this harness can lie
+# quietly. cmake-build-debug is the tree that used to hold the SDL/GL target;
+# if you still have it, it is exactly what this catches.
 #
 # The frame is driven by the display link, which stops when the panel sleeps
 # (plan.md section 5, gap 13) - so hold the display awake for the run:
@@ -54,7 +61,7 @@
 set -eu
 
 root=$(cd "$(dirname "$0")/.." && pwd)
-build=${BUILD:-$root/cmake-build-debug}
+build=${BUILD:-$root/cmake-build-eacp}
 timeout=${GATE_TIMEOUT:-300}
 work=$root/regression/work
 gamedir=demo
@@ -66,6 +73,13 @@ elif [ -x "$build/neo/$game" ]; then
 	exe=$build/neo/$game
 else
 	echo "no $game binary under $build - set BUILD to your build directory" >&2
+	exit 1
+fi
+
+# The binary must be this tree's, not one from before step 5. See the note above.
+if otool -L "$exe" 2>/dev/null | grep -qi 'libSDL'; then
+	echo "$exe links libSDL - that is a build from before step 5, not this tree" >&2
+	echo "(rebuild, or point BUILD at the tree you meant)" >&2
 	exit 1
 fi
 

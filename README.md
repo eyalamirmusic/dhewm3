@@ -1,9 +1,10 @@
 # ABOUT
 
-_dhewm 3_ is a _Doom 3_ GPL source port. **This fork targets macOS (universal binaries) and Windows only.**
+_dhewm 3_ is a _Doom 3_ GPL source port. **This fork targets macOS only**, and renders
+through Metal rather than OpenGL. See [plan.md](./plan.md) for what that means and what
+is still missing; the Windows host is scheduled but not written.
 
-The goal of _dhewm 3_ is bring _DOOM 3_ with the help of SDL to all suitable
-platforms.
+The goal of _dhewm 3_ is bring _DOOM 3_ to all suitable platforms.
 
 Bugs present in the original _DOOM 3_ will be fixed (when identified) without
 altering the original gameplay.
@@ -28,14 +29,16 @@ altering the original gameplay.
 Compared to the original _DOOM 3_, the changes of _dhewm 3_ worth mentioning are:
 
 - 64-bit port
-- SDL for low-level OS support, OpenGL and input handling
+- [eacp](https://github.com/eyalamirmusic/eacp) for low-level OS support and input handling,
+  and Metal for rendering. Upstream dhewm3 uses SDL and OpenGL; this fork deleted both.
 - OpenAL for audio output, all OS-specific audio backends are gone
 - OpenAL EFX for EAX reverb effects (read: EAX-like sound effects on all platforms/hardware)
-- Gamepad support
-    - *Rumble* is currently **not** supported
 - Better support for widescreen (and arbitrary display resolutions)
 - A build system based on CMake
-- An **advanced**, mod-independent **settings menu** (opened with `F10` by default)
+
+Two of upstream's features are compiled but do nothing on this fork, because both
+were SDL's: **gamepad support**, and the **settings menu** (`F10`) - Dear ImGui has no
+backend for the eacp host yet, and `dhewm3Settings` says so rather than opening.
 
 See [Changelog.md](./Changelog.md) for a more complete changelog.
 
@@ -59,19 +62,20 @@ See https://dhewm3.org/#how-to-install for game data installation instructions.
 
 ## Configuration
 
-See [Configuration.md](./Configuration.md) for dhewm3-specific configuration, especially for 
-using gamepads or the **new settings menu**.
+See [Configuration.md](./Configuration.md) for dhewm3-specific configuration.
 
 ## Compiling
 
-This fork supports **macOS** (as a universal arm64 + x86_64 binary) and **Windows**.
-The build system is [CMake](http://cmake.org/) 3.21 or newer.
+This fork supports **macOS** only. The build system is [CMake](http://cmake.org/) 3.21
+or newer.
 
 Required libraries are not part of the tree:
 
 - [OpenAL Soft](https://openal-soft.org/) (Apple's and Creative's OpenAL are made of fail)
-- [SDL 3](https://libsdl.org/)
 - libcurl (optional, required for server downloads)
+
+[eacp](https://github.com/eyalamirmusic/eacp) is fetched by CMake (CPM) rather than
+installed; point `CPM_eacp_SOURCE` at a local checkout to build against one.
 
 The build is the usual CMake two-liner, run from the root of the repository:
 
@@ -87,8 +91,9 @@ Useful options (pass as `-DOPTION=VALUE` to the first command):
 
 | Option | Default | Meaning |
 | ------ | ------- | ------- |
-| `CMAKE_OSX_ARCHITECTURES` | `arm64;x86_64` | macOS only: which architectures to build for |
-| `CMAKE_PREFIX_PATH` | - | where to look for SDL3 and OpenAL Soft |
+| `CMAKE_OSX_ARCHITECTURES` | unset (native) | which architectures to build for |
+| `CMAKE_PREFIX_PATH` | - | where to look for OpenAL Soft |
+| `CPM_eacp_SOURCE` | - | build against a local eacp checkout instead of fetching one |
 | `BASE` / `D3XP` | `ON` | build the Doom 3 / Resurrection of Evil game code |
 | `HARDLINK_GAME` | `OFF` | link the game code into the executable instead of separate libraries |
 | `ASAN` / `UBSAN` | `OFF` | build with the Address / Undefined Behavior Sanitizer |
@@ -100,36 +105,29 @@ Run `cmake -LH -B build` for the full list.
 Install the dependencies with [Homebrew](https://brew.sh):
 
 ```
-brew install cmake sdl3 openal-soft
+brew install cmake openal-soft
 ```
 
 Homebrew keeps openal-soft keg-only, but CMake finds it anyway - the buildsystem asks
 `brew` where it lives.
 
-Homebrew only ships single-architecture libraries, though, so they can't go into a
-universal binary. For a **native-only** build - which is what you want while developing -
-say so explicitly:
+`CMAKE_OSX_ARCHITECTURES` is set nowhere in this fork, so the two-liner above builds
+natively for the machine it runs on, which is what you want while developing. A
+**universal** build is not something this fork has been shown to produce: it would need
+a universal OpenAL Soft (Homebrew ships single-architecture libraries) *and* a universal
+eacp, and the second has not been tried. If you ask for one anyway:
 
 ```
-cmake -B build -DCMAKE_OSX_ARCHITECTURES=arm64
-cmake --build build --parallel
-```
-
-For an actual **universal** build you need universal SDL3 and OpenAL Soft. Build them
-from source once and point CMake at the result:
-
-```
-cmake -S /path/to/SDL -B build-sdl -DCMAKE_OSX_ARCHITECTURES="arm64;x86_64" \
+cmake -S /path/to/openal-soft -B build-openal -DCMAKE_OSX_ARCHITECTURES="arm64;x86_64" \
       -DCMAKE_INSTALL_PREFIX=$PWD/deps
-cmake --build build-sdl --parallel && cmake --install build-sdl
-# ... and the same for openal-soft ...
+cmake --build build-openal --parallel && cmake --install build-openal
 
-cmake -B build -DCMAKE_PREFIX_PATH=$PWD/deps
+cmake -B build -DCMAKE_PREFIX_PATH=$PWD/deps -DCMAKE_OSX_ARCHITECTURES="arm64;x86_64"
 cmake --build build --parallel
 ```
 
-If a dependency turns out not to be universal, CMake says so at configure time instead
-of letting the linker fail with something cryptic. See
+CMake checks at configure time that OpenAL is universal when you ask for two
+architectures, rather than letting the linker fail with something cryptic. See
 [.github/workflows/macos.yml](.github/workflows/macos.yml) for the exact commands CI uses.
 
 Once it's built you can run it right there:
@@ -143,21 +141,10 @@ that contains `base/` with `pak000.pk4` to `pak008.pk4`.*
 
 ### Windows
 
-Get the dependencies with [vcpkg](https://vcpkg.io/):
-
-```
-vcpkg install sdl3 openal-soft curl
-```
-
-Then point CMake at vcpkg's toolchain file and pick an architecture:
-
-```
-cmake -A x64 -DCMAKE_TOOLCHAIN_FILE=C:/path/to/vcpkg/scripts/buildsystems/vcpkg.cmake -B build
-cmake --build build --config RelWithDebInfo
-```
-
-Use `-A Win32` for a 32bit build. Opening the generated solution in Visual Studio works
-too - `dhewm3` is already set as the startup project.
+There is no Windows build. Upstream dhewm3 has one and this fork used to; step 5 of
+[plan.md](./plan.md) deleted the SDL host it was built on, and CMake fails with a
+message saying so rather than configuring something that cannot link. The Windows eacp
+host is a scheduled step, and `neo/sys/win32/` is kept in the tree for it.
 
 ## Contributing
 

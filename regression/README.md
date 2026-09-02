@@ -1,8 +1,10 @@
-# The Phase 1 regression gate
+# The regression gate
 
-Phase 1 puts an `idRenderBackend` seam under the renderer without changing a
-pixel of the output. That claim needs measuring, not asserting, and this is what
-measures it: a recorded render demo, replayed frame by frame, hashed.
+Phase 1 put an `idRenderBackend` seam under the renderer without changing a
+pixel of the output, and Phase 2 built a Metal backend behind that seam and then
+deleted the OpenGL one. Both claims need measuring rather than asserting, and
+this is what measures them: a recorded render demo, replayed frame by frame,
+hashed.
 
 ```sh
 ./regression/gate.sh record            # once, on a known-good build
@@ -33,7 +35,7 @@ looks like a hang. `caffeinate -du` in front of the run is the whole fix, and it
 is not optional:
 
 ```sh
-BUILD=$PWD/cmake-build-eacp caffeinate -du ./regression/gate.sh capture after
+caffeinate -du ./regression/gate.sh capture after
 ```
 
 **Compare a build against itself.** Hashes are only comparable within one
@@ -48,8 +50,15 @@ for.
 
 Both builds were checked in both directions before being trusted, with the same
 numbers: 297 identical across two captures, 297 moved with `r_skipSpecular 1`.
-Step 5 deleted the SDL/GL one; a build tree holds one binary now, named
-`dhewm3`, and `BUILD` says which tree.
+
+**There is one binary now.** Step 5 deleted the SDL/GL one; a build tree holds a
+single `dhewm3`, `BUILD` defaults to `cmake-build-eacp`, and `GAME` has nothing
+left to choose. `gate.sh` refuses a binary that links `libSDL3`, because after
+step 5 no honest build of this tree does - such a binary is a stale tree from
+before it, and measuring the wrong binary is the one way this harness can lie
+quietly. If you still have a `cmake-build-debug` from Phase 1, that is exactly
+what the check catches; there is no reason to delete it, but do not point
+`BUILD` at it and expect a comparison.
 
 ## What steps 4e.5 to 4e.8 learned about the gate
 
@@ -58,22 +67,25 @@ buys each build, under "What the tour covers" below.
 
 **`GATE_ARGS` is extra `+set` pairs for the engine**, appended before the
 `+exec`. It exists for a cvar that changes every frame - `r_gamma`, say - which
-can never match the baseline and has to be checked against the *other* build
-captured the same way:
+can never match the baseline. While there were two builds, the way to check one
+was to capture *both* the same way and compare the pair against each other:
 
 ```sh
 GATE_ARGS='+set r_gamma 1.5 +set r_brightness 1.2' \
-	GAME=dhewm3-eacp BUILD=$PWD/cmake-build-eacp caffeinate -du ./regression/gate.sh capture eacp-gamma
-GATE_ARGS='+set r_gamma 1.5 +set r_brightness 1.2' ./regression/gate.sh capture gl-gamma
+	caffeinate -du ./regression/gate.sh capture eacp-gamma
 ```
 
-**The SDL/GL build is not byte-deterministic.** Two captures of the same
-unmodified binary differ on frame 99, by two pixels of two out of 255. It
-matters because that frame also moves between a capture taken months apart from
-another, which reads like a shared-code regression until a second capture of the
-same build shows it moving without one. The eacp build has been byte-identical
-across captures at every step, so "identical" is a claim only that build can
-make, and one moved frame on GL is noise until the images say otherwise.
+With one build left, `GATE_ARGS` is for capturing a second baseline under the
+setting and comparing later runs to that, which is the same trick with one leg.
+
+**The SDL/GL build was not byte-deterministic.** Two captures of the same
+unmodified binary differed on frame 99, by two pixels of two out of 255. It
+mattered because that frame also moved between captures taken months apart,
+which reads like a shared-code regression until a second capture of the same
+build shows it moving without one. The eacp build has been byte-identical across
+captures at every step, including the whole of step 5 - thirteen commits, every
+one of them 297 of 297 against the same baseline - so "identical" is a claim
+this build can make and the GL one never could.
 
 **A live pinned-camera shot is not an instrument without `com_fixedTic 1`.**
 dhewm3 advances game time from the wall clock, so a `screenshot` after a
@@ -110,8 +122,9 @@ cp regression/capture.cfg "$scratch/demo/"
 
 `fs_savepath`'s game directory is first in the engine's search path, so the
 shadow wins, and demo playback resolves a material *by name* - which is what
-makes the same edited file drive both builds through the same 297 instants. The
-same run works on either binary; give each its own scratch directory.
+made the same edited file drive both builds through the same 297 instants while
+there were two of them, and what still makes it drive one build's before and
+after.
 
 ## Both paths have to be pinned, not just fs_savepath
 
@@ -147,27 +160,26 @@ Two things about the level are worth knowing before editing the tour:
 - **It opens on a cinematic** that owns the camera for the first stretch, so the
   script sits through it before taking over. Record without that wait and you
   capture the cinematic instead of the level.
-- **`wait N` counts command-buffer executions, not frames — and the two builds
-  do not consume them at the same rate.** `idEventLoop::RunEventLoop` runs the
-  buffer once per event it processes and once more when the queue is empty, so
-  what N buys is one iteration of *that* loop rather than one frame. Measured
-  with `com_fixedTic 1`, which pins the game clock to one tic per rendered
-  frame: `wait 3150` reaches **52.7 seconds** of level time on `dhewm3-eacp`
-  and **7.7 seconds** on `dhewm3`, because the SDL build drains about 6.85
-  events a frame where the eacp one drains one.
+- **`wait N` counts command-buffer executions, not frames, and the rate is a
+  property of the host.** `idEventLoop::RunEventLoop` runs the buffer once per
+  event it processes and once more when the queue is empty, so what N buys is
+  one iteration of *that* loop rather than one frame. Measured with
+  `com_fixedTic 1`, which pins the game clock to one tic per rendered frame:
+  `wait 3150` reached **52.7 seconds** of level time on the eacp build and
+  **7.7 seconds** on the SDL/GL one, because the SDL build drained about 6.85
+  events a frame where this one drains one. On this build, `wait N` is N/60
+  seconds.
 
-  So **a live-game script is not a clock two builds share**, and a screenshot
-  taken at the same `wait` count in each of them is a picture of two different
-  moments. Pin the level clock instead: `com_fixedTic 1` and a count calibrated
-  per build — `wait N` is N/60 seconds on the eacp build and about N/411 on the
-  SDL one — and print `backEnd.viewDef->renderView.time` to check where a run
-  actually landed. The gate itself is immune and that is the point of it: a
-  recorded demo replays the render world frame by frame, so both builds draw the
-  same instants whatever their event rate.
+  So **a live-game script is not a clock two hosts share**, and a screenshot
+  taken at the same `wait` count in each is a picture of two different moments.
+  Pin the level clock instead: `com_fixedTic 1`, a count calibrated on the build
+  you are running, and print `backEnd.viewDef->renderView.time` to check where a
+  run actually landed. The gate itself is immune and that is the point of it: a
+  recorded demo replays the render world frame by frame, whatever the event rate.
 
   This is not hypothetical. §6 of `plan.md` carried an "over-bright frame" as a
   defect of the eacp backend for two steps on the strength of a comparison made
-  this way; pinned properly, both builds draw it.
+  this way; pinned properly, both builds drew it.
 
 ## The reference demo is an artifact, not an output
 
@@ -183,6 +195,6 @@ before/after check on a change, not a cross-machine conformance suite.
 ## Requirements
 
 A playable build and the demo data (`FETCH_DEMO_DATA`, on by default). Set
-`BUILD=...` if your build tree is not `cmake-build-debug`. Everything the gate
+`BUILD=...` if your build tree is not `cmake-build-eacp`. Everything the gate
 writes goes to `regression/work`, which is `fs_savepath` for these runs - your
 own config, saves and screenshots are never touched.
