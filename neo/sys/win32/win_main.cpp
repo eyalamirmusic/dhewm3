@@ -55,7 +55,11 @@ If you have questions concerning this license or the applicable additional terms
 
 #undef strcmp // get rid of "#define strcmp idStr::Cmp", it conflicts with SDL headers
 
-#include "sys/sys_sdl.h"
+// This file is still the SDL host's WinMain, and it is the reason there is no
+// Windows target yet (plan.md section 8). The include here was sys/sys_sdl.h,
+// which went with the rest of SDL in step 5; the Windows eacp host will replace
+// the entry points below rather than restore it.
+#include <SDL3/SDL.h>
 
 #ifdef D3_SDL3
   #define SDL_MAIN_HANDLED // dhewm3 implements WinMain() itself

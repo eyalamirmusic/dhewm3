@@ -28,19 +28,14 @@ If you have questions concerning this license or the applicable additional terms
 #ifndef DEBUGGERSERVER_H_
 #define DEBUGGERSERVER_H_
 
-#include "sys/sys_sdl.h"
+#include <condition_variable>
+#include <mutex>
 
 #include "sys/platform.h"
 #include "idlib/Str.h"
 #include "DebuggerMessages.h"
 #include "DebuggerBreakpoint.h"
 #include "framework/Game.h"
-
-#if SDL_VERSION_ATLEAST(3, 0, 0)
-  // backwards-compat with SDL <= 2
-  #define SDL_mutex SDL_Mutex
-  #define SDL_cond SDL_Condition
-#endif
 
 class function_t;
 typedef struct prstack_s prstack_t;
@@ -91,11 +86,17 @@ private:
 	netadr_t						mClientAdr;
 	idPort							mPort;
 	idList<rvDebuggerBreakpoint*>	mBreakpoints;
-	SDL_mutex*						mCriticalSection;
 
+	// The breakpoint list is read by the game thread and written by the
+	// debugger's own thread, so it is under a lock. These were SDL_mutex and
+	// SDL_cond until step 5; they are the standard library's now, the way
+	// sys/threads.cpp went in step 2a - the file is C++-only, and the engine's
+	// own Sys_EnterCriticalSection has five fixed global slots, which is a poor
+	// fit for two locks belonging to one object.
+	std::mutex						mCriticalSection;
 
-	SDL_cond*						mGameThreadBreakCond;
-	SDL_mutex*						mGameThreadBreakLock;
+	std::condition_variable			mGameThreadBreakCond;
+	std::mutex						mGameThreadBreakLock;
 	bool							mBreak;
 
 	bool							mBreakNext;

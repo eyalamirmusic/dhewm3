@@ -41,14 +41,6 @@ If you have questions concerning this license or the applicable additional terms
 const int MAX_MSGLEN = 8600;
 #endif
 
-#if SDL_VERSION_ATLEAST(3, 0, 0)
-  // compat with SDL2
-  #define SDL_CreateCond SDL_CreateCondition
-  #define SDL_DestroyCond SDL_DestroyCondition
-  #define SDL_CondWait SDL_WaitCondition
-  #define SDL_CondSignal SDL_SignalCondition
-#endif
-
 /*
 ================
 rvDebuggerServer::rvDebuggerServer
@@ -61,8 +53,6 @@ rvDebuggerServer::rvDebuggerServer ( )
 	mBreak				= false;
 	mBreakStepOver		= false;
 	mBreakStepInto		= false;
-	mGameThreadBreakCond = NULL;
-	mGameThreadBreakLock = NULL;
 	mLastStatementLine	= -1;
 	mBreakStepOverFunc1 = NULL;
 	mBreakStepOverFunc2 = NULL;
@@ -71,7 +61,6 @@ rvDebuggerServer::rvDebuggerServer ( )
 	mBreakProgram = NULL;
 	mGameDLLHandle = 0;
 	mBreakStepOverDepth = 0;
-	mCriticalSection = NULL;
 }
 
 /*
@@ -99,14 +88,10 @@ bool rvDebuggerServer::Initialize ( void )
 		return false;
 	}
 
-	// we're using a condition variable to pause the game thread in rbDebuggerServer::Break()
-	// until rvDebuggerServer::Resume() is called (from another thread)
-	mGameThreadBreakCond = SDL_CreateCond();
-	mGameThreadBreakLock = SDL_CreateMutex();
-
-	// Create a critical section to ensure that the shared thread
-	// variables are protected
-	mCriticalSection = SDL_CreateMutex();
+	// The condition variable that pauses the game thread in
+	// rvDebuggerServer::Break() until Resume() is called from the other thread,
+	// and the lock that protects the breakpoint list, are members now rather
+	// than handles created here - so there is nothing to create.
 
 	// Server must be running on the local host on port 28980
 	Sys_StringToNetAdr ( com_dbgClientAdr.GetString( ), &mClientAdr, true );
@@ -151,14 +136,7 @@ void rvDebuggerServer::Shutdown ( void )
 
 	Resume(); // just in case we're still paused
 
-	// dont need the crit section anymore
-	SDL_DestroyMutex( mCriticalSection );
-	mCriticalSection = NULL;
-
-	SDL_DestroyCond( mGameThreadBreakCond );
-	mGameThreadBreakCond = NULL;
-	SDL_DestroyMutex( mGameThreadBreakLock );
-	mGameThreadBreakLock = NULL;
+	// The lock and the condition variable are members and go with the object.
 }
 
 /*
@@ -333,9 +311,9 @@ void rvDebuggerServer::HandleAddBreakpoint ( idBitMsg* msg )
 	}
 
 
-	SDL_LockMutex( mCriticalSection );
+	mCriticalSection.lock();
 	mBreakpoints.Append ( new rvDebuggerBreakpoint ( filename, lineNumber, id, onceOnly ) );
-	SDL_UnlockMutex( mCriticalSection );
+	mCriticalSection.unlock();
 }
 
 /*
@@ -357,7 +335,7 @@ void rvDebuggerServer::HandleRemoveBreakpoint ( idBitMsg* msg )
 
 	// Since breakpoints are used by both threads we need to
 	// protect them with a crit section
-	SDL_LockMutex( mCriticalSection );
+	mCriticalSection.lock();
 
 	// Find the breakpoint that matches the given id and remove it from the list
 	for ( i = 0; i < mBreakpoints.Num(); i ++ )
@@ -370,7 +348,7 @@ void rvDebuggerServer::HandleRemoveBreakpoint ( idBitMsg* msg )
 		}
 	}
 
-	SDL_UnlockMutex( mCriticalSection );
+	mCriticalSection.unlock();
 }
 
 /*
@@ -593,7 +571,7 @@ void rvDebuggerServer::CheckBreakpoints	( idInterpreter* interpreter, idProgram*
 	OSPathToRelativePath(filename,qpath);
 	qpath.BackSlashesToSlashes ( );
 
-	SDL_LockMutex( mCriticalSection );
+	mCriticalSection.lock();
 
 	// Check all the breakpoints
 	for ( i = 0; i < mBreakpoints.Num ( ); i ++ )
@@ -632,19 +610,19 @@ void rvDebuggerServer::CheckBreakpoints	( idInterpreter* interpreter, idProgram*
 		// DG end
 
 		// Pop out of the critical section so we dont get stuck
-		SDL_UnlockMutex( mCriticalSection );
+		mCriticalSection.unlock();
 
 		HandleInspectScripts(NULL);
 		// We hit a breakpoint, so break
 		Break ( interpreter, program, instructionPointer );
 
 		// Back into the critical section since we are going to have to leave it
-		SDL_LockMutex( mCriticalSection );
+		mCriticalSection.lock();
 
 		break;
 	}
 
-	SDL_UnlockMutex( mCriticalSection );
+	mCriticalSection.unlock();
 }
 
 /*
@@ -697,11 +675,12 @@ void rvDebuggerServer::Break ( idInterpreter* interpreter, idProgram* program, i
 	// DG: the original code used Win32 SuspendThread() here, but as there is no equivalent
 	//     function in SDL and as this is only called within the main game thread anyway,
 	//     just use a condition variable to put this thread to sleep until Resume() has set mBreak
-	SDL_LockMutex( mGameThreadBreakLock );
-	while ( mBreak ) {
-		SDL_CondWait( mGameThreadBreakCond, mGameThreadBreakLock );
+	// (Step 5 moved this off SDL and onto std::condition_variable; the shape is
+	//  the same, and the predicate form of wait is the same loop written out.)
+	{
+		std::unique_lock<std::mutex> lock( mGameThreadBreakLock );
+		mGameThreadBreakCond.wait( lock, [this]{ return !mBreak; } );
 	}
-	SDL_UnlockMutex( mGameThreadBreakLock );
 
 	// Let the debugger client know that we have started back up again
 	SendMessage ( DBMSG_RESUMED );
@@ -746,10 +725,11 @@ void rvDebuggerServer::Resume ( void )
 	}
 
 	// Start the game thread back up
-	SDL_LockMutex( mGameThreadBreakLock );
-	mBreak = false;
-	SDL_CondSignal( mGameThreadBreakCond);
-	SDL_UnlockMutex( mGameThreadBreakLock );
+	{
+		std::lock_guard<std::mutex> lock( mGameThreadBreakLock );
+		mBreak = false;
+	}
+	mGameThreadBreakCond.notify_one();
 }
 
 /*
