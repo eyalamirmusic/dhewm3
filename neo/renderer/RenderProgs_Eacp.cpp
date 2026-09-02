@@ -619,6 +619,144 @@ void idEacpShadowProgram::define( void ) {
 /*
 ================================================================================
 
+	idEacpFogProgram
+
+================================================================================
+*/
+
+idEacpFogProgram::idEacpFogProgram() {
+	// Named rather than read off the images, because there is nothing to read
+	// off: R_FogImage and R_FogEnterImage generate both at TF_LINEAR with
+	// TR_CLAMP and no cvar or material can say otherwise, so this program has
+	// one sampling tuple by construction rather than by cache. The linear
+	// filter is load-bearing on the second of them - "picky to get the bilerp
+	// correct at terminator", says the comment over FOG_ENTER in tr_local.h,
+	// and the half-texel FOG_ENTER carries is what that pickiness amounts to.
+	fogImage.sampling.filter = GPU::TextureFilter::Linear;
+	fogImage.sampling.addressMode = GPU::TextureAddressMode::Clamp;
+
+	fogEnterImage.sampling.filter = GPU::TextureFilter::Linear;
+	fogEnterImage.sampling.addressMode = GPU::TextureAddressMode::Clamp;
+
+	compile();
+}
+
+/*
+====================
+idEacpFogProgram::define
+
+RB_T_BasicFog's two texture units, and the default modulate combiner between
+them.
+
+Every coordinate is a plane dotted with the vertex in its own model space, which
+is what GL_OBJECT_LINEAR means and what RB_T_BasicFog re-sends whenever the
+space changes. Three of the four are computed that way here; the fourth is the
+literal 0.5 below.
+====================
+*/
+void idEacpFogProgram::define( void ) {
+	auto	position = vertexInput( &eacpDrawVert_t::xyz );
+
+	auto	model = GPU::float4( position, 1.0f );
+
+	setPosition( modelViewProjection * model );
+
+	// **The t of the _fog lookup is a constant, and the original says so by
+	// overwriting its own texgen.** RB_T_BasicFog computes fogPlanes[1] beside
+	// fogPlanes[0] - the view's *right* axis, which would have made this a
+	// genuine two-dimensional distance - and then sets the plane it hands
+	// GL_T to ( 0, 0, 0, 0.5 ) on the line after, with the two lines that would
+	// have used the plane commented out above it. So the second axis was tried
+	// and abandoned, the middle row of the image is the whole of what is
+	// sampled, and 0.5 here is the honest translation of that.
+	auto	density = GPU::float2( varying( GPU::dot( model, fogPlane ) ), 0.5f );
+
+	auto	enter = varying( GPU::float2( GPU::dot( model, fogEnterPlaneS ),
+										  GPU::dot( model, fogEnterPlaneT ) ) );
+
+	// The two units multiplied together and by the colour, which is what the
+	// default GL_MODULATE texture environment computes and what the fog pass
+	// never overrides. Both images carry 255 in all three colour channels, so
+	// what the product really is is the fog's colour at the product of the two
+	// alphas - but writing the multiply out is what the combiner does, and the
+	// blend that follows reads the alpha this leaves.
+	setFragment( GPU::sample( fogImage, density )
+				 * GPU::sample( fogEnterImage, enter )
+				 * fogColor );
+}
+
+/*
+================================================================================
+
+	idEacpBlendLightProgram
+
+================================================================================
+*/
+
+idEacpBlendLightProgram::idEacpBlendLightProgram( const sampling_t &sampling ) {
+	// Before compile(), as everywhere else here: the build walk reads each
+	// texture's sampling to place the static sampler the generated source
+	// points at.
+	lightImage.sampling = sampling.projection;
+	lightFalloffImage.sampling = sampling.falloff;
+
+	compile();
+}
+
+/*
+====================
+idEacpBlendLightProgram::define
+
+RB_T_BlendLight's two texture units, modulated together and by the light stage's
+colour - the same combiner the fog above uses and the same object-linear texgens
+feeding it, with the projection's q enabled so that the read is projective.
+====================
+*/
+void idEacpBlendLightProgram::define( void ) {
+	auto	position = vertexInput( &eacpDrawVert_t::xyz );
+
+	auto	model = GPU::float4( position, 1.0f );
+
+	setPosition( modelViewProjection * model );
+
+	// Homogeneous, and divided in the fragment stage - which is what a
+	// projective texture read is, and what interaction.vfp does with the same
+	// three planes.
+	auto	projected = varying( GPU::float3( GPU::dot( model, lightProjectionS ),
+											  GPU::dot( model, lightProjectionT ),
+											  GPU::dot( model, lightProjectionQ ) ) );
+
+	// **The falloff's t is 0.5 here and 0 in the OpenGL build, and the two are
+	// the same number on every falloff image the game has.** RB_BlendLight
+	// means to set it: it selects texture unit 1 and calls
+	// qglTexCoord2f( 0, 0.5 ). But glTexCoord addresses unit 0 whatever
+	// glActiveTexture last said - glMultiTexCoord is the call that takes a unit
+	// and dhewm3 never makes it - so unit 1 keeps its default current
+	// coordinate and the falloff is really read at t = 0.
+	//
+	// It makes no difference to anything drawn. Every falloff image a blend
+	// light can name is a ramp along s alone, constant down t:
+	// lights/squarelight1a and lights/xfalloff are 64x8 with all eight rows
+	// identical, and shapes/pitFalloff is the same shape. So 0.5 is written
+	// here, which is what the code plainly intends, what the interaction
+	// program already reads its own falloff at, and what survives a
+	// content-driven filter change that t = 0 would not.
+	//
+	// The one image where the two would disagree is the *generated* one:
+	// _noFalloff has a black border row at t = 0, so a blend light falling back
+	// to it would draw nothing at all on OpenGL. No blendLight material in the
+	// demo falls back - all six declare a lightFalloffImage - so this is a
+	// difference that exists on paper and nowhere in the frames.
+	auto	falloff = GPU::float2( varying( GPU::dot( model, lightFalloffS ) ), 0.5f );
+
+	setFragment( GPU::sample( lightImage, projected.xy() / projected.z() )
+				 * GPU::sample( lightFalloffImage, falloff )
+				 * color );
+}
+
+/*
+================================================================================
+
 	idEacpBlitProgram
 
 ================================================================================
@@ -951,6 +1089,12 @@ void idEacpRenderProgs::Shutdown( void ) {
 	shadowLibrary.reset();
 	shadowProgram.reset();
 
+	fogPipelines.clear();
+	fogLibrary.reset();
+	fogProgram.reset();
+
+	blendLights.clear();
+
 	capturePipeline.reset();
 	blitPipeline.reset();
 	blitLibrary.reset();
@@ -982,6 +1126,16 @@ int idEacpRenderProgs::NumPrograms( void ) const {
 		total++;
 	}
 
+	if ( fogProgram.has_value() ) {
+		total++;
+	}
+
+	for ( int i = 0 ; i < blendLights.size() ; i++ ) {
+		if ( blendLights[i]->program.has_value() ) {
+			total++;
+		}
+	}
+
 	if ( blitProgram.has_value() ) {
 		total++;
 	}
@@ -1007,6 +1161,11 @@ int idEacpRenderProgs::NumPipelines( void ) const {
 	total += CountPipelines( screens );
 
 	total += shadowPipelines.size();
+	total += fogPipelines.size();
+
+	for ( int i = 0 ; i < blendLights.size() ; i++ ) {
+		total += blendLights[i]->pipelines.size();
+	}
 
 	if ( blitPipeline ) {
 		total++;
@@ -1428,6 +1587,112 @@ idEacpRenderProgs::shadowDraw_t idEacpRenderProgs::ShadowDraw( int stateBits, in
 	draw.pipeline = PipelineFor( shadowPipelines, *shadowLibrary,
 								 shadowProgram->vertexLayout(),
 								 stateBits, cullType, stencil );
+
+	return draw;
+}
+
+/*
+====================
+idEacpRenderProgs::FogDraw
+
+The fog volume, which is the shadow cache's shape again - one program with no
+sampling dimension to search, and a pipeline per state.
+
+Two states reach it and they are RB_FogPass's own two: the surfaces inside the
+volume at GLS_DEPTHFUNC_EQUAL over what the depth fill wrote, and the light's
+frustum triangles at GLS_DEPTHFUNC_LESS with the cull reversed, the frustum
+never having been in the depth buffer at all. A mirror doubles both, the cull
+being part of a pipeline here.
+====================
+*/
+idEacpRenderProgs::fogDraw_t idEacpRenderProgs::FogDraw( int stateBits, int cullType ) {
+	fogDraw_t	draw;
+
+	draw.program = NULL;
+	draw.pipeline = NULL;
+
+	if ( !fogProgram.has_value() ) {
+		fogProgram.emplace();
+		fogLibrary.emplace( GPU::Device::shared(), fogProgram->source() );
+
+		if ( !fogLibrary->isValid() ) {
+			common->Warning( "eacp: the fog shader failed to compile" );
+			fogProgram.reset();
+			return draw;
+		}
+	}
+
+	draw.program = &*fogProgram;
+
+	draw.pipeline = PipelineFor( fogPipelines, *fogLibrary, fogProgram->vertexLayout(),
+								 stateBits, cullType, ES_IGNORE );
+
+	return draw;
+}
+
+/*
+====================
+idEacpRenderProgs::BlendLightDraw
+
+One stage of one blend light: the program its two images are sampled through and
+the pipeline that stage's blend mode compiles to.
+
+The state is the widest of any cache here, because it is the light material's
+own: RB_BlendLight draws each stage at GLS_DEPTHMASK | stage->drawStateBits |
+GLS_DEPTHFUNC_EQUAL, and a stage's bits are whatever its `blend` keyword said -
+`add` on fogs/glare, `blend` on fogs/pitFog, `filter` on fogs/filter. So a level
+with two blend lights of different materials is two pipelines even if it is one
+program.
+====================
+*/
+idEacpRenderProgs::blendLightDraw_t
+idEacpRenderProgs::BlendLightDraw( const idImage *projection, const idImage *falloff,
+								   int stateBits, int cullType ) {
+	blendLightDraw_t	draw;
+
+	draw.program = NULL;
+	draw.pipeline = NULL;
+
+	idEacpBlendLightProgram::sampling_t	sampling;
+
+	sampling.projection = R_EacpSampling( projection );
+	sampling.falloff = R_EacpSampling( falloff );
+
+	const int	key = GPU::samplingIndex( sampling.projection )
+		| ( GPU::samplingIndex( sampling.falloff ) << 2 );
+
+	blendLightVariant_t *	variant = NULL;
+
+	for ( int i = 0 ; i < blendLights.size() ; i++ ) {
+		if ( blendLights[i]->key == key ) {
+			variant = blendLights[i];
+			break;
+		}
+	}
+
+	if ( !variant ) {
+		variant = &blendLights.createNew();
+
+		variant->key = key;
+		variant->program.emplace( sampling );
+		variant->library.emplace( GPU::Device::shared(), variant->program->source() );
+
+		if ( !variant->library->isValid() ) {
+			common->Warning( "eacp: the blend light shader failed to compile" );
+			variant->program.reset();
+			return draw;
+		}
+	}
+
+	if ( !variant->program.has_value() ) {
+		return draw;
+	}
+
+	draw.program = &*variant->program;
+
+	draw.pipeline = PipelineFor( variant->pipelines, *variant->library,
+								 variant->program->vertexLayout(),
+								 stateBits, cullType, ES_IGNORE );
 
 	return draw;
 }

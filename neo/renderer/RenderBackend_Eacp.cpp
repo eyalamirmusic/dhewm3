@@ -358,6 +358,46 @@ private:
 	// it is a quad drawn over the light's scissor rectangle instead.
 	void			ClearStencil( void );
 
+	// What RB_FogPass works out once for the light and RB_T_BasicFog then turns
+	// into two texture coordinates per space. The three planes are in *world*
+	// coordinates here, exactly as draw_common.cpp's file-static fogPlanes[] is
+	// - a fog light's planes are the view's rather than any surface's, so they
+	// are computed once and transformed into each space in turn.
+	struct eacpFog_t {
+		idPlane			density;	// fogPlanes[0]: distance through the fog
+		idPlane			enterS;		// fogPlanes[3]: the viewer's height, a constant
+		idPlane			enterT;		// fogPlanes[2]: the fragment's height
+		Float4			color;
+	};
+
+	// What RB_BlendLight works out once per stage of the light material. The
+	// projection planes are not here because they are the light's and are the
+	// same for every stage - what changes per stage is the image, the blend and
+	// the colour, plus the texture matrix that has to be folded into the planes
+	// after they reach a surface's space.
+	struct eacpBlendLight_t {
+		const idImage *	image;			// the stage's projected image
+		const idImage *	falloff;		// the light's, so constant over the stages
+		int				stateBits;
+		Float4			color;
+		bool			hasMatrix;		// in backEnd.lightTextureMatrix, as
+										// R_SetDrawInteraction leaves it
+	};
+
+	// RB_STD_FogAllLights and the two passes it dispatches to, rewritten. The
+	// one part of a view that is drawn as a *volume* rather than as a surface,
+	// and the reason DrawInteractions skips both light kinds with a continue.
+	void			FogAllLights( void );
+	void			FogPass( const drawSurf_t *drawSurfs, const drawSurf_t *drawSurfs2 );
+	void			FogChain( const drawSurf_t *chain, const eacpFog_t &fog );
+	void			FogSurface( const drawSurf_t *surf, const eacpFog_t &fog,
+								const idPlane local[3] );
+
+	void			BlendLight( const drawSurf_t *drawSurfs, const drawSurf_t *drawSurfs2 );
+	void			BlendLightChain( const drawSurf_t *chain, const eacpBlendLight_t &light );
+	void			BlendLightSurface( const drawSurf_t *surf, const eacpBlendLight_t &light,
+									   const idPlane local[4] );
+
 public:
 	// Reached through R_EacpDrawInteraction below, because
 	// RB_CreateSingleDrawInteractions takes a plain function pointer - it was
@@ -1139,8 +1179,13 @@ idRenderBackendEacp::DrawView
 
 RB_STD_DrawView. The sequence rather than the calls: fill the depth buffer, add
 each light through the stencil, blend the passes that do not depend on a light,
-fog. Three of the four are here whole; the fourth is 4e and says so where it
-would be.
+fog. All four are here.
+
+What is not, and neither is a shortcut: RB_STD_LightScale, which multiplies the
+whole frame up to crutch a backend whose blending range is eight bits and which
+can never fire here (backEnd.overBright is 1, tr.backEndRendererMaxLight being
+999 for BE_EACP as it is for BE_ARB2), and RB_RenderDebugTools, which is the
+r_show* visualisations and has no eacp counterpart yet.
 ======================
 */
 void idRenderBackendEacp::DrawView( void ) {
@@ -1191,9 +1236,10 @@ void idRenderBackendEacp::DrawView( void ) {
 
 	const int	processed = DrawShaderPasses( drawSurfs, numDrawSurfs );
 
-	// Fog and blend lights are 4e, and they belong here - between the two
-	// halves of the shader passes, because a post-process surface reads the
-	// frame with the fog already in it.
+	// Between the two halves of the shader passes, because a post-process
+	// surface reads the frame with the fog already in it - which is why
+	// DrawShaderPasses returns how far it got rather than drawing the list.
+	FogAllLights();
 
 	if ( processed < numDrawSurfs ) {
 		DrawShaderPasses( drawSurfs + processed, numDrawSurfs - processed );
@@ -1666,9 +1712,10 @@ void idRenderBackendEacp::DrawInteractions( void ) {
 	for ( viewLight_t *vLight = backEnd.viewDef->viewLights ; vLight ; vLight = vLight->next ) {
 		backEnd.vLight = vLight;
 
-		// Both are 4e: a fog light is a volume of two blended passes and a
-		// blend light a projected multiply, and neither goes through the
-		// interaction program.
+		// Neither goes through the interaction program: a fog light is a volume
+		// of two blended passes and a blend light a projected multiply, and
+		// both are drawn by FogAllLights after the ambient passes. These two
+		// continues are what leaves them to it.
 		if ( vLight->lightShader->IsFogLight() ) {
 			continue;
 		}
@@ -2634,6 +2681,556 @@ void idRenderBackendEacp::DrawStage( const srfTriangles_t *tri, const eacpStage_
 	// Through the counter wrapper rather than around it: r_showPrimitives and
 	// the renderer's own performance counters are read from the same place on
 	// both backends, and DrawIndexed is the seam.
+	RB_DrawElementsWithCounters( tri );
+}
+
+/*
+================================================================================
+
+	The fog and the blend lights.
+
+	Step 4e.5, and the last kind of light in a view. A fog light and a blend
+	light are both in backEnd.viewDef->viewLights beside the real ones and both
+	are skipped by DrawInteractions with a continue, because neither is an
+	interaction: they do not light a surface, they *tint* everything inside a
+	volume. So they are drawn here, after the ambient passes and before the
+	post-process ones, which is where RB_STD_DrawView puts them and for the
+	reason its own comment gives - a surface that reads _currentRender has to
+	find the fog already in it.
+
+	Three things they share, and each is why they are one section rather than
+	two:
+
+	  - **their coordinates are planes rather than vertex attributes.** Neither
+	    program reads the texture coordinate the surface carries; both dot the
+	    vertex against planes that belong to the light or to the view. On
+	    OpenGL that is glTexGen with GL_OBJECT_LINEAR and a plane re-sent
+	    whenever the space changes, and here it is a uniform rebuilt at the same
+	    moment, exactly as FillDepthBuffer already does with a subview's clip
+	    plane.
+	  - **they walk the light's interaction lists**, the same globalInteractions
+	    and localInteractions the interaction program walks - so a surface is
+	    fogged if and only if it is lit, which is what makes a fog volume stop
+	    at a wall.
+	  - **the stencil is off for both.** RB_STD_FogAllLights brackets the whole
+	    loop with glDisable( GL_STENCIL_TEST ), which is ES_IGNORE here: a fog
+	    light casts no shadow and reads no count.
+
+================================================================================
+*/
+
+/*
+======================
+idRenderBackendEacp::FogAllLights
+
+RB_STD_FogAllLights: every fog and blend light in the view, in the order the
+frontend listed them.
+
+Four skips, all the shared code's own - and the first of them is wider than its
+name. **r_skipFogLights turns off the blend lights too**, because
+RB_STD_FogAllLights tests it before the loop that dispatches to either kind,
+while r_skipBlendLights is tested inside RB_BlendLight alone. So
+`r_skipFogLights 1` is "draw neither" and `r_skipBlendLights 1` is "draw the fog
+but not the blend lights", which is not the pair of switches the two names
+suggest. Reproduced rather than tidied up, because a debug cvar that means
+something different on the two backends is worse than one that is oddly named
+on both - and because `r_skipFogLights 1` is what reproduces the picture this
+build drew before this step, which is how the step was measured.
+
+The stencil clear the original has between the lights is inside an #if 0 that
+_D3XP turned off - it guaranteed no pixel could be double-fogged thousands of
+units from the origin - so there is nothing here to be its counterpart, and a
+per-light stencil clear would be a scissored quad (see ClearStencil) if there
+ever were.
+======================
+*/
+void idRenderBackendEacp::FogAllLights( void ) {
+	if ( r_skipFogLights.GetBool() ) {
+		return;
+	}
+
+	if ( r_showOverDraw.GetInteger() != 0 ) {
+		return;
+	}
+
+	// An xray view is the world seen through a different set of entities, and
+	// fogging it would fog the thing being seen through rather than the scene.
+	if ( backEnd.viewDef->isXraySubview ) {
+		return;
+	}
+
+	// A 2D view has no lights at all, and no depth buffer for a fog volume to
+	// be occluded by.
+	if ( !backEnd.viewDef->viewEntitys ) {
+		return;
+	}
+
+	for ( viewLight_t *vLight = backEnd.viewDef->viewLights ; vLight ; vLight = vLight->next ) {
+		backEnd.vLight = vLight;
+
+		if ( vLight->lightShader->IsFogLight() ) {
+			FogPass( vLight->globalInteractions, vLight->localInteractions );
+		} else if ( vLight->lightShader->IsBlendLight() ) {
+			BlendLight( vLight->globalInteractions, vLight->localInteractions );
+		}
+	}
+
+	backEnd.vLight = NULL;
+
+	drawProgram = NULL;
+	drawPipeline = NULL;
+	drawVertices = NULL;
+}
+
+/*
+======================
+idRenderBackendEacp::FogPass
+
+RB_FogPass: one fog light, as the surfaces inside it plus the volume itself.
+
+**The two draws are two different things and the second is the whole trick.**
+The surfaces are drawn at GLS_DEPTHFUNC_EQUAL over what the depth fill wrote, so
+each of them is tinted by how far the eye is looking through the fog to reach
+it. That covers everything the fog stands in front of - but not the *sky*, or
+anything else the view sees past the far side of the volume, because nothing was
+written into the depth buffer there. So the light's own frustum is drawn as one
+more surface, back faces only and at GLS_DEPTHFUNC_LESS, which fills in exactly
+the fragments no surface claimed. tr_light.cpp gives the frustum an ambient
+cache for this and for nothing else.
+
+Three numbers are the light's rather than the surface's and are computed once
+here:
+
+  - **the density plane**, which is the view's forward axis scaled so that a
+    fragment a fog distance away reads the edge of the _fog image. The distance
+    is the light material's alpha register, which is why a fog light's alpha is
+    not an opacity - and why the default value of 1 means "500 units" rather
+    than "fully opaque".
+  - **the fog volume's top plane**, scaled by 0.001 so that a height in units
+    lands inside the _fogEnter image, and
+  - **the viewer's own height above it**, which is the same plane evaluated at
+    the eye. That is a number rather than a plane, and it is carried as a plane
+    with no normal so that both coordinates reach the shader the same way.
+
+FOG_ENTER is added to the last two, and it is half a texel plus a half: the
+image is 64 wide and the terminator has to land exactly on the boundary between
+its two halves, which the comment beside FOG_ENTER in tr_local.h calls "picky to
+get the bilerp correct".
+======================
+*/
+void idRenderBackendEacp::FogPass( const drawSurf_t *drawSurfs, const drawSurf_t *drawSurfs2 ) {
+	// No r_skipFogLights here: RB_FogPass has none either, the switch being
+	// FogAllLights' one line above.
+
+	// The light's frustum, drawn side out. If the vertex cache had no room for
+	// it the volume cannot be closed, and half a fog light is worse than none.
+	const srfTriangles_t *	frustumTris = backEnd.vLight->frustumTris;
+
+	if ( !frustumTris || !frustumTris->ambientCache ) {
+		return;
+	}
+
+	drawSurf_t	ds;
+
+	memset( &ds, 0, sizeof( ds ) );
+	ds.space = &backEnd.viewDef->worldSpace;
+	ds.geo = frustumTris;
+	ds.scissorRect = backEnd.viewDef->scissor;
+
+	// A fog light's material has one stage by assumption - RB_FogPass says so
+	// in a comment and reads GetStage( 0 ) without looking - and its four
+	// colour registers are the fog's colour and its distance.
+	const idMaterial *		lightShader = backEnd.vLight->lightShader;
+	const float *			regs = backEnd.vLight->shaderRegisters;
+	const shaderStage_t *	stage = lightShader->GetStage( 0 );
+
+	eacpFog_t	fog;
+
+	const float	distance = regs[ stage->color.registers[3] ];
+
+	// Three channels and a 1, because qglColor3fv is what sends this and GL
+	// fills the fourth in. The alpha the register holds is the distance below.
+	fog.color = asFloat4( regs[ stage->color.registers[0] ],
+						  regs[ stage->color.registers[1] ],
+						  regs[ stage->color.registers[2] ],
+						  1.0f );
+
+	// "If they left the default value on, set a fog distance of 500."
+	const float	a = ( distance <= 1.0f ) ? ( -0.5f / DEFAULT_FOG_DISTANCE )
+										 : ( -0.5f / distance );
+
+	// The third row of the view's modelview matrix, which is the distance along
+	// the view axis - so this plane evaluated at a vertex is how far in front of
+	// the eye it is, scaled into the image's half-width.
+	const float *	modelView = backEnd.viewDef->worldSpace.modelViewMatrix;
+
+	fog.density[0] = a * modelView[2];
+	fog.density[1] = a * modelView[6];
+	fog.density[2] = a * modelView[10];
+	fog.density[3] = a * modelView[14];
+
+	// The fog volume's fade plane - "always the top plane on unrotated lights",
+	// which is what makes a fog volume something a player can stand half inside.
+	fog.enterT[0] = 0.001f * backEnd.vLight->fogPlane[0];
+	fog.enterT[1] = 0.001f * backEnd.vLight->fogPlane[1];
+	fog.enterT[2] = 0.001f * backEnd.vLight->fogPlane[2];
+	fog.enterT[3] = 0.001f * backEnd.vLight->fogPlane[3];
+
+	const float	viewHeight =
+		backEnd.viewDef->renderView.vieworg * fog.enterT.Normal() + fog.enterT[3];
+
+	fog.enterS[0] = 0.0f;
+	fog.enterS[1] = 0.0f;
+	fog.enterS[2] = 0.0f;
+	fog.enterS[3] = FOG_ENTER + viewHeight;
+
+	// **fogPlanes[1] is not here, and its absence is the original's own
+	// decision rather than this port's.** RB_T_BasicFog computes a second
+	// density plane off the view's right axis - which would make the lookup a
+	// real two-dimensional distance - and then overwrites the texgen plane with
+	// ( 0, 0, 0, 0.5 ) on the very next line, with the two lines that would have
+	// used it commented out above. So the _fog image's t is a constant, the
+	// program says 0.5 outright, and computing the plane here would be
+	// computing something nothing reads.
+
+	SetState( GLS_DEPTHMASK | GLS_SRCBLEND_SRC_ALPHA | GLS_DSTBLEND_ONE_MINUS_SRC_ALPHA
+			  | GLS_DEPTHFUNC_EQUAL );
+
+	FogChain( drawSurfs, fog );
+	FogChain( drawSurfs2, fog );
+
+	// The frustum is not in the depth buffer, so it cannot be drawn at EQUAL -
+	// and it is drawn back faces only, because what is wanted is where the
+	// volume *ends* behind everything else in the view.
+	SetState( GLS_DEPTHMASK | GLS_SRCBLEND_SRC_ALPHA | GLS_DSTBLEND_ONE_MINUS_SRC_ALPHA
+			  | GLS_DEPTHFUNC_LESS );
+	SetCull( CT_BACK_SIDED );
+
+	FogChain( &ds, fog );
+
+	SetCull( CT_FRONT_SIDED );
+}
+
+/*
+======================
+idRenderBackendEacp::FogChain
+
+RB_RenderDrawSurfChainWithFunction over RB_T_BasicFog, which cannot be the
+shared walker because that one makes four qgl calls of its own - the modelview
+matrix, the two depth hacks and the scissor. Here all four are SetSpace and
+SetScissor, which is the same collapse CreateDrawInteractions made in step 4d.2.
+
+The three planes are transformed into each space as it arrives rather than per
+surface, which is exactly the condition RB_T_BasicFog re-sends its texgens on:
+backEnd.currentSpace changing. Clearing it first is what makes the first surface
+of every chain rebuild them, and it is what the shared walker does too.
+======================
+*/
+void idRenderBackendEacp::FogChain( const drawSurf_t *chain, const eacpFog_t &fog ) {
+	if ( !chain ) {
+		return;
+	}
+
+	backEnd.currentSpace = NULL;
+
+	idPlane	local[3];
+
+	for ( const drawSurf_t *surf = chain ; surf ; surf = surf->nextOnLight ) {
+		if ( surf->space != backEnd.currentSpace ) {
+			// The half texel that puts a vertex at the eye in the middle of the
+			// _fog image, and the FOG_ENTER offsets that centre the terminator
+			// in the _fogEnter one. Added after the transform rather than
+			// before it, because R_GlobalPlaneToLocal moves the constant term
+			// and these are offsets in the image's coordinates rather than in
+			// the world's.
+			R_GlobalPlaneToLocal( surf->space->modelMatrix, fog.density, local[0] );
+			local[0][3] += 0.5f;
+
+			R_GlobalPlaneToLocal( surf->space->modelMatrix, fog.enterS, local[1] );
+
+			R_GlobalPlaneToLocal( surf->space->modelMatrix, fog.enterT, local[2] );
+			local[2][3] += FOG_ENTER;
+		}
+
+		SetSpace( surf->space, surf->space->modelDepthHack );
+
+		if ( r_useScissor.GetBool() && !backEnd.currentScissor.Equals( surf->scissorRect ) ) {
+			backEnd.currentScissor = surf->scissorRect;
+			SetScissor( backEnd.currentScissor );
+		}
+
+		FogSurface( surf, fog, local );
+	}
+
+	drawProgram = NULL;
+	drawPipeline = NULL;
+	drawVertices = NULL;
+}
+
+/*
+======================
+idRenderBackendEacp::FogSurface
+
+RB_T_BasicFog's draw, which is one surface's ambient cache through the fog
+program - no texture coordinate, no normal and no colour read from it, only the
+position, because every coordinate the program samples at is a plane dotted with
+that position.
+======================
+*/
+void idRenderBackendEacp::FogSurface( const drawSurf_t *surf, const eacpFog_t &fog,
+									  const idPlane local[3] ) {
+	const srfTriangles_t *	tri = surf->geo;
+
+	if ( !tri || !tri->numIndexes || !tri->ambientCache ) {
+		return;
+	}
+
+	idEacpRenderProgs::fogDraw_t	draw =
+		eacpRenderProgs.FogDraw( backEnd.glState.glStateBits,
+								 ViewCull( backEnd.glState.faceCulling ) );
+
+	if ( !draw.pipeline ) {
+		return;
+	}
+
+	GPU::Texture *	fogTexture = TextureFor( globalImages->fogImage );
+	GPU::Texture *	enterTexture = TextureFor( globalImages->fogEnterImage );
+
+	if ( !fogTexture || !enterTexture ) {
+		if ( !warnedMissingTexture ) {
+			warnedMissingTexture = true;
+			common->Warning( "eacp: the fog lookup images have no texture on the GPU, "
+							 "so the fog will not draw" );
+		}
+		return;
+	}
+
+	draw.program->modelViewProjection = asFloat4x4( modelViewProjection );
+
+	draw.program->fogPlane = asFloat4( local[0][0], local[0][1], local[0][2], local[0][3] );
+	draw.program->fogEnterPlaneS = asFloat4( local[1][0], local[1][1], local[1][2], local[1][3] );
+	draw.program->fogEnterPlaneT = asFloat4( local[2][0], local[2][1], local[2][2], local[2][3] );
+
+	draw.program->fogColor = fog.color;
+
+	draw.program->fogImage = *fogTexture;
+	draw.program->fogEnterImage = *enterTexture;
+
+	drawProgram = draw.program;
+	drawPipeline = draw.pipeline;
+
+	const idDrawVert *	vertices = (const idDrawVert *)vertexCache.Position( tri->ambientCache );
+
+	drawVertices = &eacpRenderProgs.StreamVertices(
+		vertices, (std::size_t)tri->numVerts * sizeof( idDrawVert ) );
+
+	RB_DrawElementsWithCounters( tri );
+}
+
+/*
+======================
+idRenderBackendEacp::BlendLight
+
+RB_BlendLight: one blend light, once per stage of its material.
+
+**The stage loop is outside the surface walk and not inside it**, which is the
+opposite of everything else in this backend and is the original's arrangement:
+a two-stage blend light draws every surface twice rather than each surface
+twice. It matters because the stages blend into each other - the second is drawn
+over the first's result across the whole volume - and it costs the vertex
+streaming nothing here, because the walk re-streams a surface's vertices per
+pass either way.
+
+There is no frustum draw. A blend light tints what is inside it and stops; only
+the fog needs a volume to close, because only the fog is a function of *distance
+through* rather than of position.
+======================
+*/
+void idRenderBackendEacp::BlendLight( const drawSurf_t *drawSurfs, const drawSurf_t *drawSurfs2 ) {
+	// **The first list decides whether either is drawn**, which is RB_BlendLight's
+	// own first line and reads like a slip: a light whose only surfaces are the
+	// no-self-shadow ones in localInteractions draws nothing. Kept, because it
+	// is what the game does - and it is nearly unreachable anyway, a blend light
+	// material carrying noShadows, which sends every surface to
+	// globalInteractions in idInteraction::AddActiveInteraction.
+	if ( !drawSurfs ) {
+		return;
+	}
+
+	if ( r_skipBlendLights.GetBool() ) {
+		return;
+	}
+
+	const idMaterial *	lightShader = backEnd.vLight->lightShader;
+	const float *		regs = backEnd.vLight->shaderRegisters;
+
+	for ( int i = 0 ; i < lightShader->GetNumStages() ; i++ ) {
+		const shaderStage_t *	stage = lightShader->GetStage( i );
+
+		if ( !regs[ stage->conditionRegister ] ) {
+			continue;
+		}
+
+		eacpBlendLight_t	light;
+
+		light.image = stage->texture.image;
+		light.falloff = backEnd.vLight->falloffImage;
+		light.stateBits = GLS_DEPTHMASK | stage->drawStateBits | GLS_DEPTHFUNC_EQUAL;
+
+		// "Get the modulate values from the light, including alpha, unlike
+		// normal lights" - the stage's own comment, and the difference is that
+		// a blend light's alpha reaches the blend function rather than being
+		// thrown away by an additive one.
+		light.color = asFloat4( regs[ stage->color.registers[0] ],
+								regs[ stage->color.registers[1] ],
+								regs[ stage->color.registers[2] ],
+								regs[ stage->color.registers[3] ] );
+
+		// The texture matrix belongs to the *generated* coordinate rather than
+		// to a vertex attribute, so it cannot be a matrix on the way in the
+		// generic stage program's is. It is folded into the projection planes
+		// once they reach a surface's space, which is what
+		// RB_BakeTextureMatrixIntoTexgen is for and where
+		// R_SetDrawInteraction already calls it for a real light. Left in
+		// backEnd.lightTextureMatrix, which is that function's own input.
+		light.hasMatrix = stage->texture.hasMatrix;
+
+		if ( light.hasMatrix ) {
+			RB_GetShaderTextureMatrix( regs, &stage->texture, backEnd.lightTextureMatrix );
+		}
+
+		SetState( light.stateBits );
+
+		BlendLightChain( drawSurfs, light );
+		BlendLightChain( drawSurfs2, light );
+	}
+}
+
+/*
+======================
+idRenderBackendEacp::BlendLightChain
+
+The same walk FogChain does, with the light's four projection planes carried
+into each space instead of the fog's three.
+
+**RB_T_BlendLight has a second vertex path this does not, and it is dead.** It
+takes a surface's shadowCache when there is no ambientCache, under a comment
+saying it "gets used for both blend lights and shadow draws" - which is a
+leftover from a shadow path that no longer calls it, RB_T_Shadow having its own.
+A blend light's globalInteractions and localInteractions are built by
+idInteraction::AddActiveInteraction, which sets lightTris->ambientCache from the
+surface's own before linking it and links shadow volumes into globalShadows and
+localShadows instead, so a surface in these two lists always has an ambient
+cache and never arrives with only a shadow one.
+======================
+*/
+void idRenderBackendEacp::BlendLightChain( const drawSurf_t *chain,
+										   const eacpBlendLight_t &light ) {
+	if ( !chain ) {
+		return;
+	}
+
+	backEnd.currentSpace = NULL;
+
+	idPlane	local[4];
+
+	for ( const drawSurf_t *surf = chain ; surf ; surf = surf->nextOnLight ) {
+		if ( surf->space != backEnd.currentSpace ) {
+			for ( int i = 0 ; i < 4 ; i++ ) {
+				R_GlobalPlaneToLocal( surf->space->modelMatrix,
+									  backEnd.vLight->lightProject[i], local[i] );
+			}
+
+			// After the transform, because the matrix acts on the coordinate
+			// the planes generate rather than on the plane - which is the order
+			// R_SetDrawInteraction uses on the same four planes.
+			if ( light.hasMatrix ) {
+				RB_BakeTextureMatrixIntoTexgen( local, backEnd.lightTextureMatrix );
+			}
+		}
+
+		SetSpace( surf->space, surf->space->modelDepthHack );
+
+		if ( r_useScissor.GetBool() && !backEnd.currentScissor.Equals( surf->scissorRect ) ) {
+			backEnd.currentScissor = surf->scissorRect;
+			SetScissor( backEnd.currentScissor );
+		}
+
+		BlendLightSurface( surf, light, local );
+	}
+
+	drawProgram = NULL;
+	drawPipeline = NULL;
+	drawVertices = NULL;
+}
+
+/*
+======================
+idRenderBackendEacp::BlendLightSurface
+
+RB_T_BlendLight's draw: one surface's ambient cache through the blend light
+program, at the four planes this space was given.
+======================
+*/
+void idRenderBackendEacp::BlendLightSurface( const drawSurf_t *surf,
+											 const eacpBlendLight_t &light,
+											 const idPlane local[4] ) {
+	const srfTriangles_t *	tri = surf->geo;
+
+	if ( !tri || !tri->numIndexes || !tri->ambientCache ) {
+		return;
+	}
+
+	if ( !light.image || !light.falloff ) {
+		return;
+	}
+
+	idEacpRenderProgs::blendLightDraw_t	draw =
+		eacpRenderProgs.BlendLightDraw( light.image, light.falloff,
+										backEnd.glState.glStateBits,
+										ViewCull( backEnd.glState.faceCulling ) );
+
+	if ( !draw.pipeline ) {
+		return;
+	}
+
+	GPU::Texture *	projection = TextureFor( light.image );
+	GPU::Texture *	falloff = TextureFor( light.falloff );
+
+	if ( !projection || !falloff ) {
+		// A light's projected image is often a .dds this build cannot read, so
+		// this is the same warning DrawInteraction carries and for the same
+		// reason.
+		if ( !warnedMissingTexture ) {
+			warnedMissingTexture = true;
+			common->Warning( "eacp: '%s' has no texture on the GPU, so a blend light "
+							 "will not draw",
+							 projection ? light.falloff->imgName.c_str()
+										: light.image->imgName.c_str() );
+		}
+		return;
+	}
+
+	draw.program->modelViewProjection = asFloat4x4( modelViewProjection );
+
+	draw.program->lightProjectionS = asFloat4( local[0][0], local[0][1], local[0][2], local[0][3] );
+	draw.program->lightProjectionT = asFloat4( local[1][0], local[1][1], local[1][2], local[1][3] );
+	draw.program->lightProjectionQ = asFloat4( local[2][0], local[2][1], local[2][2], local[2][3] );
+	draw.program->lightFalloffS = asFloat4( local[3][0], local[3][1], local[3][2], local[3][3] );
+
+	draw.program->color = light.color;
+
+	draw.program->lightImage = *projection;
+	draw.program->lightFalloffImage = *falloff;
+
+	drawProgram = draw.program;
+	drawPipeline = draw.pipeline;
+
+	const idDrawVert *	vertices = (const idDrawVert *)vertexCache.Position( tri->ambientCache );
+
+	drawVertices = &eacpRenderProgs.StreamVertices(
+		vertices, (std::size_t)tri->numVerts * sizeof( idDrawVert ) );
+
 	RB_DrawElementsWithCounters( tri );
 }
 

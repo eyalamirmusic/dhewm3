@@ -642,6 +642,152 @@ public:
 /*
 ================================================================================
 
+	idEacpFogProgram
+
+	RB_FogPass, which is the one thing Doom 3 draws that is a *volume* rather
+	than a surface: a fog light adds a colour to everything inside it, in
+	proportion to how far the viewer is looking through it.
+
+	The fixed-function original is two texture units with the default modulate
+	combiner between them, driven entirely by object-linear texgens, and each of
+	its two textures answers a different question:
+
+	  - **_fog**, a 128x128 radial ramp of 1 - 0.982^d, read at
+	    ( 0.5 - distance/fogDistance, 0.5 ) - so a fragment's alpha is how much
+	    fog is between it and the eye. The image is two-dimensional and only its
+	    middle row is ever sampled, because the s coordinate is the whole of the
+	    answer and the comment over R_FogImage says why: "we calculate distance
+	    correctly in two planes, but the third will still be projection based".
+	  - **_fogEnter**, a 64x64 correction read at the distances of the *viewer*
+	    and of the fragment from the fog volume's top plane. What it fixes is the
+	    terminator: a viewer half in and half out of a fog volume should see fog
+	    only over the part of each ray that is inside it, and R_FogEnterImage's
+	    FogFraction tabulates exactly that fraction for every pair of heights.
+
+	**Both stay textures rather than becoming arithmetic**, which is the opposite
+	of the decision step 4d.2 made about the specular ramp - and for the opposite
+	reason. That ramp was a curve the ARB program could not evaluate, so the
+	table was the workaround and the curve was the intent. These two are not:
+	one is an exponential accumulated by repeated multiplication over 256 steps
+	and the other is a piecewise function of two variables with four cases and a
+	deep-water blend. Reproducing either in the shader would be reproducing a
+	generator, and keeping them keeps the picture bit-for-bit closest to the
+	OpenGL build's - which is what every step of this port is measured against.
+
+	One program and no variants. Both images are generated rather than loaded -
+	R_FogImage and R_FogEnterImage, Image_init.cpp - and both are generated
+	TF_LINEAR with TR_CLAMP, so there is exactly one sampling tuple a fog light
+	can ask for. If either generator ever changed its mind, this would need the
+	variant list idEacpBlendLightProgram below has.
+
+================================================================================
+*/
+
+class idEacpFogProgram : public eacp::GPU::ShaderProgram {
+public:
+							idEacpFogProgram();
+
+	virtual void			define( void ) override;
+
+	eacp::GPU::Uniform<eacp::GPU::Float4x4>		modelViewProjection;
+
+	// The fog's density plane in the surface's own coordinates: dotted with the
+	// vertex it gives the s the _fog image is read at. It is the view's forward
+	// axis scaled by -0.5/fogDistance with 0.5 added to the constant term, so a
+	// vertex at the eye reads the middle of the image and one a fog distance
+	// away reads its edge.
+	eacp::GPU::Uniform<eacp::GPU::Float4>		fogPlane;
+
+	// The two coordinates _fogEnter is read at, also as planes in the surface's
+	// own space. t is the fragment's height above the fog volume's top plane
+	// and s is the viewer's - which is why s is a plane with no normal at all,
+	// its constant term being the whole of the answer.
+	eacp::GPU::Uniform<eacp::GPU::Float4>		fogEnterPlaneS;
+	eacp::GPU::Uniform<eacp::GPU::Float4>		fogEnterPlaneT;
+
+	// The fog's colour, from the light material's single stage. Its alpha is 1
+	// rather than the register's, because RB_FogPass sends it with qglColor3fv
+	// and GL fills the fourth channel in - the register's own alpha is the fog
+	// *distance* and has already been spent on fogPlane above.
+	eacp::GPU::Uniform<eacp::GPU::Float4>		fogColor;
+
+	eacp::GPU::Uniform<eacp::GPU::Texture2D>	fogImage;
+	eacp::GPU::Uniform<eacp::GPU::Texture2D>	fogEnterImage;
+
+	EACP_SHADER( modelViewProjection, fogPlane, fogEnterPlaneS, fogEnterPlaneT,
+				 fogColor, fogImage, fogEnterImage )
+};
+
+/*
+================================================================================
+
+	idEacpBlendLightProgram
+
+	RB_BlendLight, which is the other half of RB_STD_FogAllLights and is a
+	simpler idea than the fog beside it: a blend light projects its image onto
+	everything inside it and blends the result in with whatever the light
+	material's stage asked for, instead of interacting with the surface the way
+	a real light does. `fogs/glare` is a light that adds a glow to a volume;
+	`fogs/pitFog` is one that fades a pit to black with distance.
+
+	Two textures, and they are the light's own two - the projected image from
+	the stage and the falloff the light material declares - sampled the way the
+	interaction program samples the same pair: the projection projectively, at
+	( s/q, t/q ), and the falloff at one coordinate. So this is the light half
+	of interaction.vfp with the surface half deleted, which is exactly what the
+	fixed-function original is: two texture units, both driven by object-linear
+	texgens off the light's projection planes, modulated together and by the
+	stage's colour.
+
+	**The variants are a list keyed on two samplings**, the way
+	idEacpRenderProgs::InteractionDraw's are keyed on five. Both images are
+	declared by the light material, so a light that repeats where its neighbour
+	clamps is a second program - and a projection sampled with the wrong address
+	mode tiles a light across a level rather than confining it to its volume,
+	which is the same reason the interaction program's key counts them.
+
+================================================================================
+*/
+
+class idEacpBlendLightProgram : public eacp::GPU::ShaderProgram {
+public:
+	struct sampling_t {
+		eacp::GPU::TextureSampling	projection;
+		eacp::GPU::TextureSampling	falloff;
+	};
+
+							idEacpBlendLightProgram( const sampling_t &sampling );
+
+	virtual void			define( void ) override;
+
+	eacp::GPU::Uniform<eacp::GPU::Float4x4>		modelViewProjection;
+
+	// The light's projection in the surface's own coordinates, with the light
+	// stage's texture matrix already folded into the first two planes by
+	// RB_BakeTextureMatrixIntoTexgen - which is what the fixed-function path
+	// gets from a matrix on the texture unit and what R_SetDrawInteraction does
+	// with the same four planes for a real light.
+	eacp::GPU::Uniform<eacp::GPU::Float4>		lightProjectionS;
+	eacp::GPU::Uniform<eacp::GPU::Float4>		lightProjectionT;
+	eacp::GPU::Uniform<eacp::GPU::Float4>		lightProjectionQ;
+	eacp::GPU::Uniform<eacp::GPU::Float4>		lightFalloffS;
+
+	// The light stage's colour, alpha included - which is the difference
+	// RB_BlendLight's own comment draws against a normal light, whose alpha
+	// never reaches the blend.
+	eacp::GPU::Uniform<eacp::GPU::Float4>		color;
+
+	eacp::GPU::Uniform<eacp::GPU::Texture2D>	lightImage;
+	eacp::GPU::Uniform<eacp::GPU::Texture2D>	lightFalloffImage;
+
+	EACP_SHADER( modelViewProjection,
+				 lightProjectionS, lightProjectionT, lightProjectionQ, lightFalloffS,
+				 color, lightImage, lightFalloffImage )
+};
+
+/*
+================================================================================
+
 	idEacpBlitProgram
 
 	The finished frame onto the screen: one texture, sampled at the coordinate
@@ -758,6 +904,25 @@ public:
 	};
 
 	shadowDraw_t			ShadowDraw( int stateBits, int cullType, eacpStencil_t stencil );
+
+	// One fog light's volume, and one stage of one blend light. Neither takes a
+	// stencil, because RB_STD_FogAllLights brackets both with
+	// glDisable( GL_STENCIL_TEST ) - the pass that would have read a count is
+	// over by the time either of these draws.
+	struct fogDraw_t {
+		idEacpFogProgram *						program;
+		const eacp::GPU::RenderPipeline *		pipeline;
+	};
+
+	fogDraw_t				FogDraw( int stateBits, int cullType );
+
+	struct blendLightDraw_t {
+		idEacpBlendLightProgram *				program;
+		const eacp::GPU::RenderPipeline *		pipeline;
+	};
+
+	blendLightDraw_t		BlendLightDraw( const idImage *projection, const idImage *falloff,
+											int stateBits, int cullType );
 
 	// The frame onto the screen, and the frame into an idImage's texture. Their
 	// pipelines are the two things here that are not compiled against the
@@ -930,6 +1095,30 @@ private:
 	std::optional<idEacpShadowProgram>		shadowProgram;
 	std::optional<eacp::GPU::ShaderLibrary>	shadowLibrary;
 	eacp::Vector<statePipeline_t>			shadowPipelines;
+
+	// The fog program, which has no variants either and for a different reason
+	// than the shadow one: it samples two textures rather than none, but both
+	// are generated by the engine at a fixed filter and repeat, so there is one
+	// tuple to compile for. Its pipelines are the two RB_FogPass draws in - the
+	// surfaces at GLS_DEPTHFUNC_EQUAL and the light's own frustum at
+	// GLS_DEPTHFUNC_LESS with the cull reversed.
+	std::optional<idEacpFogProgram>			fogProgram;
+	std::optional<eacp::GPU::ShaderLibrary>	fogLibrary;
+	eacp::Vector<statePipeline_t>			fogPipelines;
+
+	// The blend light's variants, keyed the way the interaction program's are
+	// and for the same reason - the two images are the light material's, so
+	// their sampling is content rather than a constant. Two two-bit indices is
+	// a key space of sixteen and a level reaches one or two of them, so a
+	// linear search over an OwnedVector is again the whole of the lookup.
+	struct blendLightVariant_t {
+		int											key;
+		std::optional<idEacpBlendLightProgram>		program;
+		std::optional<eacp::GPU::ShaderLibrary>		library;
+		eacp::Vector<statePipeline_t>				pipelines;
+	};
+
+	eacp::OwnedVector<blendLightVariant_t>	blendLights;
 
 	// The blit, which has one program and no state to key it on - and two
 	// pipelines, because it has two destinations: the drawable, which the frame
