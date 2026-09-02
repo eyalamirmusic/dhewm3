@@ -57,7 +57,15 @@ instead — seven of them move, the largest by 0.59 of 255. Step 7 turned the F1
 settings menu back on by integrating **imgui-eacp** rather than writing a
 backend — one Dear ImGui in the binary, the UI drawn inside the engine's frame
 between a suspended pass and its resume, and the SDL host's rules for who gets
-an event transcribed onto eacp's four callbacks.**
+an event transcribed onto eacp's four callbacks. Step 8 is the first thing this
+port chased that was not a picture: after a level or a save loads, the frames
+spiked to **30–700 ms for about four seconds** before settling at vsync, and it
+was not shader or pipeline compiles but MTLBuffer churn underneath
+`GPU::StreamingBuffers`, which held one GPU buffer per write and regrew a slot
+by doubling. eacp's streaming buffers are an arena per frame in flight now and a
+write comes back as a `GPU::BufferRange`, which took that save's slow frames
+from **42 to 2**, its worst frame from **707 to 277 ms** and its peak RSS from
+**4.9 to 3.4 GB**, at 297 of 297 identical.**
 
 Reference implementation for almost everything on the platform side:
 `~/Code/PureDOOM/examples/EACP` — a complete engine hosted on eacp, with its own
@@ -379,6 +387,10 @@ particles draw. 23 is what is left of the pair those two made, both having been
 found by looking at content rather than by reading eacp. 25 is what closing 24
 left behind: the drawable's own depth buffer still cannot be sampled, so the
 answer to "can I read my own depth" now depends on where the app is drawing.
+**And 28 is closed by step 8**, which is the odd one: it was raised against
+something this section had already checked off as *not* a gap, and it took
+measuring the seconds of stutter after a level load rather than reading eacp to
+see that the right shape had the wrong allocator under it.
 
 Numbers are never reused, so a hole is an entry that closed.
 
@@ -793,10 +805,51 @@ Numbers are never reused, so a hole is an entry that closed.
     a silent no-op where the analogous wrong-kind binds assert. Nothing in the
     port is blocked on any of them.
 
+28. ~~**`StreamingBuffers` handed out a whole GPU buffer per write.**~~ —
+    **closed**, and kept because of where it came from: it is the only entry on
+    this list raised against something the section below had already checked off
+    as *not* a gap, and it was found by measuring rather than by reading.
+
+    The type was `idVertexCache`'s shape and always had been — a pool per frame
+    that may be in flight, recycled only once that frame cannot be on the GPU.
+    What was underneath it was one `GPU::Buffer` per write of the frame, a slot
+    regrown in place by doubling whenever a later frame's write landed in that
+    position and was bigger. For a batching renderer that flushes a few dozen
+    times a frame that is nothing. For a renderer that streams **per draw** —
+    which is what this port is, `idVertexCache` handing out system-memory
+    pointers because `ARBVertexBufferObjectAvailable` is false — it is a
+    thousand GPU resources a frame, every one of them sized for the largest
+    write that ever happened to land in its slot, reallocating for as long as
+    the draw order keeps moving. Step 8 measured the cost: about **1 ms inside
+    the driver for each MTLBuffer freed**, in the middle of `write`.
+
+    **Closed by making the pool an arena rather than a rack.** `GPU::BufferRange`
+    (`Lib/eacp/GPU/Buffer/Buffer.h`) is a `{buffer, offset, bytes}` slice with an
+    `isValid()`, `write()` returns one, slices are 256-byte aligned — the
+    strictest offset either API asks of any bind — and a frame that outgrows its
+    arena gets one appended rather than replaced, because draws already recorded
+    hold ranges into the old one; the pool folds back to a single arena when it
+    next comes round. The binds that had to learn a range are
+    `RenderPass::setVertexBuffer`, `drawIndexed`, `drawIndexedInstanced` and
+    `bind( program, range )`, on Metal and D3D12 alike, and `ShaderProgram`'s
+    instance slots hold ranges now instead of buffer pointers.
+
+    On eacp's **`develop`** branch as `5ea9468`, pushed, with
+    `Tests/GPU/StreamingBufferTests.cpp` rewritten to nine cases — the recycling
+    period, disjoint writes in one frame, a flat steady state, the fold after an
+    outgrown frame, shuffled sizes that allocate nothing, and one long frame that
+    grows bytes rather than buffers — and `Tests/GPU/StreamedRangeDrawTests.cpp`
+    added as four pixel cases that check a slice draws what was written *there*.
+    `Apps/GPU/StreamingStress` is the example. Step 8 in §6 is the port's half.
+
 ### Checked, and *not* gaps
 
 - **`GPU::StreamingBuffers` already exists** (`Lib/eacp/GPU/Buffer/`) and is
   `idVertexCache`'s exact shape. An earlier draft of this plan had it as work to do.
+  **The shape was right and the allocator under it was wrong**, which is gap 28
+  and which nothing in the reading of it would have shown: it is visible only as
+  a cost, and only to a renderer that streams once per draw. Step 8 is what found
+  it, and closed it.
 - **Doom 3's 3D textures were dead code.** `idImage::Generate3DImage` was defined
   and never called, so `TT_3D` never happened and eacp needs no 3D texture. Step
   5 deleted the function; `TT_3D` itself survives in `textureType_t` because the
@@ -3343,6 +3396,110 @@ claims that key.
   whose caret blink and scroll inertia are driven by frozen time does not animate
   at all.
 
+#### Step 8 — the post-load stutter, and the arena under the streaming buffers — **done**
+
+The first thing this port chased that is not a picture. Load a level or a save
+on this backend — measured on the save `Eyal2`, map `demo_mc_underground` — and
+the scene appears at once, and then the frames spike to **30–700 ms for about
+four seconds** before settling at vsync and staying there. Nothing is wrong with
+what is on screen, which is why the gate has nothing to say about this step
+either way.
+
+**The obvious suspect is not it, and ruling it out first is what left somewhere
+to look.** A backend that compiles its programs lazily stutters when a level's
+content reaches it — that is the whole design of §4.3's variant cache — so the
+first measurement was the shutdown counter: **13 programs and about 35 pipelines**
+for that map, **~8 ms for all of them together**. They are effectively free
+because Metal caches compiled sources per device and per process, and 35
+pipelines cannot account for four seconds however they are spread.
+
+**What the time actually was, with `com_speeds 1`, `sample` on the game's pid and
+a handful of temporary counters.** The engine's own timers are flat across the
+slow frames: game, frontend and backend each ~1 ms, on a frame taking hundreds.
+So the time is outside all three, and the sample says where — Metal's
+`waitUntilScheduled` inside eacp's `Frame::~Frame`, waiting on a command buffer
+that cannot be scheduled yet, and, on the recording side,
+**`GPU::StreamingBuffers::write` freeing MTLBuffers**, an IOGPU deallocation trap
+of about **1 ms each**, in the middle of the frame's draw loop.
+
+**The cause is the two facts multiplied.** Every draw on this backend copies its
+vertices and its indices through `StreamVertices` / `StreamIndices`, because
+`idVertexCache` keeps its blocks in system memory here —
+`ARBVertexBufferObjectAvailable` is false, which step 4b's `Init()` decided —
+and hands out plain pointers. And `StreamingBuffers` gave every one of those
+writes a GPU buffer of its own, one per write slot per pool, regrown in place by
+doubling whenever a later frame's write landed in that slot and was larger. A thousand-draw frame is
+therefore a thousand resources, each sized by whatever happened to occupy its
+position last time, and for as long as the draw order keeps changing — which is
+exactly the first seconds after a load — the regrowth is hundreds of allocate and
+free pairs a frame. The aggravator is the load itself: the whole of it runs
+inside one display-link tick, so every one of the **7,632 loading-screen
+redraws** took fresh slots that were never recycled, and about **100,000 buffers
+were alive before the first 3D frame**. Peak RSS **4.9 GB**.
+
+**The fix is eacp's and it is one idea: an arena rather than a rack.** A pool is
+one buffer per frame in flight, `write()` copies into it at the cursor and
+returns a `GPU::BufferRange` — `{buffer, offset, bytes}`, 256-byte aligned — and
+a frame that outgrows its arena has one *appended* beside it rather than swapped
+under the draws already recorded, the pool folding back to a single arena the
+next time it comes round. `RenderPass::setVertexBuffer`, `drawIndexed`,
+`drawIndexedInstanced` and `bind( program, range )` grew range overloads on both
+backends, and `ShaderProgram`'s instance slots hold ranges. eacp `5ea9468` on
+**`develop`**, pushed, with `Tests/GPU/StreamingBufferTests.cpp` rewritten to nine
+cases and `Tests/GPU/StreamedRangeDrawTests.cpp` added as four pixel cases;
+§5's gap 28 has the detail.
+
+**The two adaptations are small, which is the point of the shape.** Here,
+`9ffa4d5`: `drawVertices` is a `GPU::BufferRange` instead of a
+`const GPU::Buffer *`, the two `Stream*` helpers return one, the null checks
+become `drawVertices.buffer` and the reset becomes `{}`. Thirty-nine lines each
+way over three files, and no call site changed its shape. In imgui-eacp,
+`DrawRenderer`'s `vertexBuffer` and `indexBuffer` become ranges tested with
+`isValid()` — **14 insertions and 13 deletions**.
+
+**Measured on the same save, before and after: slow frames (≥ 30 ms) 42 → 2,
+worst frame 707 → 277 ms, peak RSS 4.9 → 3.4 GB.** The reproduction is worth
+keeping, because a stutter measured by feel is not measured: run with
+`+set fs_savepath <scratch> +set fs_configpath <scratch>` and `+exec` a cfg
+holding `set com_speeds 1; loadGame Eyal2; wait 1200; quit`, with the save copied
+under `<scratch>/demo/savegames`, and count the per-frame lines `com_speeds`
+prints. **The gate is 297 of 297 identical** to `step7d`, label `arena`, which is
+the expected result: the bytes a draw reads are the same bytes, at an offset
+instead of at zero.
+
+**What this is not.** The plan has said since step 4b that
+`idVertexCache`'s system-memory blocks are "what the draws want until it moves
+onto `GPU::StreamingBuffers` wholesale", and §5's "not gaps" entry has said since
+before the port began that the type is `idVertexCache`'s exact shape. That move
+is still not made, and this step does not make it — every draw still copies its
+geometry every frame. What it does is make the streaming path able to *carry* a
+per-draw renderer at all: the cost of a write is now its bytes and a memcpy
+rather than a GPU resource, so the wholesale move is an optimisation to be made
+on its own merits rather than the only way out of a stall.
+
+**Where the three repositories stand.** eacp's half is committed and pushed on
+`develop`; `origin/main` is at `6b462a3` and does not have it, and the local
+checkout's `main` carries an unpushed merge of `develop` on top of that.
+`CMake/Eacp.cmake` follows it: `CPMAddPackage` now asks for `GIT_TAG develop`
+literally rather than `${EACP_GIT_TAG}`, and the `eacp_track_branch(...)` call
+above it is deleted — so the function is still defined but never called,
+`EACP_GIT_TAG` is a cache variable nothing reads, and the fast-forward that call
+existed to perform does not happen. That is the trap the file's own long comment
+describes: CPM skips the download when the source directory already exists, so
+CPM's throwaway clone of `develop` is made by the first configure and never
+looked at again, and a fresh configure with no source override builds against
+whatever `develop` was the first time that build tree was configured. The
+`cmake-build-release` this step was measured in is configured with
+`-DCPM_eacp_SOURCE=$HOME/Code/eacp -DCPM_imgui-eacp_SOURCE=$HOME/Code/imgui-eacp`
+and so builds against the working trees either way. imgui-eacp's half is
+**uncommitted**, standing in the `~/Code/imgui-eacp` working tree on `main`
+awaiting the user's own commit as step 7's change did before it — and it has a
+second reason to wait: imgui-eacp's `CMake/FindEACP.cmake` fetches eacp `main`,
+which has no `BufferRange`, so imgui-eacp will not build standalone against its
+own pin until eacp's `develop` reaches `main` or that pin moves. Inside this
+build the `find_package(EACP)` is answered by the eacp this tree already added
+(step 7), so it builds here.
+
 ### Shader inventory for Phase 2
 
 Roughly 10–15 EDSL programs, each in the sampling variants §4.3 sizes — 8 worst case
@@ -3712,7 +3869,9 @@ Phase 2 is the first work that compiles against eacp. In rough order:
    the handles at all. C6 landed the stub at 297/297, `fragmentPrograms` and all.
 
 One thing is open, and it is the Windows host. The two that stood beside it are
-struck through below, with the steps that closed them.
+struck through below, with the steps that closed them, and a third struck-through
+entry sits with them that was never on this list at all — step 8 was found by
+running the build rather than by planning for it.
 
 **The Windows host.** The port is macOS-only from step 2b (§6), and step 5 made
 that the buildsystem's position rather than an accident: `neo/CMakeLists.txt`
@@ -3765,6 +3924,16 @@ it stays the one piece of the port that was verified by looking at it rather tha
 by the gate: 297 of 297 frames identical either way, exactly as 4e.8 predicted,
 and the picture measured instead at ten pinned cameras, where seven move and the
 largest reads 0.59 of 255 against a run-to-run floor of 0.0003.
+
+~~**The seconds of stutter after a level load.**~~ — **done**, step 8 in §6, and
+eacp gap 28 with it. Never on this list, because nothing planned for it: the
+frames after a load spiked to 30–700 ms for about four seconds and the cause was
+neither shader compiles nor anything the engine's own timers could see, but one
+GPU buffer allocated and freed per streamed draw underneath
+`GPU::StreamingBuffers`. An arena per frame in flight and a `GPU::BufferRange`
+per write took the measured save's slow frames from 42 to 2, its worst frame from
+707 to 277 ms and its peak RSS from 4.9 to 3.4 GB, at 297 of 297 identical. It is
+the first thing here measured in milliseconds rather than in levels of 255.
 
 **Why 4e.8 went before step 5 rather than after it, in one number.** At the
 tour's second camera stop the two builds disagreed by 0.458 of 255, and the heat
