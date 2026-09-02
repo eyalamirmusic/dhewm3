@@ -451,12 +451,6 @@ set(src_roq
 
 add_globbed_headers(src_roq "tools/compilers/roqvq")
 
-set(src_renderbump
-	tools/compilers/renderbump/renderbump.cpp
-)
-
-add_globbed_headers(src_renderbump "tools/compilers/renderbump")
-
 set(src_snd
 	sound/snd_cache.cpp
 	sound/snd_decoder.cpp
@@ -741,7 +735,6 @@ set(src_core
 	${src_dmap}
 	${src_aas}
 	${src_roq}
-	${src_renderbump}
 	${src_snd}
 	${src_ui}
 	${src_debuggerServer}

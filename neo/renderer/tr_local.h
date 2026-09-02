@@ -1635,7 +1635,6 @@ TR_BACKEND
 */
 
 void RB_SetDefaultGLState( void );
-void RB_SetGL2D( void );
 
 void RB_ExecuteBackEndCommands( const emptyCommand_t *cmds );
 

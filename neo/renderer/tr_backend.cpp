@@ -102,37 +102,6 @@ RENDER BACK END THREAD FUNCTIONS
 
 /*
 =============
-RB_SetGL2D
-
-This is not used by the normal game paths, just by some tools
-=============
-*/
-void RB_SetGL2D( void ) {
-	// set 2D virtual screen size
-	qglViewport( 0, 0, glConfig.vidWidth, glConfig.vidHeight );
-	if ( r_useScissor.GetBool() ) {
-		qglScissor( 0, 0, glConfig.vidWidth, glConfig.vidHeight );
-	}
-	qglMatrixMode( GL_PROJECTION );
-	qglLoadIdentity();
-	qglOrtho( 0, 640, 480, 0, 0, 1 );		// always assume 640x480 virtual coordinates
-	qglMatrixMode( GL_MODELVIEW );
-	qglLoadIdentity();
-
-	GL_State( GLS_DEPTHFUNC_ALWAYS |
-			  GLS_SRCBLEND_SRC_ALPHA |
-			  GLS_DSTBLEND_ONE_MINUS_SRC_ALPHA );
-
-	GL_Cull( CT_TWO_SIDED );
-
-	qglDisable( GL_DEPTH_TEST );
-	qglDisable( GL_STENCIL_TEST );
-}
-
-
-
-/*
-=============
 RB_SetBuffer
 
 =============
