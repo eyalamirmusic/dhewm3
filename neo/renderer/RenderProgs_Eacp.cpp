@@ -1045,6 +1045,151 @@ void idEacpBlitProgram::define( void ) {
 /*
 ================================================================================
 
+	idEacpDepthCopyProgram
+
+================================================================================
+*/
+
+idEacpDepthCopyProgram::idEacpDepthCopyProgram() {
+	// Nearest, and it is the only honest filter for this: a depth value is not a
+	// colour and the average of two of them is a surface that is at neither
+	// depth. The copy is 1:1 anyway - the destination is the frame target's own
+	// size - so there is nothing between texels to interpolate.
+	sceneDepth.sampling.filter = GPU::TextureFilter::Nearest;
+	sceneDepth.sampling.addressMode = GPU::TextureAddressMode::Clamp;
+
+	compile();
+}
+
+void idEacpDepthCopyProgram::define( void ) {
+	auto	position = vertexInput( &eacpBlitVert_t::xy );
+	auto	texcoord = vertexInput( &eacpBlitVert_t::st );
+
+	setPosition( GPU::float4( position, 0.0f, 1.0f ) );
+
+	// One channel in, one channel out. The destination is R32Float, so only the
+	// first of the four is stored; the other three are written for the same
+	// reason the blit writes an opaque alpha, which is that a fragment has to
+	// produce a colour whatever the attachment keeps of it.
+	auto	depth = GPU::sample( sceneDepth, varying( texcoord ) );
+
+	setFragment( GPU::float4( depth, depth, depth, 1.0f ) );
+}
+
+/*
+================================================================================
+
+	idEacpSoftParticleProgram
+
+================================================================================
+*/
+
+idEacpSoftParticleProgram::idEacpSoftParticleProgram( GPU::TextureSampling sampling ) {
+	image.sampling = sampling;
+
+	// _currentDepth's, which is not content: R_DepthImage creates the image
+	// TF_NEAREST / TR_CLAMP and CopyDepthbufferToImage writes those two fields
+	// back on every capture, so this is a constant rather than a key.
+	depthImage.sampling.filter = GPU::TextureFilter::Nearest;
+	depthImage.sampling.addressMode = GPU::TextureAddressMode::Clamp;
+
+	compile();
+}
+
+/*
+====================
+idEacpSoftParticleProgram::define
+
+soft_particle.vfp, both halves, line for line.
+
+The vertex half is three lines of the original: the position through the
+matrix (`OPTION ARB_position_invariant`), the texture coordinate through the
+stage's matrix, and the vertex colour across. The fourth thing it sends is the
+clip position itself, which the ARB program did not need because
+`fragment.position` was given to it.
+
+The fragment half recovers two depths in Doom units and compares them. Worth
+knowing about the two constants: they are `{ 1/3, -0.33316667 }`, and what they
+undo is R_SetupProjection's matrix at `r_znear` 3 - a window depth d comes back
+as 3 / (d - 0.9995), which is negative and grows away from the eye. The 0.9994
+clamp above it is the original's guard for caulk sky, which writes no depth at
+all and leaves the far plane's 1 in the buffer; without it the reciprocal of
+zero would put the sky at infinity and fade nothing.
+====================
+*/
+void idEacpSoftParticleProgram::define( void ) {
+	auto	position = vertexInput( &eacpDrawVert_t::xyz );
+	auto	texcoord = vertexInput( &eacpDrawVert_t::st );
+	auto	vertexColor = vertexInput( &eacpDrawVert_t::color );
+
+	auto	clip = modelViewProjection * GPU::float4( position, 1.0f );
+
+	setPosition( clip );
+
+	// `DP4 result.texcoord.x, vertex.texcoord, program.env[12]` and its T half,
+	// with vertex.texcoord being (s, t, 0, 1) - the same two rows the generic
+	// stage program dots, against the same coordinate.
+	auto	coordinate = GPU::float4( texcoord, 1.0f, 0.0f );
+
+	auto	st = varying( GPU::float2( GPU::dot( coordinate, textureMatrixS ),
+									   GPU::dot( coordinate, textureMatrixT ) ) );
+
+	// `MOV result.color, vertex.color`, through the pair that says whether the
+	// stage wanted the array or the constant colour.
+	auto	color = varying( vertexColor * colorModulate + colorAdd );
+
+	// fragment.position, rebuilt - see idEacpHeatHazeProgram::define, which
+	// needs the same number for the same reason. z as well as x and y here,
+	// because this program compares the fragment's own depth against the
+	// buffer's rather than only reading the buffer.
+	auto	screen = varying( GPU::float4( clip.x(), clip.y(),
+										   clip.z(), clip.w() ) );
+
+	auto	ndc = screen.xyz() / screen.w();
+
+	// `MUL tmp.xy, fragment.position, program.env[22]`, with the viewport folded
+	// in - the class comment says why that is more than a translation.
+	auto	depthCoordinate = ndc.xy() * depthScaleBias.xy() + depthScaleBias.zw();
+
+	// `TEX scene_depth, tmp, texture[1], 2D` then `MIN scene_depth, 0.9994`.
+	auto	sceneWindow = GPU::min( GPU::sample( depthImage, depthCoordinate ).x(),
+									0.9994f );
+
+	// `MAD tmp, scene_depth, depth_consts.x, depth_consts.y; RCP scene_depth`,
+	// twice: once for what the depth buffer holds and once for this fragment.
+	auto	sceneDepth = 1.0f / ( sceneWindow * 0.33333333f - 0.33316667f );
+	auto	particleDepth = 1.0f / ( ndc.z() * 0.33333333f - 0.33316667f );
+
+	// `ADD tmp, -scene_depth, particle_depth; ADD tmp, tmp, radius;
+	//  MUL_SAT fade, tmp, 1/fadeRange`. Both depths are negative and grow away
+	// from the eye, so a particle in front of the surface behind it gives a
+	// positive difference and the radius is what moves the zero crossing out to
+	// where the particle's own volume starts intersecting.
+	auto	fade = GPU::clamp( ( particleDepth - sceneDepth + particleRadius.x() )
+							   * particleRadius.y(),
+							   0.0f, 1.0f );
+
+	// `MUL_SAT near_fade, particle_depth, -particle_radius.z`: the same fade at
+	// the other end, so a particle does not pop as it passes through the eye.
+	auto	nearFade = GPU::clamp( particleDepth * -particleRadius.z(), 0.0f, 1.0f );
+
+	// `MUL fade, near_fade, fade; ADD_SAT fade, fade, program.env[24]` - the
+	// scalar broadcast to four channels and then saturated back up on the ones
+	// this blend mode does not fade.
+	auto	scaled = fade * nearFade;
+
+	auto	channels = GPU::clamp( GPU::float4( scaled, scaled, scaled, scaled )
+								   + colorChannelMask,
+								   0.0f, 1.0f );
+
+	// `TEX oColor; MUL oColor, oColor, fade; MUL result.color, oColor,
+	//  fragment.color`.
+	setFragment( GPU::sample( image, st ) * channels * color );
+}
+
+/*
+================================================================================
+
 	State, translated.
 
 	The GLS_* bitfield is the one piece of Doom 3's backend that was already
@@ -1334,6 +1479,11 @@ void idEacpRenderProgs::Shutdown( void ) {
 	screens.clear();
 	heatHazes.clear();
 	colorProcesses.clear();
+	softParticles.clear();
+
+	depthCopyPipeline.reset();
+	depthCopyLibrary.reset();
+	depthCopyProgram.reset();
 
 	shadowPipelines.clear();
 	shadowLibrary.reset();
@@ -1373,6 +1523,11 @@ int idEacpRenderProgs::NumPrograms( void ) const {
 	total += CountPrograms( screens );
 	total += CountPrograms( heatHazes );
 	total += CountPrograms( colorProcesses );
+	total += CountPrograms( softParticles );
+
+	if ( depthCopyProgram.has_value() ) {
+		total++;
+	}
 
 	if ( shadowProgram.has_value() ) {
 		total++;
@@ -1413,6 +1568,11 @@ int idEacpRenderProgs::NumPipelines( void ) const {
 	total += CountPipelines( screens );
 	total += CountPipelines( heatHazes );
 	total += CountPipelines( colorProcesses );
+	total += CountPipelines( softParticles );
+
+	if ( depthCopyPipeline ) {
+		total++;
+	}
 
 	total += shadowPipelines.size();
 	total += fogPipelines.size();
@@ -2192,6 +2352,109 @@ idEacpRenderProgs::blitDraw_t idEacpRenderProgs::CaptureDraw( void ) {
 	}
 
 	draw.pipeline = capturePipeline;
+
+	return draw;
+}
+
+/*
+====================
+idEacpRenderProgs::DepthCopyDraw
+
+The frame's depth buffer into _currentDepth. One program and one pipeline, both
+compiled on the first capture of a run - which is the first depth fill of the
+first 3D view, so in practice the first frame that draws a world.
+
+Three fields again, and all three are the destination's: R32Float because a
+window depth needs the mantissa (see TextureFormat::R32Float), no depth
+attachment because the depth here is what is being *read*, and single-sampled
+like every texture target.
+====================
+*/
+idEacpRenderProgs::depthCopyDraw_t idEacpRenderProgs::DepthCopyDraw( void ) {
+	depthCopyDraw_t	draw;
+
+	draw.program = NULL;
+	draw.pipeline = NULL;
+
+	if ( !depthCopyProgram.has_value() ) {
+		depthCopyProgram.emplace();
+		depthCopyLibrary.emplace( GPU::Device::shared(), depthCopyProgram->source() );
+
+		if ( !depthCopyLibrary->isValid() ) {
+			R_EacpShaderCompileFailed( "depth capture" );
+			depthCopyLibrary.reset();
+			depthCopyProgram.reset();
+			return draw;
+		}
+	}
+
+	if ( !depthCopyLibrary.has_value() ) {
+		return draw;
+	}
+
+	draw.program = &*depthCopyProgram;
+
+	if ( !depthCopyPipeline ) {
+		GPU::RenderPipelineDescriptor	descriptor;
+
+		descriptor.library = &*depthCopyLibrary;
+		descriptor.vertexLayout = depthCopyProgram->vertexLayout();
+		descriptor.topology = GPU::PrimitiveTopology::Triangles;
+
+		descriptor.colorFormat = GPU::pixelFormatFor( GPU::TextureFormat::R32Float );
+		descriptor.sampleCount = 1;
+
+		descriptor.depth = false;
+		descriptor.stencil = false;
+
+		depthCopyPipeline.create( GPU::Device::shared(), descriptor );
+
+		if ( !depthCopyPipeline->isValid() ) {
+			common->Warning( "eacp: no pipeline for the depth capture, so "
+							 "_currentDepth will not be filled in" );
+			depthCopyPipeline.reset();
+			return draw;
+		}
+	}
+
+	draw.pipeline = depthCopyPipeline;
+
+	return draw;
+}
+
+/*
+====================
+idEacpRenderProgs::SoftParticleDraw
+
+soft_particle.vfp, whose one variable texture is the particle's own image - so
+the key is that one sampling and the space is four. _currentDepth's is a
+constant, for the reason the constructor gives.
+====================
+*/
+idEacpRenderProgs::softParticleDraw_t
+idEacpRenderProgs::SoftParticleDraw( const idImage *image, int stateBits, int cullType ) {
+	softParticleDraw_t	draw;
+
+	draw.program = NULL;
+	draw.pipeline = NULL;
+
+	const GPU::TextureSampling	sampling = R_EacpSampling( image );
+
+	texgenVariant_t<idEacpSoftParticleProgram> *	variant =
+		TexgenVariant( softParticles, GPU::samplingIndex( sampling ), "soft particle",
+					   [&]( std::optional<idEacpSoftParticleProgram> &program ) {
+						   program.emplace( sampling );
+					   } );
+
+	if ( !variant ) {
+		return draw;
+	}
+
+	draw.program = &*variant->program;
+
+	draw.pipeline = PipelineFor( variant->pipelines, *variant->library,
+								 variant->program->vertexLayout(),
+								 stateBits, cullType, ES_IGNORE );
 
 	return draw;
 }

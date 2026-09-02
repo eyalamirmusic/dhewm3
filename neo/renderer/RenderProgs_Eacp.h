@@ -1034,6 +1034,144 @@ public:
 /*
 ================================================================================
 
+	idEacpDepthCopyProgram
+
+	`_currentDepth`: the frame's depth buffer, out of the attachment and into an
+	image the shader passes can sample. #3877's early depth capture, and the
+	blit's shape one plane along - the same six clip-space vertices, into an
+	idImage's texture, with the source read from the render target rather than
+	uploaded.
+
+	**A depth attachment cannot be sampled by the pass that is rendering into
+	it**, which is the same rule `_currentRender` runs into and is why this
+	interrupts the frame's pass exactly as CopyFramebufferToImage does. It is
+	also the whole of what eacp gap 24 was: the attachment is created
+	render-target-only, so before it was closed there was nothing to sample here
+	whatever the pass was doing.
+
+	**One float out, one float in.** eacp's depthTexture() slot samples to a
+	Float rather than a Float4 - Metal's `depth2d<float>` and an R32_FLOAT SRV
+	both have exactly one channel - and the destination is R32Float for the
+	reason a depth buffer is not an eight-bit image: window depth spends almost
+	its whole range in the last thousandth, where a byte has one value and a half
+	float has about one too.
+
+================================================================================
+*/
+
+class idEacpDepthCopyProgram : public eacp::GPU::ShaderProgram {
+public:
+							idEacpDepthCopyProgram();
+
+	virtual void			define( void ) override;
+
+	// The *render target* whose depth buffer this reads, not a texture of its
+	// own - a depth attachment is created with its colour texture and has no
+	// separate existence, which is what setFragmentDepthTexture takes.
+	eacp::GPU::Uniform<eacp::GPU::TextureDepth2D>	sceneDepth;
+
+	EACP_SHADER( sceneDepth )
+};
+
+/*
+================================================================================
+
+	idEacpSoftParticleProgram
+
+	soft_particle.vfp, which is TheDarkMod 2.04's and which dhewm3 embeds as a
+	string in the ARB2 path (#3878). A particle fades out where it meets the
+	surface behind it and where it is about to pass through the eye, so a steam
+	plume sinks into the floor instead of cutting a line across it.
+
+	**It is the only program here whose input is the depth buffer**, and so the
+	only one that needed eacp gap 24 open before it could be written. What it
+	samples is not the attachment but `_currentDepth`, the copy
+	idEacpDepthCopyProgram made at the end of the depth fill - an ordinary
+	single-channel float image by then, because the attachment is still attached.
+
+	**The arithmetic is the original's, constants included.**
+	`{ 0.33333333, -0.33316667 }` recovers view-space depth in Doom units from a
+	window depth, and it is hard-coded there and here for the same reason: it is
+	R_SetupProjection's matrix with `r_znear` at 3, written out. Reading a
+	non-default `r_znear` would need it computed, and neither build does that.
+
+	**Nothing gives it a gamma correction**, which is a decision the original
+	states outright: soft_particle.vfp carries `nodhewm3gammahack` so that
+	R_LoadARBProgram leaves it alone, "because that looks bad when rendered with
+	additive blending (gets too bright)". So this derives from ShaderProgram
+	rather than from idEacpGammaProgram, exactly as the generic stage does.
+
+	**The screen coordinate is rebuilt rather than read**, the same way
+	idEacpHeatHazeProgram's is and for the same reason - the EDSL has no
+	fragment-position input. The clip position goes across as a varying and the
+	fragment stage divides by w, which is exact: a varying is interpolated with w
+	already divided out, so the quotient is the normalized device coordinate at
+	that fragment. Both the depth lookup and the fragment's *own* depth come out
+	of it, which is what makes the pair comparable.
+
+	**depthScaleBias is what a viewport does to that coordinate.** The ARB
+	program reads an absolute window position and scales it by the reciprocal of
+	the depth image's size; here the coordinate arrives in [-1, 1] of the
+	*viewport*, so the map into the image's [0, 1] carries the viewport's origin
+	as well as its size. That is a fix rather than a translation, and it is what
+	makes a mirror or a subview sample its own depth: the original's lookup is
+	off by the viewport origin wherever that is not zero.
+
+================================================================================
+*/
+
+class idEacpSoftParticleProgram : public eacp::GPU::ShaderProgram {
+public:
+							idEacpSoftParticleProgram( eacp::GPU::TextureSampling sampling );
+
+	virtual void			define( void ) override;
+
+	eacp::GPU::Uniform<eacp::GPU::Float4x4>		modelViewProjection;
+
+	// The stage's texture matrix, as the two rows of it that do anything -
+	// PP_DIFFUSE_MATRIX_S and PP_DIFFUSE_MATRIX_T in the original, which is the
+	// one thing dhewm3 added to TheDarkMod's vertex program.
+	eacp::GPU::Uniform<eacp::GPU::Float4>		textureMatrixS;
+	eacp::GPU::Uniform<eacp::GPU::Float4>		textureMatrixT;
+
+	// `MUL result.color, oColor, fragment.color`, with fragment.color being
+	// either the vertex colour array or the constant colour glColor4fv put
+	// there - which is StageColor's (modulate, add) pair on its non-combiner
+	// rule, this being a fragment program rather than a texture-env combiner.
+	eacp::GPU::Uniform<eacp::GPU::Float4>		colorModulate;
+	eacp::GPU::Uniform<eacp::GPU::Float4>		colorAdd;
+
+	// (scale.x, scale.y, bias.x, bias.y): the normalized device coordinate into
+	// a coordinate on _currentDepth. program.env[22] with the viewport's origin
+	// folded in - see the class comment.
+	eacp::GPU::Uniform<eacp::GPU::Float4>		depthScaleBias;
+
+	// program.env[23]: { radius, 1 / fadeRange, 1 / radius, 0 }. fadeRange is
+	// the particle's diameter for an alpha blend and its radius for an additive
+	// one, which is the original's own asymmetry: fog is half as apparent with a
+	// wall in the middle of it, where a glare loses nothing by having something
+	// to reflect off.
+	eacp::GPU::Uniform<eacp::GPU::Float4>		particleRadius;
+
+	// program.env[24]: the channels the fade is *not* allowed to touch, added
+	// to it before the multiply. An alpha blend fades its alpha and keeps its
+	// rgb; an additive one fades its rgb and keeps its alpha.
+	eacp::GPU::Uniform<eacp::GPU::Float4>		colorChannelMask;
+
+	eacp::GPU::Uniform<eacp::GPU::Texture2D>	image;
+
+	// _currentDepth: the copy, not the attachment, so an ordinary 2D texture
+	// sampled nearest and clamped - which is what R_DepthImage created it as.
+	eacp::GPU::Uniform<eacp::GPU::Texture2D>	depthImage;
+
+	EACP_SHADER( modelViewProjection, textureMatrixS, textureMatrixT,
+				 colorModulate, colorAdd, depthScaleBias, particleRadius,
+				 colorChannelMask, image, depthImage )
+};
+
+/*
+================================================================================
+
 	idEacpRenderProgs
 
 	The three caches and the streaming pools, in one place because they are
@@ -1173,6 +1311,31 @@ public:
 
 	blitDraw_t				BlitDraw( void );
 	blitDraw_t				CaptureDraw( void );
+
+	// The frame's depth buffer into _currentDepth, which is the third
+	// destination the same six vertices are drawn onto and the only one whose
+	// source is not a colour texture. Its pipeline is compiled against R32Float
+	// and against no depth attachment - the destination is an image, and the
+	// depth being read is the *source*.
+	struct depthCopyDraw_t {
+		idEacpDepthCopyProgram *				program;
+		const eacp::GPU::RenderPipeline *		pipeline;
+	};
+
+	depthCopyDraw_t			DepthCopyDraw( void );
+
+	// The soft particle (#3878), whose key is its one variable sampling - the
+	// particle's own image. _currentDepth's is not in it: R_DepthImage creates
+	// that image nearest and clamped and the depth copy writes those two fields
+	// back every time it runs, so there is one tuple to compile for and the key
+	// space is four.
+	struct softParticleDraw_t {
+		idEacpSoftParticleProgram *				program;
+		const eacp::GPU::RenderPipeline *		pipeline;
+	};
+
+	softParticleDraw_t		SoftParticleDraw( const idImage *image, int stateBits,
+											  int cullType );
 
 	// Geometry for one draw, in a buffer no frame still in flight is reading.
 	// The reference is good until this frame's pool comes round again, which is
@@ -1334,6 +1497,11 @@ private:
 	eacp::OwnedVector<texgenVariant_t<idEacpHeatHazeProgram>>		heatHazes;
 	eacp::OwnedVector<texgenVariant_t<idEacpColorProcessProgram>>	colorProcesses;
 
+	// The soft particle's, on the same template again. Its key is the particle
+	// image's sampling alone, so the space is four; the demo's first level
+	// reaches one of them, every particle image in it being linear and clamped.
+	eacp::OwnedVector<texgenVariant_t<idEacpSoftParticleProgram>>	softParticles;
+
 	// The shadow program, which has no variants - see the class. What it does
 	// have is more pipelines than either of the others per program: the count
 	// in its two forms, the clear, and the mirrored pair of the count.
@@ -1375,6 +1543,16 @@ private:
 	std::optional<eacp::GPU::ShaderLibrary>	blitLibrary;
 	eacp::OwningPointer<eacp::GPU::RenderPipeline>	blitPipeline;
 	eacp::OwningPointer<eacp::GPU::RenderPipeline>	capturePipeline;
+
+	// The depth copy, which has one program, no state to key it on and one
+	// pipeline - its destination is always an idImage's R32Float texture. It is
+	// a program of its own rather than a variant of the blit above because what
+	// it samples is a different kind of thing: eacp declares a depth slot and a
+	// colour slot separately, and a shader that sampled both would declare a
+	// texture neither destination binds.
+	std::optional<idEacpDepthCopyProgram>	depthCopyProgram;
+	std::optional<eacp::GPU::ShaderLibrary>	depthCopyLibrary;
+	eacp::OwningPointer<eacp::GPU::RenderPipeline>	depthCopyPipeline;
 
 	// The program above, compiled on the first of the two draws that wants it.
 	idEacpBlitProgram *		BlitProgram( void );

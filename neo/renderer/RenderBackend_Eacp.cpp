@@ -442,6 +442,20 @@ private:
 	void			DrawColorProcessStage( const srfTriangles_t *tri, const drawSurf_t *surf,
 										   const shaderStage_t *pStage, int stateBits );
 
+	// #3878's soft particle: an ambient stage of a particle surface, drawn
+	// through soft_particle.vfp instead of the generic stage program so that it
+	// fades where it meets the geometry behind it. It is neither a texgen nor a
+	// newStage - the engine chooses it, off a flag the frontend set and the
+	// stage's own blend mode - which is why it is a branch of its own.
+	void			DrawSoftParticleStage( const srfTriangles_t *tri, const drawSurf_t *surf,
+										   const shaderStage_t *pStage, int srcBlend );
+
+	// The normalized device coordinate into a coordinate on _currentDepth, as
+	// (scale.x, scale.y, bias.x, bias.y). The capture is 1:1 with the frame
+	// target, so this is the viewport's own rectangle over the target's size -
+	// which is what makes a subview's particles read the subview's depth.
+	Float4			DepthCaptureScaleBias( void ) const;
+
 	// program.local[i] as RB_STD_T_RenderShaderPasses sends it: the four
 	// registers a vertexParm named, evaluated, or zero where the material
 	// declared no such parm - which is what an ARB program's untouched local
@@ -590,6 +604,7 @@ private:
 	// One warning per unimplemented path rather than one per frame, which is
 	// the difference between a note and an unusable console.
 	bool				warnedCopyFramebuffer;
+	bool				warnedCopyDepthbuffer;
 	bool				warnedCompressed;
 	bool				warnedExternalFormat;
 	bool				warnedTexgen;
@@ -640,6 +655,7 @@ idRenderBackendEacp::idRenderBackendEacp() {
 	lightStencil = ES_IGNORE;
 	postProcessPass = false;
 	warnedCopyFramebuffer = false;
+	warnedCopyDepthbuffer = false;
 	warnedCompressed = false;
 	warnedExternalFormat = false;
 	warnedTexgen = false;
@@ -822,6 +838,14 @@ bool idRenderBackendEacp::EnsureFrameTarget( void ) {
 	descriptor.format = GPU::TextureFormat::BGRA8Unorm;
 	descriptor.renderTarget = true;
 	descriptor.stencil = true;
+
+	// #3877's depth capture reads the attachment, and eacp creates one
+	// render-target-only unless asked otherwise (gap 24). Asked for always
+	// rather than when r_useSoftParticles happens to be set, because the cvar is
+	// archived and can move at any time while the target is built once per
+	// resolution - and what it costs is a usage bit on Metal and one descriptor
+	// on D3D12, neither of which is worth a vid_restart to save.
+	descriptor.sampleableDepth = true;
 
 	frameTarget.create( GPU::Device::shared(), descriptor, (const void *)NULL );
 
@@ -1435,6 +1459,26 @@ void idRenderBackendEacp::SetSpace( const viewEntity_t *space, float modelDepthH
 
 /*
 ======================
+R_EacpDepthCaptureEnabled
+
+Whether the frame's depth buffer is copied into _currentDepth at the end of the
+depth fill (#3877). Character for character the condition the deleted backend
+made, and it is worth writing out what -1 resolves to: the cvar defaults to -1
+and r_useSoftParticles defaults to 1, so on the SDL/GL build the capture was on
+out of the box and stayed on unless one of the two was turned off. That is the
+answer this backend has to reproduce, because the frontend already reproduces
+the other half of it - tr_light.cpp gives a particle surface a softening radius
+on `r_useSoftParticles && r_enableDepthCapture != 0`, which step 5 left intact.
+======================
+*/
+static bool R_EacpDepthCaptureEnabled( void ) {
+	const int	enable = r_enableDepthCapture.GetInteger();
+
+	return enable == 1 || ( enable == -1 && r_useSoftParticles.GetBool() );
+}
+
+/*
+======================
 idRenderBackendEacp::FillDepthBuffer
 
 RB_STD_FillDepthBuffer, which is also RB_RenderDrawSurfListWithFunction: the
@@ -1447,12 +1491,16 @@ that the walk below does not: the plane is the view's, in world coordinates, and
 what a draw needs is the same plane in the surface's own - so it is transformed
 per space, exactly where OpenGL re-sends its texgen.
 
-Not here, and each is switched off by something this port controls:
+**The early depth capture (#3877) is at the end of it**, which is where the ARB
+path put it and is the only place it can be: the buffer is complete, and the
+lights and the shader passes that come after all read what it holds. What asks
+is r_enableDepthCapture, whose -1 means "whenever soft particles are on" - and
+that is what it resolved to on the deleted backend too, the cvar defaulting to
+-1 and r_useSoftParticles to 1. The lightgem's own passes are excluded by
+viewID, exactly as they are in the frontend condition that flags the surfaces.
 
-  - the early depth capture (#3877), which feeds _currentDepthImage to the soft
-    particle program. r_enableDepthCapture is -1 and r_useSoftParticles only
-    reaches a BE_ARB2 backend, so nothing asks.
-  - polygon offset for decals, which is eacp gap 6.
+Not here, and switched off by something this port controls: polygon offset for
+decals, which is eacp gap 6.
 ======================
 */
 void idRenderBackendEacp::FillDepthBuffer( drawSurf_t **drawSurfs, int numDrawSurfs ) {
@@ -1493,6 +1541,19 @@ void idRenderBackendEacp::FillDepthBuffer( drawSurf_t **drawSurfs, int numDrawSu
 	drawProgram = NULL;
 	drawPipeline = NULL;
 	drawVertices = NULL;
+
+	// The depth this view drew, into an image the shader passes can sample.
+	// Suppressed for a lightgem render, which has a negative viewID and no
+	// particles worth softening - the same test the frontend makes before it
+	// gives a surface a softening radius at all (tr_light.cpp).
+	if ( R_EacpDepthCaptureEnabled() && backEnd.viewDef->renderView.viewID >= 0 ) {
+		globalImages->currentDepthImage->CopyDepthbuffer(
+			backEnd.viewDef->viewport.x1,
+			backEnd.viewDef->viewport.y1,
+			backEnd.viewDef->viewport.x2 - backEnd.viewDef->viewport.x1 + 1,
+			backEnd.viewDef->viewport.y2 - backEnd.viewDef->viewport.y1 + 1,
+			true );
+	}
 }
 
 /*
@@ -2429,10 +2490,11 @@ void idRenderBackendEacp::DrawSurfaceShaderPasses( const drawSurf_t *surf ) {
 		return;
 	}
 
-	// #3878: a soft particle refuses the model depth hack, the older and
-	// cruder way of softening the same edge. It refuses it on every backend,
-	// including this one, where the soft particle program itself is behind
-	// BE_ARB2 and so never runs.
+	// #3878: a soft particle refuses the model depth hack, the older and cruder
+	// way of softening the same edge. The two are alternatives rather than
+	// layers - the hack pushes the whole surface away so that its edge is not
+	// coincident with the wall, where the program fades the fragments that are
+	// near it - so a surface the program is about to soften keeps its own depth.
 	const bool	softParticle = ( surf->dsFlags & DSF_SOFT_PARTICLE ) != 0;
 
 	SetSpace( surf->space, softParticle ? 0.0f : surf->space->modelDepthHack );
@@ -2497,6 +2559,25 @@ void idRenderBackendEacp::DrawSurfaceShaderPasses( const drawSurf_t *surf ) {
 		// exactly as RB_STD_T_RenderShaderPasses branches out of its loop here.
 		if ( pStage->newStage ) {
 			DrawNewStage( tri, surf, pStage );
+			continue;
+		}
+
+		// #3878, and its place in the loop is the ARB path's exactly: after the
+		// newStage branch, so that a particle material carrying its own program
+		// keeps it, and before the constant colour and the three blend
+		// shortcuts, so that a soft particle with a black constant colour is
+		// still drawn. The blend test is the original's too - only an additive
+		// or a straight-alpha stage has a channel this can fade, and a
+		// particle_radius of zero or less is the frontend saying this surface
+		// is not one.
+		const int	srcBlend = pStage->drawStateBits & GLS_SRCBLEND_BITS;
+
+		if ( softParticle
+			 && surf->particle_radius > 0.0f
+			 && ( srcBlend == GLS_SRCBLEND_ONE || srcBlend == GLS_SRCBLEND_SRC_ALPHA )
+			 && !r_skipNewAmbient.GetBool()
+			 && R_EacpDepthCaptureEnabled() ) {
+			DrawSoftParticleStage( tri, surf, pStage, srcBlend );
 			continue;
 		}
 
@@ -2756,6 +2837,158 @@ void idRenderBackendEacp::DrawStage( const srfTriangles_t *tri, const eacpStage_
 	// Through the counter wrapper rather than around it: r_showPrimitives and
 	// the renderer's own performance counters are read from the same place on
 	// both backends, and DrawIndexed is the seam.
+	RB_DrawElementsWithCounters( tri );
+}
+
+/*
+======================
+idRenderBackendEacp::DepthCaptureScaleBias
+
+Where on _currentDepth a fragment at a given normalized device coordinate is.
+
+The ARB program reads an absolute window position and multiplies it by the
+reciprocal of the depth image's size, which is only the right answer when the
+viewport starts at the frame's origin - the full-screen case, and the only one
+the original was ever exercised in. Here the coordinate arrives in [-1, 1] of
+the *viewport*, so the map carries the viewport's origin as well as its size:
+a mirror or a subview then reads the rows its own pass wrote rather than rows
+that many pixels away.
+
+y is negated because the two run opposite ways: a clip-space +1 is the top of
+the viewport and a texture's row 0 is the top of the image, so a coordinate that
+grows upward has to become one that grows downward.
+======================
+*/
+Float4 idRenderBackendEacp::DepthCaptureScaleBias( void ) const {
+	if ( frameTargetWidth < 1 || frameTargetHeight < 1 ) {
+		return asFloat4( 0.5f, -0.5f, 0.5f, 0.5f );
+	}
+
+	const float	width = (float)frameTargetWidth;
+	const float	height = (float)frameTargetHeight;
+
+	const Graphics::Rect &	viewport = appliedViewport;
+
+	return asFloat4( 0.5f * viewport.w / width,
+					 -0.5f * viewport.h / height,
+					 ( viewport.x + 0.5f * viewport.w ) / width,
+					 ( viewport.y + 0.5f * viewport.h ) / height );
+}
+
+/*
+======================
+idRenderBackendEacp::DrawSoftParticleStage
+
+soft_particle.vfp (#3878), which is the last program in Doom 3 this backend did
+not have. Everything above the draw is what RB_STD_T_RenderShaderPasses' soft
+branch sets, in the order it sets it.
+
+**The state is the stage's with the depth test taken off**, which is the
+original's `GL_State( pStage->drawStateBits | GLS_DEPTHFUNC_ALWAYS )` and its
+comment says why: the fragment program is doing the occlusion itself, out of the
+depth buffer it samples, and a hardware test in front of it would clip the very
+fragments the fade is for.
+
+**The image is the stage's own rather than RB_BindVariableStageImage's**, again
+as the original: the soft branch binds `pStage->texture.image` directly. Nothing
+in the game puts a cinematic on a particle, so the two agree on everything that
+ships; where they would not, this is the one that matches the reference.
+======================
+*/
+void idRenderBackendEacp::DrawSoftParticleStage( const srfTriangles_t *tri,
+												 const drawSurf_t *surf,
+												 const shaderStage_t *pStage,
+												 int srcBlend ) {
+	const GPU::Texture *	texture = TextureForStage( pStage->texture.image, false );
+	const GPU::Texture *	depth = TextureForStage( globalImages->currentDepthImage, false );
+
+	// A capture that did not happen leaves R_DepthImage's own 16x16 placeholder
+	// in the image, which would sample as a surface three units from the eye and
+	// fade every particle in the view to nothing. So the test is that the image
+	// is the size a capture makes it rather than that it has a texture at all -
+	// a capture the backend refused (no sampleable depth) is a warning already
+	// given, and this is what keeps it from also being a wrong picture.
+	if ( !texture || !depth
+		 || globalImages->currentDepthImage->uploadWidth != frameTargetWidth
+		 || globalImages->currentDepthImage->uploadHeight != frameTargetHeight ) {
+		return;
+	}
+
+	SetState( pStage->drawStateBits );
+
+	const int	stateBits = backEnd.glState.glStateBits | GLS_DEPTHFUNC_ALWAYS;
+
+	idEacpRenderProgs::softParticleDraw_t	draw =
+		eacpRenderProgs.SoftParticleDraw( pStage->texture.image, stateBits,
+										  ViewCull( backEnd.glState.faceCulling ) );
+
+	if ( !draw.pipeline ) {
+		return;
+	}
+
+	draw.program->modelViewProjection = asFloat4x4( modelViewProjection );
+
+	// The texture matrix, which is dhewm3's own addition to TheDarkMod's vertex
+	// program - "some particle materials set the texture matrix (with scroll,
+	// translate, scale, centerScale, shear or rotate)".
+	const float *	regs = surf->shaderRegisters;
+
+	float	matrix[16];
+
+	if ( pStage->texture.hasMatrix ) {
+		RB_GetShaderTextureMatrix( regs, &pStage->texture, matrix );
+
+		draw.program->textureMatrixS = asFloat4( matrix[0], matrix[4], matrix[12], 0.0f );
+		draw.program->textureMatrixT = asFloat4( matrix[1], matrix[5], matrix[13], 0.0f );
+	} else {
+		draw.program->textureMatrixS = asFloat4( 1.0f, 0.0f, 0.0f, 0.0f );
+		draw.program->textureMatrixT = asFloat4( 0.0f, 1.0f, 0.0f, 0.0f );
+	}
+
+	// SVC_IGNORE is a glColor4fv of the stage's constant colour and everything
+	// else is the vertex colour array, which is StageColor's non-combiner rule -
+	// the same one the two reflection programs take, and for the same reason: a
+	// fragment program has replaced the texture-env combiner, so what reaches
+	// the shader is `vertex.color` and nothing else.
+	eacpStage_t	stage;
+
+	stage.color = asFloat4( regs[ pStage->color.registers[0] ],
+							regs[ pStage->color.registers[1] ],
+							regs[ pStage->color.registers[2] ],
+							regs[ pStage->color.registers[3] ] );
+	stage.vertexColor = pStage->vertexColor;
+
+	StageColor( stage, false, draw.program->colorModulate, draw.program->colorAdd );
+
+	draw.program->depthScaleBias = DepthCaptureScaleBias();
+
+	// program.env[23]. fadeRange is the particle's diameter for an alpha blend
+	// and its radius for an additive one, which is the original's own asymmetry
+	// and its comment explains it: "Fog is half as apparent when a wall is in
+	// the middle of it. Light glares lose no visibility when they have something
+	// to reflect off."
+	const float	radius = surf->particle_radius;
+	const float	fadeRange = ( srcBlend == GLS_SRCBLEND_SRC_ALPHA )
+		? radius * 2.0f
+		: radius;
+
+	draw.program->particleRadius = asFloat4( radius, 1.0f / fadeRange,
+											 1.0f / radius, 0.0f );
+
+	// program.env[24]: added to the fade before the multiply, so a 1 is a
+	// channel this does not touch. An alpha blend fades its alpha and keeps its
+	// colour; an additive one has no alpha to fade and blends out through its
+	// colour instead.
+	draw.program->colorChannelMask = ( srcBlend == GLS_SRCBLEND_SRC_ALPHA )
+		? asFloat4( 1.0f, 1.0f, 1.0f, 0.0f )
+		: asFloat4( 0.0f, 0.0f, 0.0f, 1.0f );
+
+	draw.program->image = *texture;
+	draw.program->depthImage = *depth;
+
+	drawProgram = draw.program;
+	drawPipeline = draw.pipeline;
+
 	RB_DrawElementsWithCounters( tri );
 }
 
@@ -4564,13 +4797,166 @@ void idRenderBackendEacp::CopyFrameRegion( GPU::RenderPass &into,
 	into.draw( 6 );
 }
 
+/*
+====================
+idRenderBackendEacp::CopyDepthbufferToImage
+
+_currentDepth: #3877's early depth capture, which is what the soft particle
+program (#3878) reads. Step 4e.3's copy one plane along, and it needs everything
+that one needed plus eacp gap 24 - the depth attachment created sampleable, and
+a shader slot that can sample it.
+
+**The destination is the frame target's own size and the copy is 1:1**, where
+OpenGL's is a power-of-two allocation the region lands in the corner of. The
+power-of-two dance was kept for _currentRender because uploadWidth is what the
+shared code scales screen coordinates by; nothing above the seam reads
+_currentDepth's, `RB_SetProgramEnvironment` having gone with the ARB path. So
+the natural size is the one that makes the lookup a coordinate rather than a
+ratio - and it is what lets a subview sample its own depth at all, since a
+region copied to the corner is only in the right place when the viewport starts
+at the origin.
+
+**R32Float, and the format is the point.** A window depth is 0 at the near plane
+and 1 at the far one with almost every surface in the last thousandth of that
+range; eight bits give it one value there and a half float about one. The one
+number this has to keep apart from the far plane is the original's own 0.9994
+clamp, which stands for thirty thousand units.
+
+**The pass is interrupted and put back**, as CopyFramebufferToImage's is and for
+the identical reason: the attachment being read belongs to the pass doing the
+reading, and no API allows that. What comes back is the same pass with the same
+depth and stencil planes - DepthAction::Resume, eacp gap 22 - which matters more
+here than it did there, since the depth this just copied is also the depth
+everything after it tests against.
+====================
+*/
 void idRenderBackendEacp::CopyDepthbufferToImage( idImage *image, int x, int y,
 												  int imageWidth, int imageHeight,
 												  bool useOversizedBuffer ) {
-	// #3877's early depth capture, which feeds _currentDepthImage to the soft
-	// particle program - and that program is behind BE_ARB2, so nothing on this
-	// backend samples what this would write. r_enableDepthCapture is what asks,
-	// and FillDepthBuffer says where it does not.
+	if ( image == NULL || !eacpFrame || !frameTarget ) {
+		return;
+	}
+
+	// Gap 24 closed is what makes this possible at all; a build against an eacp
+	// that has not is one warning and a soft particle that does not soften.
+	if ( !frameTarget->hasSampleableDepth() ) {
+		if ( !warnedCopyDepthbuffer ) {
+			warnedCopyDepthbuffer = true;
+			common->Warning( "eacp: the frame's depth buffer cannot be sampled, "
+							 "so soft particles will not be softened" );
+		}
+
+		return;
+	}
+
+	if ( imageWidth < 1 || imageHeight < 1 ) {
+		return;
+	}
+
+	// Doom 3 measures from the bottom left of the frame; a texture's rows start
+	// at the top. Refused rather than clamped if it does not fit, exactly as the
+	// colour copy refuses.
+	const int	top = frameTargetHeight - ( y + imageHeight );
+
+	if ( x < 0 || top < 0 || x + imageWidth > frameTargetWidth
+		 || y + imageHeight > frameTargetHeight ) {
+		return;
+	}
+
+	idEacpRenderProgs::depthCopyDraw_t	draw = eacpRenderProgs.DepthCopyDraw();
+
+	if ( !draw.pipeline ) {
+		return;
+	}
+
+	GPU::Texture *	texture = TextureFor( image );
+
+	const bool	rebuild = texture == NULL
+		|| !texture->isRenderTarget()
+		|| image->uploadWidth != frameTargetWidth
+		|| image->uploadHeight != frameTargetHeight;
+
+	if ( rebuild ) {
+		image->uploadWidth = frameTargetWidth;
+		image->uploadHeight = frameTargetHeight;
+
+		GPU::TextureDescriptor	descriptor;
+
+		descriptor.width = frameTargetWidth;
+		descriptor.height = frameTargetHeight;
+		descriptor.format = GPU::TextureFormat::R32Float;
+		descriptor.renderTarget = true;
+
+		ReplaceTexture( image, makeOwned<GPU::Texture>( GPU::Device::shared(),
+														descriptor, (const void *)NULL ) );
+
+		texture = TextureFor( image );
+
+		if ( !texture->isValid() || !texture->isRenderTarget() ) {
+			common->Warning( "eacp: no %ix%i depth capture target for image '%s'",
+							 frameTargetWidth, frameTargetHeight,
+							 image->imgName.c_str() );
+			ReplaceTexture( image, NULL );
+			return;
+		}
+	}
+
+	image->type = TT_2D;
+
+	// What R_DepthImage asked for, written where this backend reads an image's
+	// sampling from - the compiled variant rather than state on the texture.
+	// Nearest because the average of two depths is a surface at neither of them.
+	image->filter = TF_NEAREST;
+	image->repeat = TR_CLAMP;
+
+	const bool	resume = SuspendPass();
+
+	draw.program->sceneDepth = *frameTarget;
+
+	GPU::RenderPassDescriptor	descriptor;
+
+	// Cleared to the far plane on a new texture, which is what the region
+	// outside this view's viewport should read: nothing was drawn there, and 1
+	// is what a pass clears its depth buffer to.
+	descriptor.clear = rebuild;
+	descriptor.clearColor = Graphics::Color( 1.0f, 1.0f, 1.0f, 1.0f );
+
+	GPU::RenderPass	into = eacpFrame->beginPass( *texture, descriptor );
+
+	// The region where it already is, source and destination being the same
+	// rectangle of the same size - so a second view's capture leaves the first
+	// one's rows alone rather than overwriting them from the corner.
+	const float	s0 = (float)x / (float)frameTargetWidth;
+	const float	s1 = (float)( x + imageWidth ) / (float)frameTargetWidth;
+	const float	t0 = (float)top / (float)frameTargetHeight;
+	const float	t1 = (float)( top + imageHeight ) / (float)frameTargetHeight;
+
+	const eacpBlitVert_t	quad[6] = {
+		{ { -1.0f,  1.0f }, { s0, t0 } },
+		{ { -1.0f, -1.0f }, { s0, t1 } },
+		{ {  1.0f, -1.0f }, { s1, t1 } },
+		{ { -1.0f,  1.0f }, { s0, t0 } },
+		{ {  1.0f, -1.0f }, { s1, t1 } },
+		{ {  1.0f,  1.0f }, { s1, t0 } },
+	};
+
+	const GPU::Buffer &	vertices = eacpRenderProgs.StreamVertices( quad, sizeof( quad ) );
+
+	into.setViewport( Graphics::Rect( (float)x, (float)top,
+									  (float)imageWidth, (float)imageHeight ) );
+
+	into.setPipeline( *draw.pipeline );
+	into.setVertexBuffer( vertices );
+
+	draw.program->bindTextures( into );
+
+	into.draw( 6 );
+
+	into.end();
+
+	if ( resume ) {
+		ResumePass();
+	}
 }
 
 /*
