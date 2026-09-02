@@ -259,14 +259,22 @@ private:
 		const float *		textureMatrix;	// RB_GetShaderTextureMatrix's 16, or NULL
 		bool				alphaTest;
 		float				alphaTestRef;
+
+		// The subview's near clip plane in this surface's own coordinates, or
+		// NULL for every draw outside one - which is every draw but a mirror's
+		// depth fill. Read only where alphaTest is set, exactly as Doom 3 reads
+		// its own: the notch it clips with modulates an alpha nothing tests
+		// unless the surface is perforated.
+		const float *		clipPlane;
 	};
 
 	// The texture the frame is composed into, made on the first pass and
 	// remade when the engine's idea of the screen size changes.
 	bool			EnsureFrameTarget( void );
 
-	// The pass every draw goes into. One per frame so far - see DrawView on why
-	// a view does not get its own yet.
+	// The pass every draw goes into: one per 3D view, because a pass is the
+	// only thing that can clear the depth and stencil buffers and that is what
+	// RB_BeginDrawingView asks for per view. See BeginDrawingView.
 	void			BeginPass( bool clearColor,
 							   GPU::DepthAction depthAction = GPU::DepthAction::Keep );
 	void			EndPass( void );
@@ -289,11 +297,21 @@ private:
 									 int srcX, int srcY, int srcWidth, int srcHeight,
 									 int dstX, int dstY, int dstWidth, int dstHeight );
 
-	// RB_BeginDrawingView: where on the target this view lands, what part of it
-	// may be written, and the state the view starts from.
-	void			BeginDrawingView( void );
+	// RB_BeginDrawingView: the pass this view is drawn in, where on the target
+	// it lands, what part of it may be written, and the state it starts from.
+	// False if the view has no pass to draw into, which is the one thing here
+	// that can fail - a 3D view after another opens one of its own.
+	bool			BeginDrawingView( void );
 	void			SetViewport( const idScreenRect &rect );
 	void			SetScissor( const idScreenRect &rect );
+
+	// The cull mode a draw in this view is compiled with, which is the one it
+	// asked for unless the view is mirrored. GL_Cull does this per draw, by
+	// picking the glCullFace enum it hands the context; here the cull mode is
+	// part of the pipeline, so the flip has to happen before the pipeline is
+	// looked up - which also puts it in the cache key, so a mirrored draw and
+	// an unmirrored one of the same material get the two pipelines they need.
+	int				ViewCull( int cullType ) const;
 
 	// The matrix a draw is transformed by, rebuilt when the surface's space or
 	// its depth hack changes. This is also where both depth hacks land, each of
@@ -305,7 +323,7 @@ private:
 	// interaction pass can run at GLS_DEPTHFUNC_EQUAL and touch only the
 	// fragments that survived.
 	void			FillDepthBuffer( drawSurf_t **drawSurfs, int numDrawSurfs );
-	void			FillDepthBufferSurface( const drawSurf_t *surf );
+	void			FillDepthBufferSurface( const drawSurf_t *surf, const float *clipPlane );
 
 	// RB_ARB2_DrawInteractions, RB_ARB2_CreateDrawInteractions and
 	// RB_ARB2_DrawInteraction. The light half of a view: every light in turn,
@@ -384,6 +402,13 @@ private:
 	bool				suspendedHasViewport;
 	bool				suspendedHasScissor;
 
+	// Whether a 3D view has already been drawn into the open pass, and so
+	// whether the next one has to open a pass of its own. It is the depth
+	// buffer that is being tracked: a 2D view never writes it, so a 2D view
+	// leaves the answer alone, and a suspended pass comes back with the same
+	// buffer it left, so a resume leaves it alone too.
+	bool				passHasWorldView;
+
 	// The image on each texture unit, which is what a draw binds. The GL
 	// backend has no equivalent because GL remembers this itself.
 	idImage *			boundImages[MAX_MULTITEXTURE_UNITS];
@@ -437,8 +462,6 @@ private:
 	bool				warnedExternalFormat;
 	bool				warnedTexgen;
 	bool				warnedMissingTexture;
-	bool				warnedClipPlanes;
-	bool				warnedSubviewPass;
 	bool				warnedReadPixels;
 	bool				warnedShowShadows;
 	bool				warnedDepthPassShadows;
@@ -469,6 +492,7 @@ idRenderBackendEacp::idRenderBackendEacp() {
 	hasScissor = false;
 	suspendedHasViewport = false;
 	suspendedHasScissor = false;
+	passHasWorldView = false;
 	memset( boundImages, 0, sizeof( boundImages ) );
 	drawProgram = NULL;
 	drawPipeline = NULL;
@@ -483,8 +507,6 @@ idRenderBackendEacp::idRenderBackendEacp() {
 	warnedExternalFormat = false;
 	warnedTexgen = false;
 	warnedMissingTexture = false;
-	warnedClipPlanes = false;
-	warnedSubviewPass = false;
 	warnedReadPixels = false;
 	warnedShowShadows = false;
 	warnedDepthPassShadows = false;
@@ -680,10 +702,11 @@ bool idRenderBackendEacp::EnsureFrameTarget( void ) {
 ======================
 idRenderBackendEacp::BeginPass / EndPass
 
-One eacp pass per Doom 3 view, and the mapping is not arbitrary: a pass clears
-depth and stencil as it opens and can be told whether to clear colour, which is
-exactly what RB_BeginDrawingView asks for - the depth buffer and the stencil
-buffer emptied for this view, the colour left where the views before it put it.
+One eacp pass per Doom 3 3D view, and the mapping is not arbitrary: a pass
+clears depth and stencil as it opens and can be told whether to clear colour,
+which is exactly what RB_BeginDrawingView asks for - the depth buffer and the
+stencil buffer emptied for this view, the colour left where the views before it
+put it. BeginDrawingView is where the per-view part of that is decided.
 
 Into the render target rather than the drawable, which is step 4e's whole
 change and is what a second pass on one frame needs: a texture target is stored
@@ -728,6 +751,13 @@ void idRenderBackendEacp::BeginPass( bool clearColor, GPU::DepthAction depthActi
 	// thing a RenderPass allows: beginPass returns a prvalue, so this
 	// constructs it in the allocation and never copies or moves it.
 	pass.reset( new GPU::RenderPass( eacpFrame->beginPass( *frameTarget, descriptor ) ) );
+
+	// A pass that cleared the depth buffer is a pass no view has drawn into
+	// yet; one that resumed is the same pass as before and keeps the answer it
+	// already had.
+	if ( depthAction != GPU::DepthAction::Resume ) {
+		passHasWorldView = false;
+	}
 
 	// The one value every stencil comparison in the frame is against, and the
 	// one StencilOp::Replace writes - which is why it can be said once here
@@ -894,6 +924,11 @@ idRenderBackendEacp::SetDrawBuffer
 Where the frame goes. There is one place it can go - the render target the frame
 is composed into - so what is left of this is the debug clear, which several of
 the r_show* tools rely on to blank the parts of the screen they do not draw.
+
+The clear is the only reason this opens a pass at all, and it opens the one the
+frame's first view will use rather than one of its own: a view that finds a pass
+nothing has drawn a world into keeps it (BeginDrawingView), so the common frame -
+one 3D view and the 2D over it - is still one pass from here to SwapBuffers.
 ======================
 */
 void idRenderBackendEacp::SetDrawBuffer( int buffer ) {
@@ -1070,7 +1105,9 @@ void idRenderBackendEacp::DrawView( void ) {
 	// light touches the fragments that survived and no others.
 	backEnd.depthFunc = GLS_DEPTHFUNC_EQUAL;
 
-	BeginDrawingView();
+	if ( !BeginDrawingView() ) {
+		return;
+	}
 
 	// backEnd.lightScale, which each light's colour is multiplied by. Its
 	// sibling backEnd.overBright is always 1 here - tr.backEndRendererMaxLight
@@ -1098,23 +1135,51 @@ void idRenderBackendEacp::DrawView( void ) {
 ======================
 idRenderBackendEacp::BeginDrawingView
 
-RB_BeginDrawingView, minus the part that is the pass's.
+RB_BeginDrawingView, and the whole of what it clears.
 
-Doom 3 clears the depth and stencil buffers here for a 3D view and leaves them
-alone for a 2D one; eacp clears both as a pass opens and there is one pass per
-frame, so the clear has already happened by the time this runs. That is right
-for one 3D view in a frame and wrong for two: a subview or a mirror is a second
-3D view over the same buffers and would find the first view's depth in them.
+Doom 3 empties the depth and stencil buffers here for a 3D view and leaves them
+alone for a 2D one. Neither buffer can be cleared once a pass has begun - the
+clear is a property of the attachment being loaded, on both of eacp's backends -
+so a 3D view that finds a pass another 3D view has already drawn into ends it
+and opens its own. That is what makes a frame's second 3D view - a mirror, a
+subview, a remote camera - see an empty depth buffer rather than the first
+view's, and it is the whole of step 4e.4.
 
-Not fixed by opening a pass per view, which is the obvious answer and does not
-work: this view's colour has to survive into the next pass, and with MSAA on -
-which it is - the drawable's multisample texture is resolved and discarded as
-each pass ends, so the second pass would load an undefined attachment. It is
-step 4e's, with subviews and mirrors, and it is a real eacp question rather than
-a Doom 3 one.
+**What the new pass keeps is the colour, and that is the part that needed
+eacp.** Every view after the first draws over what the ones before it left: the
+mirror is rendered first, into the scissor rectangle of the surface it belongs
+to, and the view above it then multiplies that rectangle down by the overbright
+factor rather than filling it black. So the second pass has to load the first
+one's colour, which is `clear = false` and which gap 18 says is a lie on a
+multisampled drawable - the MSAA attachment resolves and stores nothing, so the
+load reads an attachment nobody kept. Step 4e.1 moved the frame into a texture
+target, which is single-sampled and stored, and `clear = false` means what it
+says there.
+
+Only a 3D view counts, because only a 3D view writes depth: a 2D one is forced
+to GLS_DEPTHFUNC_ALWAYS with no write in DrawShaderPasses, which is what
+RB_BeginDrawingView's glDisable( GL_DEPTH_TEST ) amounts to.
 ======================
 */
-void idRenderBackendEacp::BeginDrawingView( void ) {
+bool idRenderBackendEacp::BeginDrawingView( void ) {
+	const bool	worldView = ( backEnd.viewDef->viewEntitys != NULL );
+
+	if ( worldView ) {
+		if ( passHasWorldView ) {
+			EndPass();
+			BeginPass( false );
+
+			// The pass is what SetViewport and SetScissor below measure
+			// against, so a view whose own pass did not open has nowhere to be
+			// drawn rather than somewhere odd.
+			if ( !pass ) {
+				return false;
+			}
+		}
+
+		passHasWorldView = true;
+	}
+
 	depthRangeNear = 0.0f;
 	depthRangeFar = 1.0f;
 
@@ -1123,17 +1188,47 @@ void idRenderBackendEacp::BeginDrawingView( void ) {
 	backEnd.currentScissor = backEnd.viewDef->scissor;
 	SetScissor( backEnd.currentScissor );
 
-	if ( backEnd.viewDef->viewEntitys && !warnedSubviewPass
-		 && backEnd.viewDef->isSubview ) {
-		warnedSubviewPass = true;
-		common->Warning( "eacp: a subview shares the frame's depth buffer with the "
-						 "view it is drawn under, so it will occlude wrongly" );
-	}
-
 	// RB_BeginDrawingView's last act, and the reason SetCull is reached at all
 	// below: the cached value has to disagree with whatever is asked for next.
 	backEnd.glState.faceCulling = -1;
 	SetCull( CT_FRONT_SIDED );
+
+	return true;
+}
+
+/*
+======================
+idRenderBackendEacp::ViewCull
+
+Which face a draw in this view culls, which is the one the material asked for
+unless the view is mirrored - a mirror reverses the handedness of the camera, so
+every triangle presents the winding it did not before, and front and back swap.
+
+GL_Cull does this per draw, by choosing the enum it hands glCullFace. Here the
+cull mode is compiled into a pipeline, so it has to be folded in before the
+pipeline is looked up rather than after - which is also what puts it in the
+cache key, so the mirrored and unmirrored draws of one material get the two
+pipelines they need instead of sharing the first one compiled.
+
+backEnd.glState.faceCulling therefore stays what the renderer asked for and
+never what is drawn, which matters because the shared code sets it to -1 to
+force the next SetCull through.
+======================
+*/
+int idRenderBackendEacp::ViewCull( int cullType ) const {
+	if ( !backEnd.viewDef || !backEnd.viewDef->isMirror ) {
+		return cullType;
+	}
+
+	if ( cullType == CT_FRONT_SIDED ) {
+		return CT_BACK_SIDED;
+	}
+
+	if ( cullType == CT_BACK_SIDED ) {
+		return CT_FRONT_SIDED;
+	}
+
+	return cullType;
 }
 
 /*
@@ -1201,11 +1296,13 @@ walk and the function it calls are separate on OpenGL only because four
 different passes share the walk, and this is the one of them that survives the
 port intact.
 
+A subview's near clip plane is here, and it is the one thing this function does
+that the walk below does not: the plane is the view's, in world coordinates, and
+what a draw needs is the same plane in the surface's own - so it is transformed
+per space, exactly where OpenGL re-sends its texgen.
+
 Not here, and each is switched off by something this port controls:
 
-  - the mirror clip plane, which is a second texture unit whose alpha texgen
-    fails the alpha test behind the plane. It needs a subview to matter, and
-    subviews are 4e.
   - the early depth capture (#3877), which feeds _currentDepthImage to the soft
     particle program. r_enableDepthCapture is -1 and r_useSoftParticles only
     reaches a BE_ARB2 backend, so nothing asks.
@@ -1218,18 +1315,24 @@ void idRenderBackendEacp::FillDepthBuffer( drawSurf_t **drawSurfs, int numDrawSu
 		return;
 	}
 
-	if ( backEnd.viewDef->numClipPlanes && !warnedClipPlanes ) {
-		warnedClipPlanes = true;
-		common->Warning( "eacp: the mirror clip plane is not implemented, so a "
-						 "subview will draw what is behind its plane" );
-	}
-
 	SelectTexture( 0 );
 
 	backEnd.currentSpace = NULL;
 
+	// The subview's near clip plane, carried into each space in turn. Rebuilt
+	// on the space change rather than per surface, which is the same condition
+	// RB_T_FillDepthBuffer re-sends its texgen plane on - and currentSpace
+	// having just been cleared is what makes the first surface rebuild it.
+	const bool	clipping = ( backEnd.viewDef->numClipPlanes != 0 );
+	idPlane		localClipPlane;
+
 	for ( int i = 0 ; i < numDrawSurfs ; i++ ) {
 		const drawSurf_t *	surf = drawSurfs[i];
+
+		if ( clipping && surf->space != backEnd.currentSpace ) {
+			R_GlobalPlaneToLocal( surf->space->modelMatrix,
+								  backEnd.viewDef->clipPlanes[0], localClipPlane );
+		}
 
 		SetSpace( surf->space, surf->space->modelDepthHack );
 
@@ -1238,7 +1341,7 @@ void idRenderBackendEacp::FillDepthBuffer( drawSurf_t **drawSurfs, int numDrawSu
 			SetScissor( backEnd.currentScissor );
 		}
 
-		FillDepthBufferSurface( surf );
+		FillDepthBufferSurface( surf, clipping ? localClipPlane.ToFloatPtr() : NULL );
 	}
 
 	drawProgram = NULL;
@@ -1254,9 +1357,15 @@ RB_T_FillDepthBuffer. An opaque surface is one draw of the white image in black;
 a perforated one is a draw per alpha-tested stage, through the same texture and
 the same texture matrix its ambient pass would use, so the holes in a grate are
 holes in the depth buffer too.
+
+clipPlane is the subview's near plane in this surface's coordinates, or NULL,
+and it reaches only the perforated draws - which is not a shortcut but what
+OpenGL does: the notch modulates the fragment's alpha, and nothing tests the
+alpha of a surface that is not alpha-tested.
 ======================
 */
-void idRenderBackendEacp::FillDepthBufferSurface( const drawSurf_t *surf ) {
+void idRenderBackendEacp::FillDepthBufferSurface( const drawSurf_t *surf,
+												  const float *clipPlane ) {
 	const srfTriangles_t *	tri = surf->geo;
 	const idMaterial *		shader = surf->material;
 
@@ -1302,6 +1411,7 @@ void idRenderBackendEacp::FillDepthBufferSurface( const drawSurf_t *surf ) {
 	draw.textureMatrix = NULL;
 	draw.alphaTest = false;
 	draw.alphaTestRef = 0.0f;
+	draw.clipPlane = clipPlane;
 
 	if ( shader->GetSort() == SS_SUBVIEW ) {
 		// A subview's own surface - the mirror, the monitor - is drawn down by
@@ -1875,7 +1985,7 @@ void idRenderBackendEacp::ShadowSurface( const drawSurf_t *surf ) {
 
 	idEacpRenderProgs::shadowDraw_t	draw =
 		eacpRenderProgs.ShadowDraw( backEnd.glState.glStateBits,
-									backEnd.glState.faceCulling, stencil );
+									ViewCull( backEnd.glState.faceCulling ), stencil );
 
 	if ( !draw.pipeline ) {
 		return;
@@ -1932,7 +2042,7 @@ void idRenderBackendEacp::DrawInteraction( const drawInteraction_t *din ) {
 										 din->lightImage, din->diffuseImage,
 										 din->specularImage,
 										 backEnd.glState.glStateBits,
-										 backEnd.glState.faceCulling,
+										 ViewCull( backEnd.glState.faceCulling ),
 										 lightStencil );
 
 	if ( !draw.pipeline ) {
@@ -2241,6 +2351,7 @@ void idRenderBackendEacp::DrawSurfaceShaderPasses( const drawSurf_t *surf ) {
 		draw.color = color;
 		draw.alphaTest = false;
 		draw.alphaTestRef = 0.0f;
+		draw.clipPlane = NULL;
 
 		float	matrix[16];
 
@@ -2307,7 +2418,7 @@ void idRenderBackendEacp::DrawStage( const srfTriangles_t *tri, const eacpStage_
 	}
 
 	idEacpRenderProgs::stageDraw_t	draw =
-		eacpRenderProgs.StageDraw( stage.image, stage.stateBits, stage.cullType,
+		eacpRenderProgs.StageDraw( stage.image, stage.stateBits, ViewCull( stage.cullType ),
 								   stage.alphaTest );
 
 	if ( !draw.pipeline ) {
@@ -2356,6 +2467,16 @@ void idRenderBackendEacp::DrawStage( const srfTriangles_t *tri, const eacpStage_
 	}
 
 	draw.program->alphaTestRef = stage.alphaTestRef;
+
+	// The subview's near plane, or the plane every vertex is a unit in front
+	// of - which is what says "no clipping" without a variant to say it in.
+	if ( stage.clipPlane ) {
+		draw.program->clipPlane = asFloat4( stage.clipPlane[0], stage.clipPlane[1],
+											stage.clipPlane[2], stage.clipPlane[3] );
+	} else {
+		draw.program->clipPlane = asFloat4( 0.0f, 0.0f, 0.0f, 1.0f );
+	}
+
 	draw.program->image = *texture;
 
 	drawProgram = draw.program;

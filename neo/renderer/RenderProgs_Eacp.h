@@ -219,6 +219,9 @@ enum eacpStencil_t {
 	discard is a branch the generated source either has or does not, so it is
 	the second dimension of the program cache rather than a bit of state.
 
+	The mirror clip plane rides on that discard rather than adding a third
+	dimension to the cache, and clipPlane below says why.
+
 ================================================================================
 */
 
@@ -247,10 +250,21 @@ public:
 	// cannot be the compile-time threshold setDiscardBelow takes - see define().
 	eacp::GPU::Uniform<eacp::GPU::Float>		alphaTestRef;
 
+	// The mirror clip plane, in the surface's own coordinates, dotted with the
+	// vertex to give a signed distance the discard is taken on. (0, 0, 0, 1) is
+	// no plane at all - every vertex a distance of 1 in front of it - and is
+	// what every draw outside a subview's depth fill sets.
+	//
+	// It is a uniform rather than a third variant of this program, unlike the
+	// alpha test above it: the discard is already there in this variant, and
+	// what a plane changes is the value being compared rather than whether a
+	// comparison is compiled at all.
+	eacp::GPU::Uniform<eacp::GPU::Float4>		clipPlane;
+
 	eacp::GPU::Uniform<eacp::GPU::Texture2D>	image;
 
 	EACP_SHADER( modelViewProjection, textureMatrixS, textureMatrixT,
-				 colorModulate, colorAdd, alphaTestRef, image )
+				 colorModulate, colorAdd, alphaTestRef, clipPlane, image )
 
 private:
 	bool					discards;

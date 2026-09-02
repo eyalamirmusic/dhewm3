@@ -11,15 +11,18 @@ menu on screen through Metal**, **loads a level**, **lights it** and
 `interaction.vfp` and `shadow.vp` are in the EDSL, the stencil shadow volumes
 are counted two-sided in one pass over each volume, and at a pinned camera in
 `demo_mars_city1` the two backends draw **the same 71 draws, 1644 triangles and
-2376 shadow triangles**, volume for volume. 4e is three steps in: the frame is
+2376 shadow triangles**, volume for volume. 4e is four steps in: the frame is
 composed into an app-owned **render target**, that target is **read back to the
 CPU** — so the eacp build takes the game's own camera shots, writes screenshots,
 and **runs the regression gate**, 297 frames hashed and identical across two
-captures — and it is now **copied into an image**, so `_currentRender` and
-`_scratch` are filled in and the player-view effects draw the frame they are
-supposed to. Every comparison from here is a hash rather than a screen grab.
-What is left in 4e is a pass per view, fog, blend lights and the texgen
-variants.**
+captures — it is **copied into an image**, so `_currentRender` and `_scratch`
+are filled in and the player-view effects draw the frame they are supposed to,
+and every 3D view now gets **a pass of its own**, so **mirrors and subviews
+work**: the washroom mirror of `demo_mars_city1` reflects the room, which moved
+sixteen of the gate's 297 frames from 3.82 of 255 against the SDL/GL build to
+0.50 and left the other 281 byte-identical. Every comparison from here is a hash
+rather than a screen grab. What is left in 4e is fog, blend lights and the
+texgen variants.**
 
 Reference implementation for almost everything on the platform side:
 `~/Code/PureDOOM/examples/EACP` — a complete engine hosted on eacp, with its own
@@ -438,6 +441,12 @@ Numbers are never reused, so a hole is an entry that closed.
     wrote. The entry stays because it is still true of the drawable, and because
     the reason it stopped mattering is that this port gave up multisampling
     (gap 20) rather than that eacp gained `StoreAndMultisampleResolve`.
+
+    **Step 4e.4 is where that was spent.** Every 3D view opens a pass of its
+    own now, clearing the depth and stencil planes and loading the colour the
+    views before it wrote, which is what makes the mirror in `demo_mars_city1`
+    a reflection rather than the wall behind it. So `clear = false` is not only
+    honest on this path, it is load-bearing.
 
 19. **A shader can bind four textures on D3D12, and Doom 3's interaction program
     needs five.** `Lib/eacp/GPU/Windows/D3D12Types.h:25` is
@@ -1762,6 +1771,100 @@ factor to read it with. `CopyDepthbufferToImage` stays empty for the reason it
 always had: `_currentDepth` feeds the soft-particle program, which is behind
 `BE_ARB2`.
 
+#### Step 4e.4 — a pass per view, and the mirror — **done**
+
+What gap 18 has been pointing at since step 4d.1 decided it. A Doom 3 3D view
+opens with the depth and stencil buffers emptied and the colour left alone, and
+on eacp the only thing that can empty either buffer is a pass beginning — so a
+3D view that finds a pass another 3D view has already drawn into **ends it and
+opens its own**, with `clear = false` and `DepthAction::Keep`. That is the whole
+change, and everything else in this step is what it turned out to need.
+
+**The common frame is still one pass.** `SetDrawBuffer` opens the frame's pass
+for its debug clear and the first view keeps it — the condition is *another 3D
+view has drawn here*, not *a view has arrived* — so one world and the 2D over it
+costs exactly what it did. Only a 3D view counts, because only a 3D view writes
+depth: `DrawShaderPasses` forces a 2D one to `GLS_DEPTHFUNC_ALWAYS | GLS_DEPTHMASK`,
+which is what `RB_BeginDrawingView`'s `glDisable( GL_DEPTH_TEST )` amounts to.
+A suspended pass (4e.3) comes back with the buffer it left, so a resume does not
+reset the answer either.
+
+**The demo has a subview, and the gate was already standing in front of it.**
+`textures/washroom/mirror` carries the `mirror` keyword, which is `sort
+SS_SUBVIEW` and nothing else, and `R_GenerateSurfaceSubview` renders that kind
+in place — mirrored camera, scissored to the surface, drawn *into the frame*
+rather than into a texture. The mirror is at x ≈ −2647 in `demo_mars_city1` and
+the tour's ninth stop is `setviewpos -2500 -1116 252 180`, which is 147 units
+away looking straight at it. So this is measurable on the gate rather than on a
+map written to measure it, and `r_debugRenderToTexture 1` says `3d: 2` there on
+both builds.
+
+**Measured.** **16 of 297 frames moved** — 132 to 147, one camera stop exactly —
+and those sixteen go from a mean of **3.82 of 255** against the SDL/GL build to
+**0.50**, which is better than the 0.8–1.5 the rest of the tour agrees at. The
+other 281 are byte-identical, which is what says a frame with one view pays
+nothing for this. Two further captures of the new build are identical to the
+first. Clean under `MTL_DEBUG_LAYER=1` with `MTL_SHADER_VALIDATION=1` and GPU
+validation, at 9 programs and **57 pipelines** against 42 at the same camera
+before — the extra being the mirror's own, every state the washroom is drawn in
+compiled a second time with the cull flipped.
+
+**The cull flip, which is the other half of the step.** A mirror reverses the
+handedness of the camera, so every triangle presents the winding it did not
+before and `CT_FRONT_SIDED` has to cull the other face. `GL_Cull` folds
+`backEnd.viewDef->isMirror` in per draw, by choosing the enum it hands
+`glCullFace`; here the cull mode is *compiled into a pipeline*, so the flip has
+to happen before the pipeline is looked up — which also makes it part of the
+cache key, and so the mirrored and unmirrored draws of one material get the two
+pipelines they need instead of sharing the first one compiled.
+`backEnd.glState.faceCulling` stays what the renderer asked for, because the
+shared code sets it to −1 to force the next `SetCull` through. Worth doing
+rather than assumed: without the flip the same shot reads **16.5 of 255**
+against the GL build where with it it reads 0.33.
+
+**And the mirror clip plane, which is not what it looks like in the source.**
+`RB_STD_FillDepthBuffer` binds `_alphaNotch` on a second texture unit and drives
+its `s` from an object-linear texgen. Read the generator and the whole thing
+collapses: the notch is two texels, alpha 0 then alpha 255, nearest and clamped,
+and the texgen plane is the view's with 0.5 added to the distance — so a vertex
+in front of the plane samples the second texel, one behind it the first, the
+modulate combiner multiplies the fragment's alpha by that 0 or 1, and the alpha
+test does the rest. The comparison it amounts to is `dot( plane, vertex ) < 0`,
+and that is what the port writes.
+
+Three things about it are worth keeping:
+
+- **It is a uniform, not a third variant of the stage program.** The alpha test
+  is a variant because a discard is a branch the source either has or does not;
+  the plane changes the *value* being compared and nothing else. `(0, 0, 0, 1)`
+  — every vertex a unit in front of it — is what every draw outside a subview's
+  depth fill sets.
+- **The two discards are one.** eacp's `ShaderGraph` holds a single discard
+  node, so a second `setDiscardBelow` would replace the first rather than join
+  it. `min( alpha − ref, distance )` is below zero exactly when either of them
+  is.
+- **It reaches only the perforated draws**, which is not a shortcut but what
+  OpenGL does: `RB_T_FillDepthBuffer` enables `GL_ALPHA_TEST` inside the
+  perforated branch alone, so on a solid surface the notch modulates an alpha
+  nothing tests.
+
+**It changes nothing at this camera, and that took proving rather than
+asserting.** The mirror's own frustum already excludes what is behind its plane,
+so the shots are identical to two decimal places with the clip in and out. What
+says the path is live rather than dead: forcing every vertex in the subview
+behind the plane moves the picture by **1.15 of 255 with a worst of 232** — so
+the mirror view does contain perforated surfaces, the plane does reach them, and
+the real plane simply rejects none of them here.
+
+**What is not here.** The three subview kinds that render into a *texture* —
+`DI_REMOTE_RENDER`, `DI_MIRROR_RENDER`, `DI_XRAY_RENDER`, which are
+`R_RemoteRender` and friends cropping the view and calling
+`CaptureRenderToImage`. Nothing in the demo pk4's two maps uses a material with
+a `remoteRenderMap`, `mirrorRenderMap` or `xrayRenderMap` stage — the eight that
+declare one are all in art the demo ships and the maps never place — so there
+would be nothing to check them against. Both pieces they need are here: the
+per-view pass, and the `CopyFramebufferToImage` step 4e.3 built.
+
 ### Shader inventory for Phase 2
 
 Roughly 10–15 EDSL programs, each in the sampling variants §4.3 sizes — 8 worst case
@@ -1938,10 +2041,18 @@ Phase 2 is the first work that compiles against eacp. In rough order:
        GL build's at 5.7 of 255 where the same camera drawn directly agrees at
        3.75. It also turned up an over-bright frame that predates it, which is
        written down where it was found.
-     - **4e.4. A pass per view** ← **next**, and so subviews and mirrors: gap 18 said a
-       second pass could not keep the first's colour, and a texture target
-       stores rather than resolving, so `clear = false` now means what it says.
-     - **4e.5. The rest.** Fog and blend lights, the texgen variants (screen,
+     - ~~**4e.4. A pass per view.**~~ — **done**, §6. Every 3D view opens its
+       own, clearing the depth and stencil planes and loading the colour the
+       views before it wrote — which gap 18 said a pass could not do and 4e.1's
+       texture target made true. So **mirrors and subviews work**: the washroom
+       mirror of `demo_mars_city1` reflects the room, which the gate's ninth
+       camera stop happens to be standing in front of. 16 of 297 frames moved,
+       from 3.82 of 255 against the SDL/GL build to 0.50, and the other 281 are
+       byte-identical. It brought the mirrored cull flip with it, which is part
+       of a pipeline here rather than a per-draw enum, and the mirror clip
+       plane, which turned out to be `dot( plane, vertex ) < 0` wearing a
+       two-texel texture.
+     - **4e.5. The rest** ← **next**. Fog and blend lights, the texgen variants (screen,
        reflect, skybox, wobblesky — two of the four want cube maps, gap 5, and
        the screen one now has the `_currentRender` 4e.3 fills to read), and
        `r_gammaInShader` (step 4d.2 — the identity at the default settings, and

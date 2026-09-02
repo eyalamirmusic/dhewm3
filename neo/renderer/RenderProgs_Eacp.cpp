@@ -134,8 +134,25 @@ void idEacpStageProgram::define( void ) {
 	// discarding below zero on ( alpha - ref ) is discarding below ref on
 	// alpha. The one difference from GL is at exact equality, which GL_GREATER
 	// discards and this keeps.
+	//
+	// The mirror clip plane is the second thing that kills a fragment here, and
+	// it is folded into the same value because a program has one discard: the
+	// smaller of the two is below zero exactly when either of them is.
+	//
+	// What it replaces is Doom 3's own trick, which is worth writing down
+	// because it is not obvious what the code is doing. RB_STD_FillDepthBuffer
+	// binds _alphaNotch - two texels, alpha 0 then alpha 255, nearest and
+	// clamped - on a second texture unit, and drives its s coordinate from an
+	// object-linear texgen whose plane is this one with 0.5 added to the
+	// distance. So a vertex in front of the plane samples the second texel and
+	// one behind it the first, the modulate combiner multiplies the fragment's
+	// alpha by that 0 or 1, and the alpha test does the rest. The comparison it
+	// amounts to is dot( plane, vertex ) < 0, which is what is written here.
 	if ( discards ) {
-		setDiscardBelow( fragment.w() - alphaTestRef, 0.0f );
+		auto	clipDistance = GPU::dot( GPU::float4( position, 1.0f ), clipPlane );
+
+		setDiscardBelow( GPU::min( fragment.w() - alphaTestRef, varying( clipDistance ) ),
+						 0.0f );
 	}
 
 	setFragment( fragment );
