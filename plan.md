@@ -48,14 +48,16 @@ too, and was never the port's: it is the level's dropship headlight, drawn by
 both builds at the same instant, and what was wrong was a reproducer that
 compared two different moments. Then step 5 deleted the renderer all of that was
 measured against, which is why every number above is written in the past tense
-and cannot be taken again. Two things are open beside the Windows host: an ImGui
-backend for the eacp host, which is what would light the F10 settings menu back
-up; and gap 20's multisampling. Step 6 took the third off that list, and eacp
-gap 24 with it: the soft-particle program (#3878) draws on this backend, off a
-depth buffer eacp can now be asked to make sampleable. The gate is 297 of 297
-identical either way, which is what 4e.8 said it would be, so the picture is
-measured at ten pinned cameras instead — seven of them move, the largest by
-0.59 of 255.**
+and cannot be taken again. One thing is open beside the Windows host: gap 20's
+multisampling. Step 6 took the soft-particle program off that list, and eacp
+gap 24 with it: #3878 draws on this backend, off a depth buffer eacp can now be
+asked to make sampleable. The gate is 297 of 297 identical either way, which is
+what 4e.8 said it would be, so the picture is measured at ten pinned cameras
+instead — seven of them move, the largest by 0.59 of 255. Step 7 turned the F10
+settings menu back on by integrating **imgui-eacp** rather than writing a
+backend — one Dear ImGui in the binary, the UI drawn inside the engine's frame
+between a suspended pass and its resume, and the SDL host's rules for who gets
+an event transcribed onto eacp's four callbacks.**
 
 Reference implementation for almost everything on the platform side:
 `~/Code/PureDOOM/examples/EACP` — a complete engine hosted on eacp, with its own
@@ -744,6 +746,20 @@ Numbers are never reused, so a hole is an entry that closed.
     A fix would be a `depth` flag beside `GPUView::setDepth`'s existing one, or
     the drawable's depth exposed as a `Texture` the same way a target's is.
 
+26. **`MouseCursor` has no diagonal resize shapes, and no busy shape.** eacp names
+    six cursors — `Default`, `IBeam`, `PointingHand`, `ResizeLeftRight`,
+    `ResizeUpDown`, `Crosshair` — and Dear ImGui asks for eleven. Four of the
+    difference have no counterpart at all (`ResizeNESW`, `ResizeNWSE`,
+    `NotAllowed`, `Wait`/`Progress`) and come back as the arrow, so a window's
+    two corner grips do not read as grips while the other two edges do.
+
+    Cosmetic, and imgui-eacp's own README already lists it as a known gap on its
+    side, so this entry is here to say the port inherits it rather than to ask
+    for anything the settings menu is blocked on. What would close it is two more
+    names in `Graphics::MouseCursor` — `NSCursor` has
+    `_windowResizeNorthEastSouthWestCursor` and both platforms have a wait
+    cursor — and the mapping in `Gui::toMouseCursor` to go with them.
+
 ### Checked, and *not* gaps
 
 - **`GPU::StreamingBuffers` already exists** (`Lib/eacp/GPU/Buffer/`) and is
@@ -806,6 +822,11 @@ The demo data is already unpacked at `<build tree>/neo/demo/demo00.pk4`
 retail install. Since step 5 the build tree the gate defaults to is
 `cmake-build-eacp`; the `cmake-build-debug` this was first written against still
 holds the Phase 1 SDL/GL binary, which is what `gate.sh`'s libSDL3 guard is for.
+Since step 7 that tree is configured with `-DCPM_eacp_SOURCE=$HOME/Code/eacp
+-DCPM_imgui-eacp_SOURCE=$HOME/Code/imgui-eacp`, because steps 6 and 7 each depend
+on changes that stand in those working trees and are not yet on either
+repository's `main`: a tree configured without the two overrides fetches `main`
+and does not build until they are committed.
 
 ### Phase 2 — cut the platform layer and the backend together ← **done, apart from the Windows host**
 
@@ -3135,6 +3156,146 @@ asymmetric now in a way it was not before. And the eacp side of this step is not
 committed: it waits in the `~/Code/eacp` working tree for the user's own commit,
 which gap 24 says more about.
 
+#### Step 7 — the settings menu on eacp — **done**
+
+§7's reversed scope cut, honoured. The F10 settings menu is a headline dhewm3
+feature and step 5 kept it compiled and dark rather than deleting it, on the
+argument that a port has no business dropping the *fork's* own work silently.
+This is the step that turns it back on: it draws, it takes the mouse and the
+keyboard, and what it takes the game does not get.
+
+**Almost none of it is written here, and that is the finding.** Dear ImGui needs
+two backends under it — a platform one that feeds `ImGuiIO` and a renderer one
+that draws `ImDrawData` — and both already exist for eacp, in
+**[imgui-eacp](https://github.com/eyalamirmusic/imgui-eacp)**: `Gui::DrawRenderer`
+is ImGui's shader written once in eacp's EDSL, its textures on
+`Texture::update`'s region overload and its geometry through
+`GPU::StreamingBuffers`, and `Gui::KeyMap` is eacp's key codes, buttons and
+cursors mapped to ImGui's. So the step is an *integration* rather than two
+backends, and what it had to decide is exactly the three things a library cannot
+know: where in this frame the two halves of the renderer run, which events the
+game still gets, and how one Dear ImGui ends up in the binary rather than two.
+
+**What is *not* taken from it is `Gui::ImGuiView`**, and the reason is the shape
+of the thing rather than any shortcoming. `ImGuiView` is a `GPUView` that owns
+its context, opens its own pass with its own clear colour and runs its own frame
+timing — a *panel*. The settings menu is an *overlay*: one context that
+`sys/sys_imgui.cpp` has always owned, drawn inside the engine's frame, into the
+render target 4e.1 composes into and before the blit that puts it on the screen.
+Two different objects, one shared renderer.
+
+**The frame sequence is the integration.** `DrawRenderer` is deliberately two
+calls: `prepare()` creates textures, uploads to them and rewrites the streaming
+buffers, all of which both of eacp's backends want done with no encoder open,
+and `encode()` records draws and therefore has to be inside a pass. The frame's
+pass is open when `RB_SwapBuffers` reaches `D3::ImGuiHooks::EndFrame`, so
+`idRenderBackendEacp::DrawImGui` **suspends it, prepares, resumes it, and
+encodes** — which is 4e.3's own machinery doing exactly what it was built for, a
+pass interrupted and put back with the colour, depth and stencil it left
+(`DepthAction::Resume`, eacp gap 22). The viewport and the scissor are given back
+to the whole target first, because the last view left a sub-rectangle in both and
+ImGui's projection covers the display.
+
+**Two changes to imgui-eacp, and the first is the depth attachment.**
+`DrawRenderer` built its pipeline for a pass with no depth — which is what
+`ImGuiView` opens, and what its `onBeforePass` hook exists to work around — while
+this port's render target carries a depth-stencil buffer, and both of eacp's
+backends reject a draw whose pipeline disagrees with its pass about that. So
+`DrawRenderer` grew a `Gui::DrawTarget` constructor: sample count, colour format,
+depth and stencil, being the four things "the pass this lands in is made of".
+`ImGuiView` takes the defaults and is unchanged. A second, smaller change lifted
+the event-feeding rules out of `ImGuiView` into `Gui::sendMousePosition` /
+`sendMouseButton` / `sendMouseWheel` / `sendKey` / `sendMouseExited`, so that
+this port and `ImGuiView` feed an `ImGuiIO` through one implementation of each
+rule rather than two — the rules worth sharing being which wheel delta is one
+ImGui notch and which of a key's characters count as typing. **Both are
+uncommitted**, the way step 6's eacp change is: they stand in the
+`~/Code/imgui-eacp` working tree awaiting the user's own commit — imgui-eacp's
+rules, like eacp's, do not let an agent commit there — with its own tests at **19
+of 19**, and this section will record the SHA once it exists.
+
+**Exactly one Dear ImGui in the binary, and nothing about two would have
+failed.** imgui-eacp fetches ImGui v1.92.5 by CPM and builds an `imgui` target
+from it; this tree has vendored 1.92.5 under `neo/libs/imgui` since long before
+the port, with dhewm3's own `imconfig.h` beside it and
+`Dhewm3SettingsMenu.cpp` including `"../libs/imgui/imgui.h"` by relative path.
+Two copies would be two sets of statics behind one `ImGui::` namespace — a
+context created against one and read through the other — with no link error to
+say so. `CMake/FindImGui.cmake` here builds the vendored sources into the target
+imgui-eacp asks `find_package(ImGui)` for, and `neo/`'s `src_imgui` stops
+compiling them; the same trick answers `find_package(EACP)` with the eacp this
+tree already added, since CPM keys packages by name and `EACP` is not `eacp`.
+Both work because the root `CMakeLists.txt` puts this directory on
+`CMAKE_MODULE_PATH` before imgui-eacp appends its own.
+
+**Who gets an event, transcribed rather than invented.** `sys/events.cpp`'s
+`if ( D3::ImGuiHooks::ProcessEvent( &ev ) ) continue;` was one function over one
+tagged union; eacp delivers four typed callbacks, so the question is asked four
+times in `sys/eacp/ImGuiBackend.cpp` and the rules are the SDL host's: nothing is
+consumed with no ImGui window open; nothing is consumed in keybind mode, because
+the Bindings tab reads the pressed key out of `idKeyInput` and the engine has to
+be given it; a *release* is never consumed, so a key held before the menu took
+focus is let go of rather than stuck down for the run; and F1–F12 are never
+consumed, so quickload and screenshot keep working over an open menu. One rule
+is this host's own: eacp reports the modifiers as state rather than as key events
+(§5, gap 9), so there is no event for `syncModifiers` to consume and answer for —
+what it does instead is decline to push a modifier's *down* into the engine while
+the menu is taking the keyboard. It matters more than it looks: the stock config
+binds Shift and Ctrl to `_speed` and `_attack`.
+
+**Measured, and the transcript is the instrument.** Six keys bound to an `echo` —
+two ordinary (`p`, `o`) and four function-key markers (F1–F4) — and the engine's
+own console read, in order: `MARK_A_menu_open`, `MARK_B_after_p_and_o`,
+`MARK_C_menu_closing`, `MARK_D_menu_closed`. **Nothing between A and B**: the
+menu ate both ordinary keys and all four markers passed through. With the menu
+closed the same two keys reached the console input line. The gate is **297 of 297
+identical** to `frames-step5-c13b`, which is what a menu that is not open should
+cost. Clean under `MTL_DEBUG_LAYER=1` with `MTL_SHADER_VALIDATION=1` and GPU
+validation, over `demo_mars_city1` with the menu drawn on top of it: the log
+holds the two "Validation Enabled" lines and nothing else.
+
+**What the counters do *not* count.** The shutdown line's `eacp: N programs and
+M pipelines compiled` does not move when the menu is drawn over that map, because
+`idEacpRenderProgs` counts the port's own and `Gui::DrawRenderer` owns its shader
+and its pipeline. The menu costs one of each, plus the font atlas and a
+streaming buffer pair, and only on a run that opens it — the renderer is built
+lazily inside `DrawImGui`, which `EndFrame` does not reach until a window has
+been opened.
+
+**By hand, on a scratch `fs_savepath` and `fs_configpath`, with synthesized
+mouse and keyboard events**: the menu draws over the game at 60fps; the pointer
+lands on what it points at (hovering a tab highlights it, clicking it switches);
+typing into the Game tab's player-name field inserts characters with the shift
+state right (`Player` → `PlayerWasd42`); the Bindings tab's *Bind another key*
+captures the pressed key and adds it to the row rather than the game seeing it;
+Escape closes a popup; Tab and the arrows drive ImGui's keyboard navigation; the
+system cursor is visible while the menu is open and gone the moment it closes
+over a live world, which is `handleMouseGrab`'s "in game" branch re-engaging.
+F10 opens it, which is the default binding `Init()` installs when nothing else
+claims that key.
+
+**Three things it cost, and the first is not this step's:**
+
+- **`RenderPass::bind( program, vertices )` binds the *program's own* pipeline**,
+  which this port's programs do not have — they are drawn through
+  `pass->setPipeline( *drawPipeline )` with the pipeline looked up per state.
+  Found by writing a renderer of this port's own before imgui-eacp was adopted,
+  and it crashed on the first draw. Worth writing down because the same trap is
+  one call away for any future program here.
+- **`GetDefaultScale` has a real answer again.** It asks the backing scale
+  through the backend, and keeps the SDL build's rule ahead of it: in HighDPI
+  mode the font sizes are already scaled to window coordinates, because
+  `io.DisplaySize` is in points and the rasterizer density follows
+  `io.DisplayFramebufferScale`. That scale is `vidWidth / winWidth` rather than
+  `GPUView::backingScale()` even though the two are the same number — the
+  product is then exactly `vidWidth`, which is what `EnsureFrameTarget`
+  allocated, so no rounding can put a scissor a pixel outside the target.
+- **The menu's clock is not the game's.** `io.DeltaTime` comes from
+  `std::chrono::steady_clock`, because opening the settings menu sets
+  `g_stoptime` and `com_fixedTic` pins the game's tick to the frame — a menu
+  whose caret blink and scroll inertia are driven by frozen time does not animate
+  at all.
+
 ### Shader inventory for Phase 2
 
 Roughly 10–15 EDSL programs, each in the sampling variants §4.3 sizes — 8 worst case
@@ -3295,7 +3456,9 @@ available on this build yet. **An eacp ImGui backend is a step of its own**, and
 not a small one: ImGui vendors `imgui_impl_metal.mm`, but this port's renderer
 is `idRenderBackendEacp` rather than raw Metal, and what the old backend did
 around `ImGui::Render` was save and restore fixed-function GL state, which has
-no analogue here.
+no analogue here. **Step 7 lit it back up**, and the step of its own turned out
+not to be the writing of a backend after all: `imgui-eacp` already had both
+halves, so what this port supplied was the integration.
 
 ---
 
@@ -3501,8 +3664,8 @@ Phase 2 is the first work that compiles against eacp. In rough order:
    the program's name beside the two handles, and the eacp backend never reads
    the handles at all. C6 landed the stub at 297/297, `fragmentPrograms` and all.
 
-Two things are open, and neither is in that order because neither blocks the
-other.
+One thing is open, and it is the Windows host. The two that stood beside it are
+struck through below, with the steps that closed them.
 
 **The Windows host.** The port is macOS-only from step 2b (§6), and step 5 made
 that the buildsystem's position rather than an accident: `neo/CMakeLists.txt`
@@ -3537,10 +3700,17 @@ in short:
   `sys/eacp/Input.cpp`. A Windows eacp target that compiled both gets a
   duplicate symbol.
 
-**An ImGui backend for the eacp host**, which is what would light the F10
-settings menu back up. §7 says what step 5 decided and why the menu was kept
-rather than deleted; the work is a platform backend and a renderer backend
-against `idRenderBackendEacp`, neither of which ImGui ships.
+~~**An ImGui backend for the eacp host**, which is what would light the F10
+settings menu back up.~~ — **done**, §6 step 7. It needed no backend written
+here: [imgui-eacp](https://github.com/eyalamirmusic/imgui-eacp) already has both
+halves, and what this port supplied was the integration — where in the engine's
+frame `prepare()` and `encode()` run, which events the game still gets, and one
+Dear ImGui in the binary rather than the vendored copy plus imgui-eacp's fetched
+one. `Gui::ImGuiView` is not used: it is a panel with its own context and its own
+pass, and the settings menu is an overlay inside the engine's frame. Gate 297 of
+297; one additive change to imgui-eacp (`Gui::DrawTarget`, so the pipeline can
+target a pass that has a depth-stencil attachment) and one refactor (the
+event-feeding rules as free functions both it and this port call).
 
 ~~**Soft particles**, behind gap 24.~~ — **done**, step 6 in §6, and gap 24 is
 closed with it. It was the last program in Doom 3 this backend did not have, and
