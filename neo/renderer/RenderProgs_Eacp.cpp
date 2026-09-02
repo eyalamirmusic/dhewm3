@@ -158,6 +158,261 @@ void idEacpStageProgram::define( void ) {
 	setFragment( fragment );
 }
 
+void R_EacpShaderCompileFailed( const char *what ) {
+	common->Warning( "eacp: the %s shader failed to compile", what );
+}
+
+/*
+================================================================================
+
+	idEacpCubeProgram
+
+================================================================================
+*/
+
+idEacpCubeProgram::idEacpCubeProgram( eacpCubeTexgen_t texgenKind,
+									  GPU::TextureSampling sampling ) {
+	// Before compile(), as everywhere: the build walk reads the sampling to
+	// place the static sampler the generated source points at, and it reads the
+	// texgen because define() branches on it.
+	cubeImage.sampling = sampling;
+
+	texgen = texgenKind;
+
+	compile();
+}
+
+/*
+====================
+idEacpCubeProgram::define
+
+Three coordinate generators and one expression over them.
+
+What OpenGL does for the first two is not a shader at all - the frontend writes
+a three-component texture coordinate into the vertex cache every frame
+(R_SkyboxTexGen, R_WobbleskyTexGen) and glTexCoordPointer reads it. That buffer
+is still written on this backend, by frontend code this port does not touch, and
+it is ignored: the same arithmetic is four instructions in a vertex shader and
+does not cost a per-frame allocation and an upload of three floats per vertex.
+So `surf->dynamicTexCoords` is filled in and never bound, which is worth knowing
+before someone goes looking for the bind.
+
+The third is environment.vfp, and its two halves land where the original puts
+them: the vertex program interpolates the normal and the vector to the eye, and
+the fragment program normalizes both - because it is the *interpolated* pair
+that has to be unit length, and normalizing per vertex would not make it so.
+====================
+*/
+void idEacpCubeProgram::define( void ) {
+	auto	position = vertexInput( &eacpDrawVert_t::xyz );
+	auto	normal = vertexInput( &eacpDrawVert_t::normal );
+	auto	vertexColor = vertexInput( &eacpDrawVert_t::color );
+
+	setPosition( modelViewProjection * GPU::float4( position, 1.0f ) );
+
+	auto	surfaceColor = varying( vertexColor * colorModulate + colorAdd );
+
+	if ( texgen == ECT_REFLECT ) {
+		// environment.vfp's two texture coordinates: the surface normal and the
+		// vector to the eye, both in model space and both left as they are for
+		// the fragment stage to normalize.
+		auto	toEye = varying( localViewOrigin.xyz() - position );
+		auto	surfaceNormal = varying( normal );
+
+		auto	eye = GPU::normalize( toEye );
+		auto	unitNormal = GPU::normalize( surfaceNormal );
+
+		// MAD R0, R0, scaleTwo, -toEye over R0 = dot( toEye, normal ) * normal,
+		// which is the reflection of the eye vector about the normal.
+		auto	reflection = unitNormal * ( GPU::dot( eye, unitNormal ) * 2.0f ) - eye;
+
+		setFragment( GPU::sample( cubeImage, reflection ) * surfaceColor );
+		return;
+	}
+
+	// The other two are a coordinate the vertex knows and the fragment
+	// interpolates, exactly as the three-component texcoord OpenGL streams is.
+	//
+	// R_WobbleskyTexGen's transform is a rotation with no translation, and it is
+	// applied by R_LocalPointToGlobal - which adds the fourth column. Multiplying
+	// the homogeneous vector with w = 0 is that same product with the column it
+	// must not pick up multiplied by zero, so this is the generator's arithmetic
+	// rather than an approximation of it. A plain skybox sends the identity and
+	// gets its own vector back unchanged, to the bit.
+	auto	coordinate = ( texgen == ECT_DIFFUSE )
+		? normal
+		: ( texgenMatrix * GPU::float4( position - localViewOrigin.xyz(), 0.0f ) ).xyz();
+
+	setFragment( GPU::sample( cubeImage, varying( coordinate ) ) * surfaceColor );
+}
+
+/*
+================================================================================
+
+	idEacpBumpyReflectProgram
+
+================================================================================
+*/
+
+idEacpBumpyReflectProgram::idEacpBumpyReflectProgram( GPU::TextureSampling cube,
+													  GPU::TextureSampling bump ) {
+	cubeImage.sampling = cube;
+	bumpImage.sampling = bump;
+
+	compile();
+}
+
+/*
+====================
+idEacpBumpyReflectProgram::define
+
+bumpyEnvironment.vfp, both halves.
+
+The vertex half carries three things into global space through the model
+matrix's rows: the vector to the eye, and the surface's tangent frame - which
+arrives as three varyings holding one *component* each of the three basis
+vectors, because that is the shape nine DP3s produce and because it is what
+makes the fragment half's three DP3s the two changes of basis composed.
+
+The fragment half is the same reflection environment.vfp computes, over a normal
+the bump map perturbed rather than the vertex's own.
+
+Two things the original leaves out are left out here. The bump map is sampled at
+the surface's raw (s, t) and *not* through the stage's texture matrix - a vertex
+program bypasses GL's texture matrix entirely, so a `scroll` on a reflect stage
+has never done anything on the ARB2 path. And the colour: this writes the cube
+sample and nothing else, where environment.vfp beside it multiplies by the
+vertex colour.
+====================
+*/
+void idEacpBumpyReflectProgram::define( void ) {
+	auto	position = vertexInput( &eacpDrawVert_t::xyz );
+	auto	texcoord = vertexInput( &eacpDrawVert_t::st );
+	auto	normal = vertexInput( &eacpDrawVert_t::normal );
+	auto	tangent = vertexInput( &eacpDrawVert_t::tangent );
+	auto	bitangent = vertexInput( &eacpDrawVert_t::bitangent );
+
+	setPosition( modelViewProjection * GPU::float4( position, 1.0f ) );
+
+	// The model matrix's rows, as directions: the w each carries is the model's
+	// translation and a DP3 never reads it.
+	auto	rowX = modelRowX.xyz();
+	auto	rowY = modelRowY.xyz();
+	auto	rowZ = modelRowZ.xyz();
+
+	auto	toGlobal = [&]( const GPU::Float3 &v ) {
+		return GPU::float3( GPU::dot( v, rowX ), GPU::dot( v, rowY ), GPU::dot( v, rowZ ) );
+	};
+
+	// One component of each of the three basis vectors per varying, which is
+	// what the nine DP3s in the original write and what the three in its
+	// fragment program read back.
+	auto	basisX = varying( GPU::float3( GPU::dot( tangent, rowX ),
+										   GPU::dot( bitangent, rowX ),
+										   GPU::dot( normal, rowX ) ) );
+	auto	basisY = varying( GPU::float3( GPU::dot( tangent, rowY ),
+										   GPU::dot( bitangent, rowY ),
+										   GPU::dot( normal, rowY ) ) );
+	auto	basisZ = varying( GPU::float3( GPU::dot( tangent, rowZ ),
+										   GPU::dot( bitangent, rowZ ),
+										   GPU::dot( normal, rowZ ) ) );
+
+	auto	toEye = varying( toGlobal( localViewOrigin.xyz() - position ) );
+
+	auto	bumpCoord = varying( texcoord );
+
+	// x out of alpha, then out of [0, 1] and into [-1, 1], then normalized -
+	// the same three steps the interaction program takes, and for the same
+	// reason: idImage::GenerateImage swaps red and alpha on every normal map it
+	// uploads.
+	auto	bumpTexel = GPU::sample( bumpImage, bumpCoord );
+	auto	localNormal = GPU::normalize( bumpTexel.wyz() * 2.0f - 1.0f );
+
+	auto	globalNormal = GPU::float3( GPU::dot( localNormal, basisX ),
+										GPU::dot( localNormal, basisY ),
+										GPU::dot( localNormal, basisZ ) );
+
+	auto	eye = GPU::normalize( toEye );
+
+	auto	reflection = globalNormal * ( GPU::dot( eye, globalNormal ) * 2.0f ) - eye;
+
+	// **Alpha is zero because the original writes nothing there at all, and zero
+	// is the value that cannot change what is already in the buffer.**
+	// `MOV result.color.xyz, R0` leaves w undefined by the ARB specification, so
+	// there is no number here to copy - what there is instead is what the three
+	// materials in the demo pk4 that reach this program do with it. Two of them
+	// (`textures/glass/glass1` and `glass2`) set `maskalpha`, so the channel is
+	// not written; the third (`textures/decals/p_oppressive`) is `blend add`,
+	// where a source alpha of zero leaves the destination's exactly as it was.
+	// So this is the one value that is invisible on every path the content
+	// actually takes, which is the best a fragment program's undefined output
+	// can be reproduced as.
+	setFragment( GPU::float4( GPU::sample( cubeImage, reflection ).xyz(), 0.0f ) );
+}
+
+/*
+================================================================================
+
+	idEacpScreenProgram
+
+================================================================================
+*/
+
+idEacpScreenProgram::idEacpScreenProgram( GPU::TextureSampling sampling ) {
+	image.sampling = sampling;
+
+	compile();
+}
+
+/*
+====================
+idEacpScreenProgram::define
+
+Three object-linear texgens and a projective read.
+
+The planes are rows 0, 1 and 3 of modelView x projection, so (s, t, q) is the
+(x, y, w) of the clip-space position this same vertex is drawn at - and s/q,
+t/q is therefore where on the screen it lands, in the [0, 1] a texture is
+sampled in only because the projection's own [-1, 1] has already been halved and
+shifted by the plane rows themselves. Whatever the material names is read at
+that point, which for every user of this in the game is `_currentRender`.
+
+The divide is in the fragment stage rather than the vertex stage, and that is
+not an optimisation to undo: interpolating s/q would give the wrong answer
+everywhere except the vertices, which is the whole reason GL_TEXTURE_GEN_Q
+exists.
+====================
+*/
+void idEacpScreenProgram::define( void ) {
+	auto	position = vertexInput( &eacpDrawVert_t::xyz );
+	auto	vertexColor = vertexInput( &eacpDrawVert_t::color );
+
+	auto	model = GPU::float4( position, 1.0f );
+
+	setPosition( modelViewProjection * model );
+
+	auto	s = GPU::dot( model, screenPlaneS );
+	auto	t = GPU::dot( model, screenPlaneT );
+	auto	q = GPU::dot( model, screenPlaneQ );
+
+	// GL's texture matrix over the homogeneous coordinate, which is why these
+	// two rows are dotted with (s, t, q, 0) where an explicit stage's are dotted
+	// with (s, t, 1, 0): the third input is the generated q rather than the
+	// constant 1. The matrix's own fourth row is the identity in everything
+	// RB_GetShaderTextureMatrix can produce, so q comes through unchanged and
+	// there is no third row to carry.
+	auto	generated = GPU::float4( s, t, q, 0.0f );
+
+	auto	projected = varying( GPU::float3( GPU::dot( generated, textureMatrixS ),
+											  GPU::dot( generated, textureMatrixT ),
+											  q ) );
+
+	auto	fragment = GPU::sample( image, projected.xy() / projected.z() )
+		* varying( vertexColor * colorModulate + colorAdd );
+
+	setFragment( fragment );
+}
+
 /*
 ================================================================================
 
@@ -623,6 +878,18 @@ static GPU::TextureSampling R_EacpSampling( const idImage *image ) {
 	sampling.addressMode = ( image->repeat == TR_REPEAT ) ? GPU::TextureAddressMode::Repeat
 														  : GPU::TextureAddressMode::Clamp;
 
+	// A cube ignores whatever the material asked for, which is not this port
+	// being lazy - it is idRenderBackendGL::SetCubeImageFilterAndRepeat, whose
+	// own comment is "no other clamp mode makes sense". It forces
+	// GL_CLAMP_TO_EDGE on S and T however the image was declared, so a cube
+	// declared `repeat` samples clamped there and has to sample clamped here.
+	// What it means on this backend is one fewer variant rather than one fewer
+	// call: the address mode is compiled into the shader, so forcing it is
+	// choosing which compiled program the draw goes through.
+	if ( image->type == TT_CUBIC ) {
+		sampling.addressMode = GPU::TextureAddressMode::Clamp;
+	}
+
 	return sampling;
 }
 
@@ -676,6 +943,10 @@ void idEacpRenderProgs::Shutdown( void ) {
 
 	interactions.clear();
 
+	cubes.clear();
+	bumpyReflects.clear();
+	screens.clear();
+
 	shadowPipelines.clear();
 	shadowLibrary.reset();
 	shadowProgram.reset();
@@ -703,6 +974,10 @@ int idEacpRenderProgs::NumPrograms( void ) const {
 		}
 	}
 
+	total += CountPrograms( cubes );
+	total += CountPrograms( bumpyReflects );
+	total += CountPrograms( screens );
+
 	if ( shadowProgram.has_value() ) {
 		total++;
 	}
@@ -726,6 +1001,10 @@ int idEacpRenderProgs::NumPipelines( void ) const {
 	for ( int i = 0 ; i < interactions.size() ; i++ ) {
 		total += interactions[i]->pipelines.size();
 	}
+
+	total += CountPipelines( cubes );
+	total += CountPipelines( bumpyReflects );
+	total += CountPipelines( screens );
 
 	total += shadowPipelines.size();
 
@@ -898,6 +1177,128 @@ idEacpRenderProgs::stageDraw_t idEacpRenderProgs::StageDraw( const idImage *imag
 	// RB_ARB2_DrawInteractions leaves the buffer on GL_ALWAYS as it finishes.
 	draw.pipeline = PipelineFor( variant.pipelines, *variant.library,
 								 variant.program->vertexLayout(),
+								 stateBits, cullType, ES_IGNORE );
+
+	return draw;
+}
+
+/*
+====================
+idEacpRenderProgs::CubeDraw
+
+A sky, a diffuse cube or an unbumped reflection. One program per (texgen,
+sampling) pair, of which the demo's first level reaches one - the sky, sampled
+linear and clamped.
+
+The state is the material's exactly as the explicit stage's is, and the stencil
+is ES_IGNORE for the reason StageDraw gives: everything drawn through the ambient
+pass is drawn outside the shadow half of a view.
+====================
+*/
+idEacpRenderProgs::cubeDraw_t idEacpRenderProgs::CubeDraw( eacpCubeTexgen_t texgen,
+														   const idImage *cube,
+														   int stateBits, int cullType ) {
+	cubeDraw_t	draw;
+
+	draw.program = NULL;
+	draw.pipeline = NULL;
+
+	const GPU::TextureSampling	sampling = R_EacpSampling( cube );
+	const int					key = (int)texgen | ( GPU::samplingIndex( sampling ) << 2 );
+
+	texgenVariant_t<idEacpCubeProgram> *	variant =
+		TexgenVariant( cubes, key, "cube texgen",
+					   [&]( std::optional<idEacpCubeProgram> &program ) {
+						   program.emplace( texgen, sampling );
+					   } );
+
+	if ( !variant ) {
+		return draw;
+	}
+
+	draw.program = &*variant->program;
+
+	draw.pipeline = PipelineFor( variant->pipelines, *variant->library,
+								 variant->program->vertexLayout(),
+								 stateBits, cullType, ES_IGNORE );
+
+	return draw;
+}
+
+/*
+====================
+idEacpRenderProgs::BumpyReflectDraw
+
+The two-textured reflection, keyed on both samplings - the cube's and the bump
+map's - because both are baked into the source and either can differ without the
+other.
+====================
+*/
+idEacpRenderProgs::bumpyReflectDraw_t
+idEacpRenderProgs::BumpyReflectDraw( const idImage *cube, const idImage *bump,
+									 int stateBits, int cullType ) {
+	bumpyReflectDraw_t	draw;
+
+	draw.program = NULL;
+	draw.pipeline = NULL;
+
+	const GPU::TextureSampling	cubeSampling = R_EacpSampling( cube );
+	const GPU::TextureSampling	bumpSampling = R_EacpSampling( bump );
+
+	const int	key = GPU::samplingIndex( cubeSampling )
+		| ( GPU::samplingIndex( bumpSampling ) << 2 );
+
+	texgenVariant_t<idEacpBumpyReflectProgram> *	variant =
+		TexgenVariant( bumpyReflects, key, "bumpy reflection",
+					   [&]( std::optional<idEacpBumpyReflectProgram> &program ) {
+						   program.emplace( cubeSampling, bumpSampling );
+					   } );
+
+	if ( !variant ) {
+		return draw;
+	}
+
+	draw.program = &*variant->program;
+
+	draw.pipeline = PipelineFor( variant->pipelines, *variant->library,
+								 variant->program->vertexLayout(),
+								 stateBits, cullType, ES_IGNORE );
+
+	return draw;
+}
+
+/*
+====================
+idEacpRenderProgs::ScreenDraw
+
+TG_SCREEN and TG_SCREEN2, whose one texture is an ordinary 2D one - so the key is
+the one sampling and the space is four.
+====================
+*/
+idEacpRenderProgs::screenDraw_t idEacpRenderProgs::ScreenDraw( const idImage *image,
+															   int stateBits,
+															   int cullType ) {
+	screenDraw_t	draw;
+
+	draw.program = NULL;
+	draw.pipeline = NULL;
+
+	const GPU::TextureSampling	sampling = R_EacpSampling( image );
+
+	texgenVariant_t<idEacpScreenProgram> *	variant =
+		TexgenVariant( screens, GPU::samplingIndex( sampling ), "screen texgen",
+					   [&]( std::optional<idEacpScreenProgram> &program ) {
+						   program.emplace( sampling );
+					   } );
+
+	if ( !variant ) {
+		return draw;
+	}
+
+	draw.program = &*variant->program;
+
+	draw.pipeline = PipelineFor( variant->pipelines, *variant->library,
+								 variant->program->vertexLayout(),
 								 stateBits, cullType, ES_IGNORE );
 
 	return draw;

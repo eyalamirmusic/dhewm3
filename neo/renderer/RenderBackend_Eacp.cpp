@@ -266,6 +266,21 @@ private:
 		// its own: the notch it clips with modulates an alpha nothing tests
 		// unless the surface is perforated.
 		const float *		clipPlane;
+
+		// texgen_t, and what decides which of the four programs draws this
+		// stage. TG_EXPLICIT is the surface's own (s, t) and everything below
+		// is unread.
+		int					texgen;
+
+		// The material's bump map, on a TG_REFLECT_CUBE stage whose material has
+		// one - which is the whole of what tells bumpyEnvironment.vfp from
+		// environment.vfp, in RB_PrepareStageTexturing and here.
+		const idImage *		bumpImage;
+
+		// R_WobbleskyTransform's 3x3 for a TG_WOBBLESKY_CUBE stage, and NULL for
+		// TG_SKYBOX_CUBE - which the program reads as the identity, that being
+		// exactly what the plain sky's generator does.
+		const float *		texgenMatrix;
 	};
 
 	// The texture the frame is composed into, made on the first pass and
@@ -363,6 +378,40 @@ private:
 	// the five uniforms that are its expression, and the draw.
 	void			DrawStage( const srfTriangles_t *tri, const eacpStage_t &stage );
 
+	// The same for a stage whose texture coordinate is generated rather than
+	// read - RB_PrepareStageTexturing's business, which on OpenGL is a texgen
+	// enable, a texcoord pointer or a pair of ARB programs and here is a
+	// program of its own. One function per program; DrawSurfaceShaderPasses
+	// picks between them on the texgen.
+	void			DrawCubeStage( const srfTriangles_t *tri, const eacpStage_t &stage,
+								   eacpCubeTexgen_t texgen );
+	void			DrawBumpyReflectStage( const srfTriangles_t *tri,
+										   const eacpStage_t &stage );
+	void			DrawScreenStage( const srfTriangles_t *tri, const eacpStage_t &stage );
+
+	// The eye in the space currently being drawn, which three of the four
+	// texgens need and which is R_SkyboxTexGen's localViewOrigin and
+	// RB_SetProgramEnvironmentSpace's program.env[5] - the same value under two
+	// names, because on OpenGL one is computed in the frontend and the other in
+	// the backend.
+	Float4			LocalViewOrigin( void ) const;
+
+	// stageVertexColor_t as the (modulate, add) pair every one of these programs
+	// takes. Static because it reads nothing but the stage; `combiner` is what
+	// separates the fixed-function texgens from the two ARB ones and the
+	// definition says why.
+	static void		StageColor( const eacpStage_t &stage, bool combiner,
+								eacp::GPU::Uniform<eacp::GPU::Float4> &modulate,
+								eacp::GPU::Uniform<eacp::GPU::Float4> &add );
+
+	// The texture an idImage carries, checked against the shape the program that
+	// is about to sample it declared. Nothing on either backend reports a cube
+	// bound where a 2D texture was declared or the other way round, so this is
+	// where a material that lost its cube map becomes a warning and a skipped
+	// draw rather than a black surface.
+	const eacp::GPU::Texture *
+					TextureForStage( const idImage *image, bool wantCube );
+
 	// The texture an idImage carries, created on the first upload and
 	// destroyed by FreeImage. Held by pointer in idImage::backendTexture,
 	// because GPU::Texture has no empty state to default-construct - and by a
@@ -413,6 +462,19 @@ private:
 	// backend has no equivalent because GL remembers this itself.
 	idImage *			boundImages[MAX_MULTITEXTURE_UNITS];
 
+	// The six faces of the cube currently being uploaded, gathered because
+	// GenerateCubeImage hands them over one at a time and eacp takes them all at
+	// once. A member rather than a local, since it has to survive between the
+	// six calls; kept rather than freed, since the next cube is almost always
+	// the same size as this one and a level load uploads a dozen of them.
+	//
+	// cubeFacesFilled is a bit per face, so a loader that gave up half way
+	// through leaves the image with no texture rather than with a cube whose
+	// missing faces hold the last one's pixels.
+	idList<byte>		cubeFaces;
+	int					cubeFaceBytes;
+	int					cubeFacesFilled;
+
 	// What the next DrawIndexed will use, and the reason the GL backend needs
 	// no equivalent: in OpenGL every one of these *is* context state, set by
 	// whoever last touched it and still there when glDrawElements is reached.
@@ -462,6 +524,7 @@ private:
 	bool				warnedExternalFormat;
 	bool				warnedTexgen;
 	bool				warnedMissingTexture;
+	bool				warnedCubeShape;
 	bool				warnedReadPixels;
 	bool				warnedShowShadows;
 	bool				warnedDepthPassShadows;
@@ -493,6 +556,8 @@ idRenderBackendEacp::idRenderBackendEacp() {
 	suspendedHasViewport = false;
 	suspendedHasScissor = false;
 	passHasWorldView = false;
+	cubeFaceBytes = 0;
+	cubeFacesFilled = 0;
 	memset( boundImages, 0, sizeof( boundImages ) );
 	drawProgram = NULL;
 	drawPipeline = NULL;
@@ -507,6 +572,7 @@ idRenderBackendEacp::idRenderBackendEacp() {
 	warnedExternalFormat = false;
 	warnedTexgen = false;
 	warnedMissingTexture = false;
+	warnedCubeShape = false;
 	warnedReadPixels = false;
 	warnedShowShadows = false;
 	warnedDepthPassShadows = false;
@@ -574,9 +640,12 @@ void idRenderBackendEacp::Init( void ) {
 	glConfig.anisotropicAvailable = false;
 	glConfig.textureLODBiasAvailable = false;
 
-	// Gap 5. Skyboxes and reflections; the normalization cube map that was the
-	// third user can be deleted outright, normalize() being free in a shader.
-	glConfig.cubeMapAvailable = false;
+	// Gap 5, closed: eacp grew cube textures, so a skybox and a reflection have
+	// something to sample. The normalization cube map that was the third user is
+	// gone rather than served - step 4d.2 made it arithmetic - so what this
+	// switches on is `cameraCubeMap` and `cubeMap` in a material, and the four
+	// cube texgens over them.
+	glConfig.cubeMapAvailable = true;
 
 	// Never happens - Generate3DImage is defined and has no callers, so TT_3D
 	// is unreachable (plan.md section 5, "Checked, and not gaps").
@@ -2309,11 +2378,12 @@ void idRenderBackendEacp::DrawSurfaceShaderPasses( const drawSurf_t *surf ) {
 			continue;
 		}
 
-		// Only TG_EXPLICIT here. The screen-space and cube texgens need
-		// _currentRender and cube maps respectively (step 4e, and gap 5), and a
-		// stage drawn with the wrong coordinates looks like a rendering bug
-		// rather than a missing feature - so it is skipped and said once.
-		if ( pStage->texture.texgen != TG_EXPLICIT ) {
+		// TG_GLASSWARP is the one texgen still skipped, and it is not really a
+		// texgen: it is a hand-written ARB fragment program that happens to be
+		// selected by one, sampling _scratch and _scratch2 through a distortion.
+		// It belongs with the newStage above rather than with the four below,
+		// and nothing in the demo pk4 declares it at all.
+		if ( pStage->texture.texgen == TG_GLASSWARP ) {
 			if ( !warnedTexgen ) {
 				warnedTexgen = true;
 				common->Warning( "eacp: texgen %i is not implemented, so '%s' will not draw",
@@ -2352,6 +2422,9 @@ void idRenderBackendEacp::DrawSurfaceShaderPasses( const drawSurf_t *surf ) {
 		draw.alphaTest = false;
 		draw.alphaTestRef = 0.0f;
 		draw.clipPlane = NULL;
+		draw.texgen = pStage->texture.texgen;
+		draw.bumpImage = NULL;
+		draw.texgenMatrix = NULL;
 
 		float	matrix[16];
 
@@ -2360,6 +2433,25 @@ void idRenderBackendEacp::DrawSurfaceShaderPasses( const drawSurf_t *surf ) {
 			draw.textureMatrix = matrix;
 		} else {
 			draw.textureMatrix = NULL;
+		}
+
+		float	wobble[16];
+
+		if ( draw.texgen == TG_WOBBLESKY_CUBE ) {
+			R_WobbleskyTransform( surf, backEnd.viewDef->floatTime, wobble );
+			draw.texgenMatrix = wobble;
+		}
+
+		// Which of the two reflection programs this stage wants, decided on the
+		// same test RB_PrepareStageTexturing makes and nothing else: a material
+		// with a bump stage reflects through its normal map in global space, one
+		// without reflects its own vertex normal in model space.
+		if ( draw.texgen == TG_REFLECT_CUBE ) {
+			const shaderStage_t *	bumpStage = shader->GetBumpStage();
+
+			if ( bumpStage ) {
+				draw.bumpImage = bumpStage->texture.image;
+			}
 		}
 
 		SetState( pStage->drawStateBits );
@@ -2380,12 +2472,98 @@ void idRenderBackendEacp::DrawSurfaceShaderPasses( const drawSurf_t *surf ) {
 			draw.stateBits |= GLS_DEPTHFUNC_ALWAYS | GLS_DEPTHMASK;
 		}
 
-		DrawStage( tri, draw );
+		// Where OpenGL calls RB_PrepareStageTexturing and then one shared draw,
+		// this picks the program the texgen names and then draws. Same
+		// decision, made a step earlier - because on a backend where the
+		// coordinate generator is compiled into a shader, choosing it *is*
+		// choosing the program.
+		switch ( draw.texgen ) {
+		case TG_SKYBOX_CUBE:
+		case TG_WOBBLESKY_CUBE:
+			DrawCubeStage( tri, draw, ECT_SKY );
+			break;
+		case TG_DIFFUSE_CUBE:
+			DrawCubeStage( tri, draw, ECT_DIFFUSE );
+			break;
+		case TG_REFLECT_CUBE:
+			if ( draw.bumpImage ) {
+				DrawBumpyReflectStage( tri, draw );
+			} else {
+				DrawCubeStage( tri, draw, ECT_REFLECT );
+			}
+			break;
+		case TG_SCREEN:
+		case TG_SCREEN2:
+			DrawScreenStage( tri, draw );
+			break;
+		default:
+			DrawStage( tri, draw );
+			break;
+		}
 	}
 
 	drawProgram = NULL;
 	drawPipeline = NULL;
 	drawVertices = NULL;
+}
+
+/*
+======================
+idRenderBackendEacp::StageColor
+
+The three stageVertexColor_t modes as the (modulate, add) pair every one of
+these programs takes. OpenGL needs a combiner and a second texture unit bound to
+the white image to say the same thing; here they are two uniforms.
+
+SVC_INVERSE_MODULATE inverts the alpha channel along with the three colour ones,
+which the fixed-function path does not: it sets GL_COMBINE_RGB alone and leaves
+alpha on the default modulate. That is a deliberate simplification and the one
+BFG's own port makes - the mode exists for cross-blended terrain, where the alpha
+is 1 either way, and no material in the demo reaches it at all.
+
+**`combiner` is what separates the fixed-function stages from the two ARB ones,
+and it is not a shortcut.** environment.vfp and bumpyEnvironment.vfp are fragment
+programs, and a fragment program replaces the texture-env combiner outright - so
+on a reflect stage the second texture unit the loop above binds the white image
+on does nothing, GL_COMBINE_RGB does nothing, and what reaches the shader is
+`vertex.color`: the stage's constant colour where SVC_IGNORE put it there with
+glColor4fv, and the vertex colour array otherwise. Which is (0, c) and (1, 0) -
+the same two uniforms, computed from a different rule.
+======================
+*/
+void idRenderBackendEacp::StageColor( const eacpStage_t &stage, bool combiner,
+									  GPU::Uniform<GPU::Float4> &modulate,
+									  GPU::Uniform<GPU::Float4> &add ) {
+	const Float4 &	color = stage.color;
+	const Float4	black = asFloat4( 0.0f, 0.0f, 0.0f, 0.0f );
+	const Float4	white = asFloat4( 1.0f, 1.0f, 1.0f, 1.0f );
+
+	if ( !combiner ) {
+		if ( stage.vertexColor == SVC_IGNORE ) {
+			modulate = black;
+			add = color;
+		} else {
+			modulate = white;
+			add = black;
+		}
+
+		return;
+	}
+
+	switch ( stage.vertexColor ) {
+	case SVC_MODULATE:
+		modulate = color;
+		add = black;
+		break;
+	case SVC_INVERSE_MODULATE:
+		modulate = asFloat4( -color[0], -color[1], -color[2], -color[3] );
+		add = color;
+		break;
+	default:
+		modulate = black;
+		add = color;
+		break;
+	}
 }
 
 /*
@@ -2403,17 +2581,14 @@ piece of geometry.
 ======================
 */
 void idRenderBackendEacp::DrawStage( const srfTriangles_t *tri, const eacpStage_t &stage ) {
-	GPU::Texture *	texture = stage.image ? TextureFor( stage.image ) : NULL;
+	// A 2D image, and the shape is part of the question rather than an
+	// assumption: a material may declare `cubeMap` and no texgen at all, which
+	// is a cube bound where this program declared a 2D texture. TextureForStage
+	// says so and the draw is skipped, where before cube textures existed it
+	// simply had no texture to bind.
+	const GPU::Texture *	texture = TextureForStage( stage.image, false );
 
 	if ( !texture ) {
-		// An image the upload path turned away - a .dds this build cannot read,
-		// or a cube map. UploadImageLevel has already said which and why; this
-		// is the draw that would have used it.
-		if ( !warnedMissingTexture ) {
-			warnedMissingTexture = true;
-			common->Warning( "eacp: '%s' has no texture on the GPU, so a surface will not draw",
-							 stage.image ? stage.image->imgName.c_str() : "(none)" );
-		}
 		return;
 	}
 
@@ -2438,33 +2613,7 @@ void idRenderBackendEacp::DrawStage( const srfTriangles_t *tri, const eacpStage_
 		draw.program->textureMatrixT = asFloat4( 0.0f, 1.0f, 0.0f, 0.0f );
 	}
 
-	// The three stageVertexColor_t modes as (modulate, add). OpenGL needs a
-	// combiner and a second texture unit bound to the white image to say the
-	// same thing; here they are two uniforms and the program is one.
-	//
-	// SVC_INVERSE_MODULATE inverts the alpha channel along with the three
-	// colour ones, which the fixed-function path does not: it sets
-	// GL_COMBINE_RGB alone and leaves alpha on the default modulate. That is a
-	// deliberate simplification and the one BFG's own port makes - the mode
-	// exists for cross-blended terrain, where the alpha is 1 either way, and no
-	// material in the demo reaches it at all.
-	const Float4 &	color = stage.color;
-	const Float4	black = asFloat4( 0.0f, 0.0f, 0.0f, 0.0f );
-
-	switch ( stage.vertexColor ) {
-	case SVC_MODULATE:
-		draw.program->colorModulate = color;
-		draw.program->colorAdd = black;
-		break;
-	case SVC_INVERSE_MODULATE:
-		draw.program->colorModulate = asFloat4( -color[0], -color[1], -color[2], -color[3] );
-		draw.program->colorAdd = color;
-		break;
-	default:
-		draw.program->colorModulate = black;
-		draw.program->colorAdd = color;
-		break;
-	}
+	StageColor( stage, true, draw.program->colorModulate, draw.program->colorAdd );
 
 	draw.program->alphaTestRef = stage.alphaTestRef;
 
@@ -2485,6 +2634,264 @@ void idRenderBackendEacp::DrawStage( const srfTriangles_t *tri, const eacpStage_
 	// Through the counter wrapper rather than around it: r_showPrimitives and
 	// the renderer's own performance counters are read from the same place on
 	// both backends, and DrawIndexed is the seam.
+	RB_DrawElementsWithCounters( tri );
+}
+
+/*
+======================
+idRenderBackendEacp::TextureForStage
+
+The texture an image carries, and whether it is the shape the program about to
+sample it declared.
+
+The check is here because nothing else does it. eacp binds a cube and a 2D
+texture through the same call on the same slot, so a mismatch is not a bind
+error - on Metal the sampler reads a texture whose type the shader does not
+expect and on D3D12 an SRV of the wrong dimension, and neither says a word. What
+it looks like is a black surface.
+
+It is reachable rather than theoretical: `cubeMap` in a material whose six files
+are not all there loads nothing, and idImage falls back to the default image,
+which is 2D.
+======================
+*/
+const GPU::Texture *idRenderBackendEacp::TextureForStage( const idImage *image, bool wantCube ) {
+	GPU::Texture *	texture = image ? TextureFor( image ) : NULL;
+
+	if ( !texture ) {
+		// An image the upload path turned away - a .dds this build cannot read,
+		// or a cube whose six faces did not all arrive.
+		if ( !warnedMissingTexture ) {
+			warnedMissingTexture = true;
+			common->Warning( "eacp: '%s' has no texture on the GPU, so a surface will not draw",
+							 image ? image->imgName.c_str() : "(none)" );
+		}
+		return NULL;
+	}
+
+	if ( texture->isCube() != wantCube ) {
+		if ( !warnedCubeShape ) {
+			warnedCubeShape = true;
+			common->Warning( "eacp: '%s' is %s where the stage wanted %s, so a surface "
+							 "will not draw",
+							 image->imgName.c_str(),
+							 texture->isCube() ? "a cube map" : "a 2D image",
+							 wantCube ? "a cube map" : "a 2D image" );
+		}
+		return NULL;
+	}
+
+	return texture;
+}
+
+/*
+======================
+idRenderBackendEacp::LocalViewOrigin
+
+The eye in the space being drawn. R_SkyboxTexGen computes this in the frontend
+and RB_SetProgramEnvironmentSpace computes it again in the backend, from the same
+two values; here there is one caller's worth of it and it is the backend's.
+
+w is 1 because the ARB programs' program.env[5] carries 1, and because nothing
+here reads it - the shaders take .xyz.
+======================
+*/
+Float4 idRenderBackendEacp::LocalViewOrigin( void ) const {
+	idVec3	local;
+
+	R_GlobalPointToLocal( backEnd.currentSpace->modelMatrix,
+						  backEnd.viewDef->renderView.vieworg, local );
+
+	return asFloat4( local[0], local[1], local[2], 1.0f );
+}
+
+/*
+======================
+idRenderBackendEacp::DrawCubeStage
+
+A sky, a diffuse cube or an unbumped reflection: one draw through
+idEacpCubeProgram, whose texgen decides which.
+
+What OpenGL does instead is three different things - two of them a
+glTexCoordPointer at a buffer the frontend filled, and the third a pair of ARB
+programs - and none of them is a fourth kind of draw. So the shape here is
+DrawStage's exactly: the two lookups, the uniforms, and RB_DrawElementsWithCounters
+over the geometry the caller streamed.
+
+The texture matrix is not applied, and that is a decision rather than an
+omission. GL's texture matrix multiplies the *whole* coordinate, and a cube's is
+a direction: Doom 3's matrix mixes s and t into each other and adds a translation
+built for the [0, 1] of an image, which on a direction vector is a rotation about
+z plus an offset that has no meaning. Two materials in the demo pk4 combine the
+two - `shaderDemos/cloudySky` and `shaderDemos/skybox`, both with `rotate` - and
+neither of the demo's maps places either of them, so there is nothing here to
+check a faithful reproduction of the mixture against.
+======================
+*/
+void idRenderBackendEacp::DrawCubeStage( const srfTriangles_t *tri, const eacpStage_t &stage,
+										 eacpCubeTexgen_t texgen ) {
+	const GPU::Texture *	texture = TextureForStage( stage.image, true );
+
+	if ( !texture ) {
+		return;
+	}
+
+	idEacpRenderProgs::cubeDraw_t	draw =
+		eacpRenderProgs.CubeDraw( texgen, stage.image, stage.stateBits,
+								  ViewCull( stage.cullType ) );
+
+	if ( !draw.pipeline ) {
+		return;
+	}
+
+	draw.program->modelViewProjection = asFloat4x4( modelViewProjection );
+	draw.program->localViewOrigin = LocalViewOrigin();
+
+	// R_WobbleskyTexGen's transform, or the identity - which is what
+	// R_SkyboxTexGen amounts to, and why the two are one program.
+	static const float	identity[16] = { 1, 0, 0, 0,  0, 1, 0, 0,
+										 0, 0, 1, 0,  0, 0, 0, 1 };
+
+	draw.program->texgenMatrix =
+		asFloat4x4( stage.texgenMatrix ? stage.texgenMatrix : identity );
+
+	// A reflect stage is environment.vfp, where a fragment program has replaced
+	// the combiner - so the constant colour reaches the shader only where
+	// SVC_IGNORE put it in glColor. StageColor's own comment has the argument.
+	StageColor( stage, texgen != ECT_REFLECT,
+				draw.program->colorModulate, draw.program->colorAdd );
+
+	draw.program->cubeImage = *texture;
+
+	drawProgram = draw.program;
+	drawPipeline = draw.pipeline;
+
+	RB_DrawElementsWithCounters( tri );
+}
+
+/*
+======================
+idRenderBackendEacp::DrawBumpyReflectStage
+
+bumpyEnvironment.vfp: the same reflection through the material's normal map, in
+global space.
+
+Two textures, so two samplings in the program's key, and the bump map is bound
+straight off the bump stage rather than through RB_BindVariableStageImage - which
+is what RB_PrepareStageTexturing does too, a bump stage having no cinematic or
+dynamic form to resolve.
+======================
+*/
+void idRenderBackendEacp::DrawBumpyReflectStage( const srfTriangles_t *tri,
+												 const eacpStage_t &stage ) {
+	const GPU::Texture *	cube = TextureForStage( stage.image, true );
+	const GPU::Texture *	bump = TextureForStage( stage.bumpImage, false );
+
+	if ( !cube || !bump ) {
+		return;
+	}
+
+	idEacpRenderProgs::bumpyReflectDraw_t	draw =
+		eacpRenderProgs.BumpyReflectDraw( stage.image, stage.bumpImage, stage.stateBits,
+										  ViewCull( stage.cullType ) );
+
+	if ( !draw.pipeline ) {
+		return;
+	}
+
+	draw.program->modelViewProjection = asFloat4x4( modelViewProjection );
+	draw.program->localViewOrigin = LocalViewOrigin();
+
+	// program.env[6], [7] and [8]: the model matrix's rows, which are its
+	// columns read across - Doom 3 keeps matrices in OpenGL's column-major
+	// order, so row i is elements i, i+4, i+8, i+12.
+	const float *	model = backEnd.currentSpace->modelMatrix;
+
+	draw.program->modelRowX = asFloat4( model[0], model[4], model[8], model[12] );
+	draw.program->modelRowY = asFloat4( model[1], model[5], model[9], model[13] );
+	draw.program->modelRowZ = asFloat4( model[2], model[6], model[10], model[14] );
+
+	// No colour at all, which is what the original writes - see the program.
+
+	draw.program->cubeImage = *cube;
+	draw.program->bumpImage = *bump;
+
+	drawProgram = draw.program;
+	drawPipeline = draw.pipeline;
+
+	RB_DrawElementsWithCounters( tri );
+}
+
+/*
+======================
+idRenderBackendEacp::DrawScreenStage
+
+TG_SCREEN and TG_SCREEN2: the surface sampling whatever the stage names at the
+point on the screen it covers, which is almost always `_currentRender`.
+
+The three planes are rows 0, 1 and 3 of modelView x projection, exactly as
+RB_PrepareStageTexturing builds them - and this is object-linear texgen, so they
+are dotted with the vertex in its own coordinates rather than in the eye's, which
+is what makes the result the clip-space position and the whole thing work.
+
+**Unmeasured, and it has to be said.** No material in the demo pk4 declares
+`texgen screen` at all outside a newStage, so nothing in the three maps draws
+through this and there is no reference picture to compare against. What it has
+instead is the copy step 4e.3 built, whose own note about `uploadWidth` and the
+power-of-two padding is what the plane rows above would have to be scaled by if
+the image sampled here were ever smaller than the frame - and it is not, on this
+backend, because CopyFramebufferToImage keeps the padded size the shared code
+expects.
+======================
+*/
+void idRenderBackendEacp::DrawScreenStage( const srfTriangles_t *tri,
+										   const eacpStage_t &stage ) {
+	const GPU::Texture *	texture = TextureForStage( stage.image, false );
+
+	if ( !texture ) {
+		return;
+	}
+
+	idEacpRenderProgs::screenDraw_t	draw =
+		eacpRenderProgs.ScreenDraw( stage.image, stage.stateBits,
+									ViewCull( stage.cullType ) );
+
+	if ( !draw.pipeline ) {
+		return;
+	}
+
+	draw.program->modelViewProjection = asFloat4x4( modelViewProjection );
+
+	float	mat[16];
+
+	myGlMultMatrix( backEnd.currentSpace->modelViewMatrix,
+					backEnd.viewDef->projectionMatrix, mat );
+
+	draw.program->screenPlaneS = asFloat4( mat[0], mat[4], mat[8], mat[12] );
+	draw.program->screenPlaneT = asFloat4( mat[1], mat[5], mat[9], mat[13] );
+	draw.program->screenPlaneQ = asFloat4( mat[3], mat[7], mat[11], mat[15] );
+
+	// The same two rows the explicit stage sends, and they mean the same thing -
+	// what differs is the third component they are dotted with, which is the
+	// generated q here and the constant 1 there. The program is where that is
+	// said.
+	if ( stage.textureMatrix ) {
+		const float *	matrix = stage.textureMatrix;
+
+		draw.program->textureMatrixS = asFloat4( matrix[0], matrix[4], matrix[12], 0.0f );
+		draw.program->textureMatrixT = asFloat4( matrix[1], matrix[5], matrix[13], 0.0f );
+	} else {
+		draw.program->textureMatrixS = asFloat4( 1.0f, 0.0f, 0.0f, 0.0f );
+		draw.program->textureMatrixT = asFloat4( 0.0f, 1.0f, 0.0f, 0.0f );
+	}
+
+	StageColor( stage, true, draw.program->colorModulate, draw.program->colorAdd );
+
+	draw.program->image = *texture;
+
+	drawProgram = draw.program;
+	drawPipeline = draw.pipeline;
+
 	RB_DrawElementsWithCounters( tri );
 }
 
@@ -2680,12 +3087,23 @@ Two things go with them, and both are worth knowing before someone looks for the
 bug: R_MipMap's preserveBorder, which is what keeps a TR_CLAMP_TO_ZERO image's
 zero edge intact all the way down its chain, and image_colorMipLevels, the
 debug tool that tints each level.
+
+**A cube arrives as six of these calls and leaves as one texture**, which is the
+one place this function is not a single upload. GenerateCubeImage uploads level 0
+of faces 0 through 5 in order and then their mip chains; eacp takes a cube as one
+block of six faces, in that same order, so the six are accumulated into a buffer
+and the texture is created on the sixth. The buffer is a member rather than a
+local for exactly that reason - the calls are separate and the creation is not.
 ====================
 */
 void idRenderBackendEacp::UploadImageLevel( idImage *image, int face, int level, int internalFormat,
 											int width, int height, int externalFormat,
 											const byte *pixels ) {
-	if ( level != 0 || face != 0 ) {
+	if ( level != 0 ) {
+		return;
+	}
+
+	if ( image->type != TT_CUBIC && face != 0 ) {
 		return;
 	}
 
@@ -2704,8 +3122,52 @@ void idRenderBackendEacp::UploadImageLevel( idImage *image, int face, int level,
 		return;
 	}
 
-	byte *		swizzled = (byte *)R_StaticAlloc( width * height * 4 );
-	R_EacpSwizzleToRGBA( swizzled, pixels, width * height, internalFormat );
+	const int	facePixels = width * height;
+
+	if ( image->type == TT_CUBIC ) {
+		// Six faces of one size, so a face arriving with a different size than
+		// the run in progress is a new cube and the buffer starts again. Face 0
+		// does the same thing, which is what makes an interrupted upload - an
+		// image reloaded over itself - start clean rather than mix two cubes.
+		const int	needed = facePixels * 4 * 6;
+
+		if ( face == 0 || cubeFaceBytes != needed ) {
+			cubeFaces.SetNum( needed, false );
+			cubeFaceBytes = needed;
+			cubeFacesFilled = 0;
+		}
+
+		if ( face < 0 || face > 5 ) {
+			return;
+		}
+
+		R_EacpSwizzleToRGBA( cubeFaces.Ptr() + face * facePixels * 4, pixels,
+							 facePixels, internalFormat );
+
+		cubeFacesFilled |= 1 << face;
+
+		// Created on the last one, and only once all six are in - a cube whose
+		// loader gave up part way through leaves the image with no texture,
+		// which DrawStage reports rather than drawing something half-built.
+		if ( cubeFacesFilled != 0x3f ) {
+			return;
+		}
+
+		GPU::TextureDescriptor	descriptor;
+
+		descriptor.width = width;
+		descriptor.height = height;
+		descriptor.format = GPU::TextureFormat::RGBA8Unorm;
+		descriptor.cube = true;
+		descriptor.mipmapped = ( image->filter == TF_DEFAULT );
+
+		ReplaceTexture( image, makeOwned<GPU::Texture>( GPU::Device::shared(), descriptor,
+														cubeFaces.Ptr() ) );
+		return;
+	}
+
+	byte *		swizzled = (byte *)R_StaticAlloc( facePixels * 4 );
+	R_EacpSwizzleToRGBA( swizzled, pixels, facePixels, internalFormat );
 
 	GPU::TextureDescriptor	descriptor;
 
@@ -2759,12 +3221,43 @@ menu.
 ====================
 */
 void idRenderBackendEacp::UploadScratchImage( idImage *image, const byte *data, int cols, int rows ) {
-	if ( rows == cols * 6 ) {
-		// A cube map animation, which needs gap 5 first.
+	if ( cols <= 0 || rows <= 0 || data == NULL ) {
 		return;
 	}
 
-	if ( cols <= 0 || rows <= 0 || data == NULL ) {
+	// A cube map animation - six square faces stacked into one tall image, which
+	// is how the GL path recognises one too. The bytes are already exactly what
+	// eacp takes: six faces of cols x cols, one after another, in the order a
+	// cube is uploaded in. So this is one call rather than the six
+	// glTexSubImage2Ds the GL backend makes.
+	if ( rows == cols * 6 ) {
+		if ( image->type != TT_CUBIC ) {
+			image->type = TT_CUBIC;
+			ReplaceTexture( image, NULL );
+		}
+
+		rows /= 6;
+
+		GPU::Texture *	cube = TextureFor( image );
+
+		if ( cube && cube->isCube() && cube->width() == cols && cube->height() == rows ) {
+			cube->update( data );
+		} else {
+			GPU::TextureDescriptor	descriptor;
+
+			descriptor.width = cols;
+			descriptor.height = rows;
+			descriptor.format = GPU::TextureFormat::RGBA8Unorm;
+			descriptor.cube = true;
+
+			ReplaceTexture( image, makeOwned<GPU::Texture>( GPU::Device::shared(),
+															descriptor, data ) );
+		}
+
+		image->uploadWidth = cols;
+		image->uploadHeight = rows;
+
+		BindImage( image );
 		return;
 	}
 
@@ -2772,7 +3265,11 @@ void idRenderBackendEacp::UploadScratchImage( idImage *image, const byte *data, 
 
 	GPU::Texture *	texture = TextureFor( image );
 
-	if ( texture && texture->width() == cols && texture->height() == rows ) {
+	// The shape is part of the match, not only the size: a cinematic that was a
+	// cube map animation and is now a flat one would otherwise be re-uploaded
+	// into six faces through an entry point that hands over one image.
+	if ( texture && !texture->isCube()
+		 && texture->width() == cols && texture->height() == rows ) {
 		texture->update( data );
 	} else {
 		GPU::TextureDescriptor	descriptor;
@@ -2808,6 +3305,12 @@ void idRenderBackendEacp::SetImageFilterAndRepeat( const idImage *image ) {
 }
 
 void idRenderBackendEacp::SetCubeImageFilterAndRepeat( const idImage *image ) {
+	// Nothing here either, but the cube's own rule is not the same as the 2D
+	// one and it does not disappear - it moves. The GL version forces
+	// GL_CLAMP_TO_EDGE whatever the material declared, because "no other clamp
+	// mode makes sense" across a seam; here the address mode is baked into a
+	// shader, so forcing it is choosing which compiled variant the draw goes
+	// through. R_EacpSampling in RenderProgs_Eacp.cpp is where that happens.
 }
 
 void idRenderBackendEacp::RefreshImageFilter( const idImage *image ) {

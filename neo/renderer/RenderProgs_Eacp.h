@@ -36,6 +36,11 @@ header pulled in after it, and eacp's headers are full of standard ones.
 
 class idImage;
 
+// common->Warning, reached through a function because this header cannot see
+// Doom 3's own - see the note above. Its one caller is the variant lookup
+// below, which is a template and so has to live here.
+void R_EacpShaderCompileFailed( const char *what );
+
 /*
 ================================================================================
 
@@ -273,6 +278,215 @@ private:
 /*
 ================================================================================
 
+	What a stage that is not TG_EXPLICIT samples its cube map with.
+
+	Doom 3 has four cube texgens and this has three, because two of them are one
+	program: TG_SKYBOX_CUBE is TG_WOBBLESKY_CUBE whose matrix is the identity,
+	and R_LocalPointToGlobal through an identity 3x3 returns the vector it was
+	given, bit for bit. So the wobble costs the sky three dot products per vertex
+	and saves a program.
+
+	The fourth, TG_REFLECT_CUBE, is two programs rather than one - the material
+	either has a bump stage or it does not, and RB_PrepareStageTexturing picks
+	`bumpyEnvironment.vfp` or `environment.vfp` on exactly that test. Only the
+	unbumped one is here; the other is idEacpBumpyReflectProgram below, because
+	it samples a second texture and works in a different space.
+
+================================================================================
+*/
+
+enum eacpCubeTexgen_t {
+	// TG_SKYBOX_CUBE and TG_WOBBLESKY_CUBE: the vector from the eye to the
+	// vertex, in model space, turned by a 3x3 the frontend rebuilds every frame
+	// for the wobble and left as the identity for the plain sky.
+	ECT_SKY,
+
+	// TG_DIFFUSE_CUBE: the vertex normal, straight through.
+	ECT_DIFFUSE,
+
+	// TG_REFLECT_CUBE on a material with no bump stage: environment.vfp.
+	ECT_REFLECT
+};
+
+/*
+================================================================================
+
+	idEacpCubeProgram
+
+	The generic material stage again, with the texture coordinate computed
+	rather than read - a sky, a reflection or a diffuse cube instead of a
+	surface's own (s, t).
+
+	It is a program beside idEacpStageProgram rather than a variant of it, and
+	the reason is eacp's rather than a preference. A shader's textures are
+	declared by the uniform members it lists, all of them, whether define()
+	samples them or not - so a stage program that grew a TextureCube would
+	declare one on every TG_EXPLICIT variant too, and Metal's validation layer
+	rejects a draw with a declared texture left unbound. The four samplings times
+	the alpha test that step 4c compiled therefore stay exactly what they were,
+	which is also what keeps every gate frame without cube content byte-identical.
+
+	Three of Doom 3's four cube texgens go through the fixed-function pipeline
+	rather than an ARB program, so their colour is the ordinary
+	(modulate, add) pair. The fourth, ECT_REFLECT, is environment.vfp, where the
+	fragment program replaces the texture-env combiner outright - so the second
+	texture unit the fixed-function path binds the white image on has no effect
+	and the colour is `vertex.color` alone. The caller is what knows the
+	difference; this end of it is the same two uniforms either way.
+
+================================================================================
+*/
+
+class idEacpCubeProgram : public eacp::GPU::ShaderProgram {
+public:
+							idEacpCubeProgram( eacpCubeTexgen_t texgen,
+											   eacp::GPU::TextureSampling sampling );
+
+	virtual void			define( void ) override;
+
+	eacp::GPU::Uniform<eacp::GPU::Float4x4>		modelViewProjection;
+
+	// The eye in the surface's own coordinates, which is R_SkyboxTexGen's
+	// localViewOrigin and environment.vfp's program.env[5]. Unread by
+	// ECT_DIFFUSE, whose coordinate is the normal and depends on nothing else.
+	eacp::GPU::Uniform<eacp::GPU::Float4>		localViewOrigin;
+
+	// R_WobbleskyTexGen's 3x3, in the 4x4 Doom 3 writes it as - and the identity
+	// for a plain skybox, which is what makes the two one program. Read by
+	// ECT_SKY alone.
+	eacp::GPU::Uniform<eacp::GPU::Float4x4>		texgenMatrix;
+
+	eacp::GPU::Uniform<eacp::GPU::Float4>		colorModulate;
+	eacp::GPU::Uniform<eacp::GPU::Float4>		colorAdd;
+
+	eacp::GPU::Uniform<eacp::GPU::TextureCube>	cubeImage;
+
+	EACP_SHADER( modelViewProjection, localViewOrigin, texgenMatrix,
+				 colorModulate, colorAdd, cubeImage )
+
+private:
+	eacpCubeTexgen_t		texgen;
+};
+
+/*
+================================================================================
+
+	idEacpBumpyReflectProgram
+
+	bumpyEnvironment.vfp: TG_REFLECT_CUBE on a material that also has a bump
+	stage, which RB_PrepareStageTexturing decides on `GetBumpStage() != NULL`
+	and nothing else.
+
+	It is not environment.vfp with a normal map bolted on - it works in a
+	different space. environment.vfp reflects a model-space eye vector about the
+	model-space vertex normal and samples the cube with the result, so its
+	reflection turns with the object; this one carries both into *global* space
+	first, through the three rows of the model matrix the vertex program is
+	handed as program.env[6], [7] and [8], and reflects there. That is what lets
+	a bumped surface reflect a cube map that is fixed to the world.
+
+	The normal map is read the way every normal map in this engine is read: x out
+	of the alpha channel, because idImage::GenerateImage swaps red and alpha on
+	upload so that one fragment program serves both the compressed and the
+	uncompressed form. `MOV localNormal.x, localNormal.a` in the original.
+
+	And it writes rgb only - `MOV result.color.xyz, R0` - taking neither the
+	vertex colour nor the stage's constant, which is a difference from
+	environment.vfp beside it and reads like an oversight in the original rather
+	than a decision. It is reproduced rather than corrected.
+
+================================================================================
+*/
+
+class idEacpBumpyReflectProgram : public eacp::GPU::ShaderProgram {
+public:
+							idEacpBumpyReflectProgram( eacp::GPU::TextureSampling cube,
+													   eacp::GPU::TextureSampling bump );
+
+	virtual void			define( void ) override;
+
+	eacp::GPU::Uniform<eacp::GPU::Float4x4>		modelViewProjection;
+
+	// program.env[5]: the eye in the surface's own coordinates.
+	eacp::GPU::Uniform<eacp::GPU::Float4>		localViewOrigin;
+
+	// program.env[6], [7] and [8]: the three rows of the model matrix, which
+	// turn a model-space direction into a global one. Rows rather than a matrix
+	// because the original is three DP3s and because the w each of them carries
+	// is the model's translation, which a direction must not pick up.
+	eacp::GPU::Uniform<eacp::GPU::Float4>		modelRowX;
+	eacp::GPU::Uniform<eacp::GPU::Float4>		modelRowY;
+	eacp::GPU::Uniform<eacp::GPU::Float4>		modelRowZ;
+
+	eacp::GPU::Uniform<eacp::GPU::TextureCube>	cubeImage;
+	eacp::GPU::Uniform<eacp::GPU::Texture2D>	bumpImage;
+
+	EACP_SHADER( modelViewProjection, localViewOrigin,
+				 modelRowX, modelRowY, modelRowZ,
+				 cubeImage, bumpImage )
+};
+
+/*
+================================================================================
+
+	idEacpScreenProgram
+
+	TG_SCREEN and TG_SCREEN2, which are the same texgen written out twice in
+	RB_PrepareStageTexturing - the two branches are identical line for line, so
+	they are one program here and the plan's two entries are one.
+
+	It is the only texgen that needs no cube map. What it computes is where the
+	vertex lands *on the screen*: rows 0, 1 and 3 of modelView x projection,
+	dotted with the vertex, which is the x, y and w of the clip-space position
+	the same vertex is drawn at. So a surface sampling `_currentRender` through
+	it reads the pixel it is about to cover, which is what a refraction or a
+	distortion wants.
+
+	OpenGL says that with three object-linear texgens and a texture matrix over
+	the homogeneous result; here the planes are three uniforms, the matrix is the
+	same two rows every other stage's is, and the divide is the fragment's -
+	which is what a projective texture read is.
+
+	The image is whatever the stage names and is usually `_currentRender`, which
+	step 4e.3 fills in.
+
+================================================================================
+*/
+
+class idEacpScreenProgram : public eacp::GPU::ShaderProgram {
+public:
+							idEacpScreenProgram( eacp::GPU::TextureSampling sampling );
+
+	virtual void			define( void ) override;
+
+	eacp::GPU::Uniform<eacp::GPU::Float4x4>		modelViewProjection;
+
+	// GL_OBJECT_PLANE for S, T and Q: rows 0, 1 and 3 of the same product the
+	// position is transformed by, each dotted with (x, y, z, 1).
+	eacp::GPU::Uniform<eacp::GPU::Float4>		screenPlaneS;
+	eacp::GPU::Uniform<eacp::GPU::Float4>		screenPlaneT;
+	eacp::GPU::Uniform<eacp::GPU::Float4>		screenPlaneQ;
+
+	// The stage's texture matrix, applied to the homogeneous coordinate as GL's
+	// texture matrix is - so these two rows are dotted with (s, t, q, 0) rather
+	// than with (s, t, 1, 0) the way an explicit stage's are.
+	eacp::GPU::Uniform<eacp::GPU::Float4>		textureMatrixS;
+	eacp::GPU::Uniform<eacp::GPU::Float4>		textureMatrixT;
+
+	eacp::GPU::Uniform<eacp::GPU::Float4>		colorModulate;
+	eacp::GPU::Uniform<eacp::GPU::Float4>		colorAdd;
+
+	eacp::GPU::Uniform<eacp::GPU::Texture2D>	image;
+
+	EACP_SHADER( modelViewProjection,
+				 screenPlaneS, screenPlaneT, screenPlaneQ,
+				 textureMatrixS, textureMatrixT,
+				 colorModulate, colorAdd, image )
+};
+
+/*
+================================================================================
+
 	idEacpInteractionProgram
 
 	interaction.vfp, which is the whole of Doom 3's lighting: one light against
@@ -488,6 +702,33 @@ public:
 	stageDraw_t				StageDraw( const idImage *image, int stateBits, int cullType,
 									   bool alphaTest );
 
+	// The same, for a stage whose coordinate is generated rather than read.
+	// Three entry points because they are three programs (see the classes), and
+	// each returns the same pair for the same reason: a null pipeline is a
+	// compile that failed and a draw the caller should skip.
+	struct cubeDraw_t {
+		idEacpCubeProgram *						program;
+		const eacp::GPU::RenderPipeline *		pipeline;
+	};
+
+	cubeDraw_t				CubeDraw( eacpCubeTexgen_t texgen, const idImage *cube,
+									  int stateBits, int cullType );
+
+	struct bumpyReflectDraw_t {
+		idEacpBumpyReflectProgram *				program;
+		const eacp::GPU::RenderPipeline *		pipeline;
+	};
+
+	bumpyReflectDraw_t		BumpyReflectDraw( const idImage *cube, const idImage *bump,
+											  int stateBits, int cullType );
+
+	struct screenDraw_t {
+		idEacpScreenProgram *					program;
+		const eacp::GPU::RenderPipeline *		pipeline;
+	};
+
+	screenDraw_t			ScreenDraw( const idImage *image, int stateBits, int cullType );
+
 	// The same for one light against one surface. Its five images arrive
 	// together because the program samples all five and its sampling variant is
 	// the tuple of what they ask for, not any one of them.
@@ -591,6 +832,97 @@ private:
 	// that vector of pointers with the ownership said out loud: it is a
 	// Vector<OwningPointer<T>>, so the elements go when it does.
 	eacp::OwnedVector<interactionVariant_t>	interactions;
+
+	// The same four fields for a texgen program, said once rather than three
+	// times. A template because that is the whole of what differs between the
+	// three: the key is an int either way, and a library and a list of pipelines
+	// are what any compiled program has.
+	//
+	// interactionVariant_t above is deliberately left as it is. It has the same
+	// shape, and folding it in would be a change to the one program whose output
+	// this step is not allowed to move.
+	template <class Program>
+	struct texgenVariant_t {
+		int											key;
+		std::optional<Program>						program;
+		std::optional<eacp::GPU::ShaderLibrary>		library;
+		eacp::Vector<statePipeline_t>				pipelines;
+	};
+
+	// The lookup those three share, and PipelineFor's sibling: the variant for a
+	// key, compiled the first time it is asked for. `make` is what the program's
+	// constructor wants, which is the one thing the three do not have in common,
+	// so it arrives as a callable rather than as an argument list this would
+	// have to know the shape of.
+	//
+	// NULL if the shader would not compile, and the failed program is dropped so
+	// the next draw asks again rather than dereferencing an empty optional. The
+	// entry stays in the list with no program in it, which is what keeps a broken
+	// shader from being recompiled once per draw for the rest of the run.
+	template <class Program, class Make>
+	texgenVariant_t<Program> *
+							TexgenVariant( eacp::OwnedVector<texgenVariant_t<Program>> &list,
+										   int key, const char *what, Make make ) {
+		texgenVariant_t<Program> *	variant = NULL;
+
+		for ( int i = 0 ; i < list.size() ; i++ ) {
+			if ( list[i]->key == key ) {
+				variant = list[i];
+				break;
+			}
+		}
+
+		if ( !variant ) {
+			variant = &list.createNew();
+
+			variant->key = key;
+			make( variant->program );
+			variant->library.emplace( eacp::GPU::Device::shared(),
+									  variant->program->source() );
+
+			if ( !variant->library->isValid() ) {
+				R_EacpShaderCompileFailed( what );
+				variant->program.reset();
+			}
+		}
+
+		return variant->program.has_value() ? variant : NULL;
+	}
+
+	// The two counters over any of those caches - the loops NumPrograms and
+	// NumPipelines run over the interaction one, said once for the three that
+	// came after it.
+	template <class Program>
+	int						CountPrograms( const eacp::OwnedVector<texgenVariant_t<Program>> &list ) const {
+		int	total = 0;
+
+		for ( int i = 0 ; i < list.size() ; i++ ) {
+			if ( list[i]->program.has_value() ) {
+				total++;
+			}
+		}
+
+		return total;
+	}
+
+	template <class Program>
+	int						CountPipelines( const eacp::OwnedVector<texgenVariant_t<Program>> &list ) const {
+		int	total = 0;
+
+		for ( int i = 0 ; i < list.size() ; i++ ) {
+			total += list[i]->pipelines.size();
+		}
+
+		return total;
+	}
+
+	// The three texgen caches. Each key packs what the program is compiled
+	// against and nothing else: the cube's is its texgen and its sampling, the
+	// bumpy reflect's is its two samplings, and the screen's is its one - so the
+	// key spaces are 12, 16 and 4, of which the demo's first level reaches three.
+	eacp::OwnedVector<texgenVariant_t<idEacpCubeProgram>>			cubes;
+	eacp::OwnedVector<texgenVariant_t<idEacpBumpyReflectProgram>>	bumpyReflects;
+	eacp::OwnedVector<texgenVariant_t<idEacpScreenProgram>>			screens;
 
 	// The shadow program, which has no variants - see the class. What it does
 	// have is more pipelines than either of the others per program: the count

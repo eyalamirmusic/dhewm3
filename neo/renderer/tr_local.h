@@ -1200,6 +1200,19 @@ bool R_CreateLightingCache( const idRenderEntityLocal *ent, const idRenderLightL
 void R_CreatePrivateShadowCache( srfTriangles_t *tri );
 void R_CreateVertexProgramShadowCache( srfTriangles_t *tri );
 
+// The 3x3 R_WobbleskyTexGen turns a surface's sky coordinates by, on its own.
+//
+// It was inside that generator and had no other caller, because on OpenGL the
+// only thing that ever wanted it was the loop that applied it to every vertex on
+// the CPU. A backend that generates the coordinate in a shader wants the matrix
+// instead, so it is a function now and the generator calls it - which leaves the
+// generator producing the same numbers it always did.
+//
+// floatTime is a parameter rather than read off tr.viewDef because the two
+// callers are on opposite sides of the frontend/backend split and do not
+// necessarily have the same view in hand.
+void R_WobbleskyTransform( const drawSurf_t *surf, float floatTime, float transform[16] );
+
 /*
 ============================================================
 
