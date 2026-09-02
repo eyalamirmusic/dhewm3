@@ -67,14 +67,13 @@ typedef struct srfTriangles_s srfTriangles_t;
 class idImage;
 
 // Which of the frontend's paths a backend consumes. Doom 3 had one per family
-// of hardware and has one left on OpenGL, the others having been deleted long
-// before this port; the port adds a second. It is not only a backend's own
+// of hardware; all but ARB2 were deleted long before this port, and step 5
+// deleted that one too, so there is one left. It is not only a backend's own
 // business, which is why it is named out here: the *frontend* branches on
 // tr.backEndRendererHasVertexPrograms in tr_light.cpp and tr_stencilshadow.cpp
 // and builds different data accordingly, so it has to be told which one is
 // running.
 typedef enum {
-	BE_ARB2,
 	BE_EACP,
 	BE_BAD
 } backEndName_t;
@@ -131,7 +130,7 @@ public:
 	virtual void			SetDrawBuffer( int buffer ) = 0;
 
 	// Present. Does not include the frame's own end-of-frame work - the
-	// renderer still drives ImGui and r_finish around this.
+	// renderer still drives ImGui around this.
 	virtual void			SwapBuffers( void ) = 0;
 
 	// The GLS_* bitfield from tr_local.h: blend, depth func, depth and colour

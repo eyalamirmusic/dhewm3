@@ -249,8 +249,10 @@ static void R_CheckCvars( void ) {
 
 	if ( r_gammaInShader.IsModified() ) {
 		r_gammaInShader.ClearModified();
-		// reload shaders so they either add or remove the code for setting gamma/brightness in shader
-		R_ReloadARBPrograms_f( idCmdArgs() );
+		// This used to reload every ARB program off disk here, so that they
+		// picked up or dropped the gamma code. There are no ARB programs; the
+		// eacp backend reads r_gammaInShader per frame instead
+		// (RenderBackend_Eacp.cpp), so there is nothing to rebuild.
 
 		if ( r_gammaInShader.GetBool() ) {
 			common->Printf( "Will apply r_gamma and r_brightness in shaders\n" );
@@ -521,27 +523,27 @@ Check for changes in the back end renderSystem, possibly invalidating cached dat
 ==================
 */
 void idRenderSystemLocal::SetBackEndRenderer() {
-	if ( !r_renderer.IsModified() ) {
+	// The backend's, because it is the only thing that knows. This used to be
+	// gated on r_renderer.IsModified() - a cvar that chose between one path per
+	// family of hardware, and had been a dirty flag and nothing else for as
+	// long as both of its values named the same path. What replaces it is the
+	// question the cvar was standing in for: does tr.backEndRenderer already
+	// say what the backend says? BeginFrame calls this every frame and gets the
+	// early-out; R_InitOpenGL clears backEndRenderer to BE_BAD first, so it
+	// does not.
+	const backEndName_t path = renderBackend->Path();
+	if ( backEndRenderer == path && path != BE_BAD ) {
 		return;
 	}
 
 	bool oldVPstate = backEndRendererHasVertexPrograms;
 
-	// The backend's, because it is the only thing that knows. r_renderer used
-	// to choose between one path per family of hardware; both values it still
-	// takes named the same path long before this port, so asking it decided
-	// nothing.
-	backEndRenderer = renderBackend->Path();
+	backEndRenderer = path;
 
 	backEndRendererHasVertexPrograms = false;
 	backEndRendererMaxLight = 1.0;
 
 	switch( backEndRenderer ) {
-	case BE_ARB2:
-		common->Printf( "using ARB2 renderSystem\n" );
-		backEndRendererHasVertexPrograms = true;
-		backEndRendererMaxLight = 999;
-		break;
 	case BE_EACP:
 		common->Printf( "using eacp renderSystem\n" );
 		backEndRendererHasVertexPrograms = true;
@@ -560,8 +562,6 @@ void idRenderSystemLocal::SetBackEndRenderer() {
 			primaryWorld->FreeInteractions();
 		}
 	}
-
-	r_renderer.ClearModified();
 }
 
 /*
@@ -643,11 +643,9 @@ void idRenderSystemLocal::BeginFrame( int windowWidth, int windowHeight ) {
 	cmd->commandId = RC_SET_BUFFER;
 	cmd->frameCount = frameCount;
 
-	if ( r_frontBuffer.GetBool() ) {
-		cmd->buffer = (int)GL_FRONT;
-	} else {
-		cmd->buffer = (int)GL_BACK;
-	}
+	// r_frontBuffer used to send GL_FRONT here, to watch a frame being built.
+	// Front-buffer rendering is OpenGL's own idea and no backend left has it.
+	cmd->buffer = (int)GL_BACK;
 }
 
 void idRenderSystemLocal::WriteDemoPics() {

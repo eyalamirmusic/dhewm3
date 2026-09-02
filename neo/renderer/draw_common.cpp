@@ -32,7 +32,6 @@ If you have questions concerning this license or the applicable additional terms
 #include "renderer/tr_local.h"
 
 extern idCVar r_useCarmacksReverse;
-extern idCVar r_useStencilOpSeparate;
 
 /*
 =====================
@@ -154,81 +153,11 @@ void RB_PrepareStageTexturing( const shaderStage_t *pStage,  const drawSurf_t *s
 		qglTexGenfv( GL_Q, GL_OBJECT_PLANE, plane );
 	}
 
-	if ( pStage->texture.texgen == TG_GLASSWARP ) {
-		if ( tr.backEndRenderer == BE_ARB2 /*|| tr.backEndRenderer == BE_NV30*/ ) {
-			qglBindProgramARB( GL_FRAGMENT_PROGRAM_ARB, FPROG_GLASSWARP );
-			qglEnable( GL_FRAGMENT_PROGRAM_ARB );
-
-			GL_SelectTexture( 2 );
-			globalImages->scratchImage->Bind();
-
-			GL_SelectTexture( 1 );
-			globalImages->scratchImage2->Bind();
-
-			qglEnable( GL_TEXTURE_GEN_S );
-			qglEnable( GL_TEXTURE_GEN_T );
-			qglEnable( GL_TEXTURE_GEN_Q );
-
-			float	mat[16], plane[4];
-			myGlMultMatrix( surf->space->modelViewMatrix, backEnd.viewDef->projectionMatrix, mat );
-
-			plane[0] = mat[0];
-			plane[1] = mat[4];
-			plane[2] = mat[8];
-			plane[3] = mat[12];
-			qglTexGenfv( GL_S, GL_OBJECT_PLANE, plane );
-
-			plane[0] = mat[1];
-			plane[1] = mat[5];
-			plane[2] = mat[9];
-			plane[3] = mat[13];
-			qglTexGenfv( GL_T, GL_OBJECT_PLANE, plane );
-
-			plane[0] = mat[3];
-			plane[1] = mat[7];
-			plane[2] = mat[11];
-			plane[3] = mat[15];
-			qglTexGenfv( GL_Q, GL_OBJECT_PLANE, plane );
-
-			GL_SelectTexture( 0 );
-		}
-	}
+	// TG_GLASSWARP was handled here, by binding the glasswarp fragment program.
+	// That is the ARB2 path's, and there is no ARB2 path.
 
 	if ( pStage->texture.texgen == TG_REFLECT_CUBE ) {
-		if ( tr.backEndRenderer == BE_ARB2 ) {
-			// see if there is also a bump map specified
-			const shaderStage_t *bumpStage = surf->material->GetBumpStage();
-			if ( bumpStage ) {
-				// per-pixel reflection mapping with bump mapping
-				GL_SelectTexture( 1 );
-				bumpStage->texture.image->Bind();
-				GL_SelectTexture( 0 );
-
-				qglNormalPointer( GL_FLOAT, sizeof( idDrawVert ), ac->normal.ToFloatPtr() );
-				qglVertexAttribPointerARB( 10, 3, GL_FLOAT, false, sizeof( idDrawVert ), ac->tangents[1].ToFloatPtr() );
-				qglVertexAttribPointerARB( 9, 3, GL_FLOAT, false, sizeof( idDrawVert ), ac->tangents[0].ToFloatPtr() );
-
-				qglEnableVertexAttribArrayARB( 9 );
-				qglEnableVertexAttribArrayARB( 10 );
-				qglEnableClientState( GL_NORMAL_ARRAY );
-
-				// Program env 5, 6, 7, 8 have been set in RB_SetProgramEnvironmentSpace
-
-				qglBindProgramARB( GL_FRAGMENT_PROGRAM_ARB, FPROG_BUMPY_ENVIRONMENT );
-				qglEnable( GL_FRAGMENT_PROGRAM_ARB );
-				qglBindProgramARB( GL_VERTEX_PROGRAM_ARB, VPROG_BUMPY_ENVIRONMENT );
-				qglEnable( GL_VERTEX_PROGRAM_ARB );
-			} else {
-				// per-pixel reflection mapping without a normal map
-				qglNormalPointer( GL_FLOAT, sizeof( idDrawVert ), ac->normal.ToFloatPtr() );
-				qglEnableClientState( GL_NORMAL_ARRAY );
-
-				qglBindProgramARB( GL_FRAGMENT_PROGRAM_ARB, FPROG_ENVIRONMENT );
-				qglEnable( GL_FRAGMENT_PROGRAM_ARB );
-				qglBindProgramARB( GL_VERTEX_PROGRAM_ARB, VPROG_ENVIRONMENT );
-				qglEnable( GL_VERTEX_PROGRAM_ARB );
-			}
-		} else {
+		{
 			qglEnable( GL_TEXTURE_GEN_S );
 			qglEnable( GL_TEXTURE_GEN_T );
 			qglEnable( GL_TEXTURE_GEN_R );
@@ -276,46 +205,11 @@ void RB_FinishStageTexturing( const shaderStage_t *pStage, const drawSurf_t *sur
 		qglDisable( GL_TEXTURE_GEN_Q );
 	}
 
-	if ( pStage->texture.texgen == TG_GLASSWARP ) {
-		if ( tr.backEndRenderer == BE_ARB2 /*|| tr.backEndRenderer == BE_NV30*/ ) {
-			GL_SelectTexture( 2 );
-			globalImages->BindNull();
-
-			GL_SelectTexture( 1 );
-			if ( pStage->texture.hasMatrix ) {
-				RB_LoadShaderTextureMatrix( surf->shaderRegisters, &pStage->texture );
-			}
-			qglDisable( GL_TEXTURE_GEN_S );
-			qglDisable( GL_TEXTURE_GEN_T );
-			qglDisable( GL_TEXTURE_GEN_Q );
-			qglDisable( GL_FRAGMENT_PROGRAM_ARB );
-			globalImages->BindNull();
-			GL_SelectTexture( 0 );
-		}
-	}
+	// The TG_GLASSWARP teardown was here, matching the setup in
+	// RB_PrepareStageTexturing. Both were the ARB2 path's.
 
 	if ( pStage->texture.texgen == TG_REFLECT_CUBE ) {
-		if ( tr.backEndRenderer == BE_ARB2 ) {
-			// see if there is also a bump map specified
-			const shaderStage_t *bumpStage = surf->material->GetBumpStage();
-			if ( bumpStage ) {
-				// per-pixel reflection mapping with bump mapping
-				GL_SelectTexture( 1 );
-				globalImages->BindNull();
-				GL_SelectTexture( 0 );
-
-				qglDisableVertexAttribArrayARB( 9 );
-				qglDisableVertexAttribArrayARB( 10 );
-			} else {
-				// per-pixel reflection mapping without bump mapping
-			}
-
-			qglDisableClientState( GL_NORMAL_ARRAY );
-			qglDisable( GL_FRAGMENT_PROGRAM_ARB );
-			qglDisable( GL_VERTEX_PROGRAM_ARB );
-			// Fixme: Hack to get around an apparent bug in ATI drivers.  Should remove as soon as it gets fixed.
-			qglBindProgramARB( GL_VERTEX_PROGRAM_ARB, 0 ); // FIXME ...
-		} else {
+		{
 			qglDisable( GL_TEXTURE_GEN_S );
 			qglDisable( GL_TEXTURE_GEN_T );
 			qglDisable( GL_TEXTURE_GEN_R );
@@ -850,19 +744,12 @@ void RB_STD_T_RenderShaderPasses( const drawSurf_t *surf ) {
 			//
 			//--------------------------
 
-			// completely skip the stage if we don't have the capability
-			if ( tr.backEndRenderer != BE_ARB2 ) {
-				continue;
-			}
-			// or if the program the material named never loaded, which is a
-			// stage this path can no longer draw: the handles are zero, and
-			// binding program 0 and enabling the target is an error rather than
-			// a no-op. Reachable since the material parser stopped deciding
-			// what a newStage is on these two handles - `shaderDemos/pinch`
-			// asks for `pinch.cg`, which no pk4 ships.
-			if ( !newStage->vertexProgram || !newStage->fragmentProgram ) {
-				continue;
-			}
+			// completely skip the stage if we don't have the capability. Which
+			// is always, now: a newStage names an ARB program pair, the ARB2
+			// path is what loaded them, and step 5 deleted it. The handles are
+			// zero for every stage, and binding program 0 and enabling the
+			// target is an error rather than a no-op.
+			continue;
 			if ( r_skipNewAmbient.GetBool() ) {
 				continue;
 			}
@@ -933,10 +820,12 @@ void RB_STD_T_RenderShaderPasses( const drawSurf_t *surf ) {
 			qglDisableClientState( GL_NORMAL_ARRAY );
 			continue;
 		}
-		else if ( soft_particle 
-				 && surf->particle_radius > 0.0f 
-				 && ( src_blend == GLS_SRCBLEND_ONE || src_blend == GLS_SRCBLEND_SRC_ALPHA ) 
-				 && tr.backEndRenderer == BE_ARB2
+		// The `&& tr.backEndRenderer == BE_ARB2` this used to carry is gone with
+		// that enumerator. The soft particle program below is an ARB program
+		// and nothing loads it any more, the same as the newStage case above.
+		else if ( soft_particle
+				 && surf->particle_radius > 0.0f
+				 && ( src_blend == GLS_SRCBLEND_ONE || src_blend == GLS_SRCBLEND_SRC_ALPHA )
 				 && !r_skipNewAmbient.GetBool() )
 		{
 			// SteveL #3878. Particles are automatically softened by the engine, unless they have shader programs of 
@@ -1236,7 +1125,7 @@ int RB_STD_DrawShaderPasses( drawSurf_t **drawSurfs, int numDrawSurfs ) {
 		isPostProcess = true;
 
 		// only dump if in a 3d view
-		if ( backEnd.viewDef->viewEntitys && tr.backEndRenderer == BE_ARB2 ) {
+		if ( backEnd.viewDef->viewEntitys ) {
 			globalImages->currentRenderImage->CopyFramebuffer( backEnd.viewDef->viewport.x1,
 				backEnd.viewDef->viewport.y1,  backEnd.viewDef->viewport.x2 -  backEnd.viewDef->viewport.x1 + 1,
 				backEnd.viewDef->viewport.y2 -  backEnd.viewDef->viewport.y1 + 1, true );
@@ -1394,7 +1283,9 @@ static void RB_T_Shadow( const drawSurf_t *surf ) {
 
 	// DG: that bloody patent on depth-fail stencil shadows has finally expired on 2019-10-13,
 	//     so use them (see https://patents.google.com/patent/US6384822B1/en for expiration status)
-	bool useStencilOpSeperate = r_useStencilOpSeparate.GetBool() && qglStencilOpSeparate != NULL;
+	// r_useStencilOpSeparate said whether to use glStencilOpSeparate when it was
+	// there; the cvar went with the rest of the GL-only ones in step 5.
+	bool useStencilOpSeperate = ( qglStencilOpSeparate != NULL );
 	if( !r_useCarmacksReverse.GetBool() ) {
 		if( useStencilOpSeperate ) {
 			// not using z-fail, but using qglStencilOpSeparate()
@@ -1984,12 +1875,10 @@ void	RB_STD_DrawView( void ) {
 	// subviews
 	RB_STD_FillDepthBuffer( drawSurfs, numDrawSurfs );
 
-	// main light renderer
-	switch( tr.backEndRenderer ) {
-	case BE_ARB2:
-		RB_ARB2_DrawInteractions();
-		break;
-	}
+	// main light renderer. This was a switch on tr.backEndRenderer with one arm
+	// left, BE_ARB2 -> RB_ARB2_DrawInteractions, and that is what step 5
+	// deleted. Nothing calls this function either: its only caller was the GL
+	// backend's DrawView.
 
 	// disable stencil shadow test
 	qglStencilFunc( GL_ALWAYS, 128, 255 );

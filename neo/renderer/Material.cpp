@@ -1067,6 +1067,27 @@ void idMaterial::MultiplyTextureMatrix( textureStage_t *ts, int registers[2][3] 
 
 /*
 =================
+R_FindARBProgram
+
+draw_arb2.cpp used to load the named .vfp off disk here, at parse time, and
+return the GL program object it had bound it to. Step 5 deleted that file with
+the rest of the ARB2 path, and this is what is left of it: the two handles a
+newStage carries are an ARB program's, so a backend that draws them some other
+way has no use for either, and every backend this tree has left is one of those.
+
+The parse stays exactly as it was rather than being cut back to what still
+matters, because a newStage material has to come out of this function the same
+shape it did before - which is what the regression gate is measuring. What
+decides whether a stage *is* a newStage is the program's name beside these,
+which the parser records and the backend reads.
+=================
+*/
+static int R_FindARBProgram( GLenum target, const char *program ) {
+	return 0;
+}
+
+/*
+=================
 idMaterial::ParseStage
 
 An open brace has been parsed
