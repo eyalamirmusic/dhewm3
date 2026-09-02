@@ -123,7 +123,7 @@ void View::render(GPU::Frame& frame)
     // update() is the wrong side of that: eacp hands a Frame to render() and to
     // nothing else.
     //
-    // What the engine sees is unchanged. sys/linux/main.cpp runs this in a
+    // What the engine sees is unchanged. Doom 3's own host ran this in a
     // `while (1)` and idCommonLocal::Frame sleeps at the end of it to hold
     // 60Hz; here the display link is the thing that waits, and the engine is
     // told not to sleep on top of it (sys/eacp/GLimp.cpp).
