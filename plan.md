@@ -48,10 +48,14 @@ too, and was never the port's: it is the level's dropship headlight, drawn by
 both builds at the same instant, and what was wrong was a reproducer that
 compared two different moments. Then step 5 deleted the renderer all of that was
 measured against, which is why every number above is written in the past tense
-and cannot be taken again. Three things are open beside the Windows host: the
-soft-particle program, which needs eacp gap 24 opened before it and which the
-gate cannot see either way; an ImGui backend for the eacp host, which is what
-would light the F10 settings menu back up; and gap 20's multisampling.**
+and cannot be taken again. Two things are open beside the Windows host: an ImGui
+backend for the eacp host, which is what would light the F10 settings menu back
+up; and gap 20's multisampling. Step 6 took the third off that list, and eacp
+gap 24 with it: the soft-particle program (#3878) draws on this backend, off a
+depth buffer eacp can now be asked to make sampleable. The gate is 297 of 297
+identical either way, which is what 4e.8 said it would be, so the picture is
+measured at ten pinned cameras instead — seven of them move, the largest by
+0.59 of 255.**
 
 Reference implementation for almost everything on the platform side:
 `~/Code/PureDOOM/examples/EACP` — a complete engine hosted on eacp, with its own
@@ -366,10 +370,13 @@ fills `_currentRender` has to end the pass, and everything drawn after it has to
 be occluded by the depth buffer that pass was writing. **And 5 is closed by step
 4e.5**, the one entry on the list that was written before the port began and
 survived to be needed exactly as written: the Mars sky and every pane of glass
-in the demo's first level sample a cube map. 23 and 24 are the same sentence
-still being true two rounds later — both were found by looking at content, and
-24 is the only entry here that stands between this port and a feature it has
-decided to keep.
+in the demo's first level sample a cube map. **And 24 is closed by step 6**, the
+one entry here that stood between this port and a feature it had decided to
+keep: a render target's depth can be asked for sampleable now, and the soft
+particles draw. 23 is what is left of the pair those two made, both having been
+found by looking at content rather than by reading eacp. 25 is what closing 24
+left behind: the drawable's own depth buffer still cannot be sampled, so the
+answer to "can I read my own depth" now depends on where the app is drawing.
 
 Numbers are never reused, so a hole is an entry that closed.
 
@@ -666,39 +673,76 @@ Numbers are never reused, so a hole is an entry that closed.
     a chain the caller built, and eacp's own builder becoming the default
     rather than the only way.
 
-24. **A pass's depth attachment cannot be sampled, and there is no depth format
-    to copy it into.** `Texture-Apple.mm:130-144` creates the depth texture a
-    render-target texture attaches with `usage = MTLTextureUsageRenderTarget`
-    and `storageMode = MTLStorageModePrivate` — no `MTLTextureUsageShaderRead`,
-    so Metal refuses to let a shader sample it, whatever
-    `Texture::nativeDepthTexture()` hands out. And there is nothing to blit it
-    into either: `TextureFormat` is `RGBA8Unorm, BGRA8Unorm, R8Unorm, RG8Unorm,
-    RGBA16Float, RGBA32Float` and has no depth member at all.
+24. ~~**A pass's depth attachment cannot be sampled, and there is no depth format
+    to copy it into.**~~ — **closed**, and kept because which of its two proposed
+    answers turned out to be the real one is the finding.
 
-    **Open, and needed after step 5.** What wants it is the soft-particle
-    program (#3878), the last thing in §8's 4e.8 basket that is worth doing:
-    it fades a particle out where it meets the surface behind it, which means
-    reading the depth buffer, which is what `CopyDepthbufferToImage` is an
-    empty function for on this backend
-    (`RenderBackend_Eacp.cpp:4198-4206`). Roughly half of Doom 3's base
-    particle stages qualify for the softening by geometry — 702 of 1332 over
-    the pk4's 32 `.prt` files — so this is a per-frame quality difference on
-    most of the game's atmosphere rather than an edge case, and it is dhewm3's
-    own improvement rather than id's.
+    They are not alternatives. eacp has no blit and a copy here is a *draw*, so a
+    copy of the depth has to **sample** the attachment whatever format it is
+    going to: the second answer needs the first, and once the first exists the
+    second is not wanted at all, the copy landing in an ordinary colour texture.
 
-    It is unlike every other gap on this list in one way worth saying: nothing
-    in the gate can see it, before or after. `r_useSoftParticles 0` and even
-    `r_skipParticles 1` move nothing beyond the SDL/GL build's own
-    capture-to-capture noise over the whole 297-frame tour, so this is the one
-    piece of the port that will have to be verified by looking at it. **And step
-    5 has now deleted the build that noise belonged to**, so there is no second
-    renderer to hold the result up against either — which is a reason to do it
-    carefully rather than a reason not to, and was known and accepted when the
-    order was chosen (§8).
+    Found by 4e.3 arriving at an empty `CopyDepthbufferToImage`, named by 4e.8,
+    and closed by step 6. `TextureDescriptor::sampleableDepth` is the flag, and
+    the shader slot that can read one is the other half:
+    `ShaderBuilder::depthTexture()`, `RenderPass::setFragmentDepthTexture` — which
+    takes the render *target*, a depth attachment having no existence apart from
+    the colour texture it was made with — and a `sample()` that gives back a
+    **`Float` rather than a `Float4`**. That last is the one place this differs
+    from the cube-texture commit it otherwise follows: a cube changes only the
+    declaration the emitter prints, where a depth slot changes the *type* of the
+    node the sample produces, `depth2d<float>` and `Texture2D<float>` each having
+    exactly one channel.
 
-    The shape of a fix is small on both sides: the depth usage and a depth
-    member on `TextureFormat` in eacp, then `CopyDepthbufferToImage` and one
-    program with two textures here.
+    **It is a flag rather than the default because the two backends charge
+    differently for it.** On Metal it is one usage bit on a texture that was
+    already private and already stored. On D3D12 one resource cannot carry two
+    fully-typed views, so the buffer becomes `R32_TYPELESS` with the DSV naming
+    `D32_FLOAT` and an SRV naming `R32_FLOAT` — a shader-visible descriptor, and
+    a barrier pair, because the resource no longer rests in `DEPTH_WRITE` for its
+    whole lifetime the way every other depth buffer here does. Gap 22's shape
+    again: the backends differ in the cost, not the meaning.
+
+    `TextureFormat::R32Float` went in beside it, and it is not incidental — it is
+    the format a depth copy has to land in. A window depth spends its range in
+    the last thousandth, where eight bits have one value to offer and a half
+    float about one; the number this has to keep apart from the far plane is the
+    soft-particle shader's own 0.9994 clamp.
+
+    On eacp `main` at `e652e7a` plus this change, with the full suite at **1332
+    tests, all passing** and the GPU half (265 of them) clean under
+    `MTL_DEBUG_LAYER=1` with `MTL_SHADER_VALIDATION=1` and GPU validation.
+    `Tests/GPU/DepthTextureTests.cpp` pins all three claims: that a target says
+    whether its depth can be sampled and that asking for depth is *not* asking
+    for that, that a later pass on the same frame reads back the clip-space z an
+    earlier pass wrote where a quad covered the target and the far plane where
+    none did, and that an R32Float target hands back 0.9994 rather than 1. The
+    D3D12 half is written and unrun, the eacp host being macOS-only (§8).
+
+    **The eacp change itself is uncommitted.** It stands in the `~/Code/eacp`
+    working tree awaiting the user's own commit — eacp's rules do not let an
+    agent commit there — so `e652e7a` is the parent it applies to rather than
+    the SHA that carries it, and this entry will record that SHA once it exists.
+
+25. **The drawable's depth buffer still cannot be sampled, only a texture
+    target's.** Step 6 closed gap 24 by letting a
+    `TextureDescriptor::renderTarget` ask for `sampleableDepth`, but
+    `GPUView::setDepth` creates the drawable's own depth attachment with
+    `usage = MTLTextureUsageRenderTarget` and nothing else, and
+    `OffscreenTarget::depthTexture` is a raw handle with no descriptor behind it
+    — so an app that renders straight to the drawable, which is what every eacp
+    app and this port before step 4e.1 does, cannot read the depth it just wrote.
+
+    **Nothing in this port wants it**, everything having gone through the frame
+    target since 4e.1, which is why it is a gap rather than a defect. What it
+    costs is that the answer to "can I read my own depth" now depends on where
+    the app happens to be drawing, which is the kind of asymmetry an API is
+    better without. It is also not free to close on the drawable: a multisampled
+    drawable's depth is a multisample texture, and sampling one is a different
+    declaration again (gap 20's neighbourhood).
+
+    A fix would be a `depth` flag beside `GPUView::setDepth`'s existing one, or
+    the drawable's depth exposed as a `Texture` the same way a target's is.
 
 ### Checked, and *not* gaps
 
@@ -2921,6 +2965,176 @@ comments, and it is the sole definer of all eleven `Sys_*` threading entry
 points and of `struct sysThread_t`. Deleting it would have unbuilt the port. It
 is one of the files this port *keeps*.
 
+#### Step 6 — soft particles, and gap 24 — **done**
+
+The last program in Doom 3 this backend did not have, and the first thing since
+step 5 that needed eacp opened before it could be written. #3878 fades a particle
+out where it meets the surface behind it, which means reading the depth buffer —
+and #3877's early depth capture is what puts that buffer somewhere a shader can
+read it. Both halves survived step 5 intact on the engine side;
+`CopyDepthbufferToImage` was the empty function they arrived at.
+
+**Gap 24 offered two answers and only one of them exists.** The entry proposed
+either making the depth attachment sampleable or adding a depth `TextureFormat`
+to blit it into. They are not alternatives: eacp has no blit, a copy on this
+stack is a *draw*, and a draw that copies depth has to **sample** the attachment
+whatever format it is going to. So the first answer is the whole of it, and once
+it exists the second is not needed at all — the copy lands in an ordinary colour
+texture. `TextureDescriptor::sampleableDepth` is the flag,
+`ShaderBuilder::depthTexture()` is the slot that reads one, and
+`RenderPass::setFragmentDepthTexture` is the bind — which takes the *render
+target* rather than a texture, a depth attachment being created with its colour
+texture and having no separate existence to hand out.
+
+It is a flag rather than the default, and the reason is entirely D3D12's. On
+Metal it is one usage bit — `MTLTextureUsageShaderRead` on a texture that was
+already `Private` and, since 4e.3's `DepthAction::Keep`, already stored — so a
+target that asks for it and one that does not are the same allocation. On D3D12
+one resource cannot carry two fully-typed views, so a sampleable depth buffer is
+created `R32_TYPELESS` with the DSV naming `D32_FLOAT` and a second SRV naming
+`R32_FLOAT`; that costs a shader-visible descriptor and, because the resource no
+longer rests in `DEPTH_WRITE` for its whole lifetime, a barrier out of it at the
+bind and back at the next pass that attaches it. Same shape as gap 22: the
+backends differ in what the flag *costs* rather than in what it means.
+
+**The EDSL grew a third kind of texture slot, and one thing about it is not the
+cube commit's shape.** With a cube, only the declaration the emitter prints
+changes — `t.sample(s, uv)` reads both kinds and the coordinate's width decides
+which. With a depth slot the sample's **type** changes as well:
+`depth2d<float>` on Metal and `Texture2D<float>` on HLSL each hand back one float
+where a colour texture hands back four. So `sample()` returns a `Float` and
+`ShaderGraph::addDepthSample` records `ValueType::Float` on the node; everything
+downstream reads the node's type, and that one line is what keeps the generated
+MSL and the generated HLSL both compiling.
+
+`TextureFormat::R32Float` went in beside it and is not a bonus. A window depth is
+0 at the near plane and 1 at the far one with almost every surface in the last
+thousandth of that range; the number the original clamps to is 0.9994, which
+stands for thirty thousand units and which eight bits and a half float both round
+to 1. One full-precision channel is what a depth copy has to land in.
+
+**In the port, the capture is 4e.3's copy one plane along.** `FillDepthBuffer`
+ends by copying the frame target's depth into `_currentDepth`, which suspends the
+frame's pass and resumes it — the attachment being read belongs to the pass doing
+the reading, and no API allows that. The condition is the deleted backend's,
+character for character: `r_enableDepthCapture == 1`, or `-1` with
+`r_useSoftParticles` on. **What `-1` resolved to is "on"** — the cvar defaults to
+`-1` and `r_useSoftParticles` to `1`, so the SDL/GL build captured depth out of
+the box; and the frontend half of #3878 that step 5 left standing (`tr_light.cpp`
+flags a particle surface and gives it a softening radius on the same condition)
+has been running on this build all along. Only the two things the backend owed
+were missing.
+
+**Two things about the destination are deliberately not the original's.**
+`_currentDepth` is the frame target's own size rather than a power-of-two
+allocation, and the region is copied *where it already is* rather than into the
+corner. That is not tidying. `glCopyTexImage2D` puts the viewport's bottom row at
+the texture's row 0 while the fragment program looks the depth up by absolute
+window position, so the original's lookup is off by the viewport origin wherever
+that is not zero — which is every subview and every mirror. Here the copy is 1:1
+with the target and the program's `depthScaleBias` carries the viewport's origin
+as well as its size, so **a mirror's particles read the mirror's own depth**
+(4e.4 gave each 3D view a pass of its own, and each of those clears its own depth
+plane). The power-of-two dance 4e.3 kept for `_currentRender` was kept because
+`uploadWidth` is what the shared code scales screen coordinates by; nothing above
+the seam reads `_currentDepth`'s, `RB_SetProgramEnvironment` having gone with the
+ARB path.
+
+**The program itself is TheDarkMod 2.04's, ported rather than redesigned.** The
+constants `{ 0.33333333, -0.33316667 }` recover a view-space depth in Doom units
+from a window depth, and they are hard-coded here as they are there: they are
+`R_SetupProjection`'s matrix at `r_znear` 3, written out — a window depth `d`
+comes back as `3 / (d - 0.9995)`. That they are still exact on this backend is
+worth saying rather than assuming: `R_EacpModelViewProjection` maps clip z by
+`(z + w) / 2`, which is precisely what OpenGL's own `[-1, 1]` to `[0, 1]`
+viewport transform does, so the window depth the two renderers write is the same
+number. The 0.9994 clamp (the original's guard for caulk sky, which writes no
+depth and leaves the far plane's 1 behind), the asymmetric fade range — a
+particle's diameter for an alpha blend and its radius for an additive one, "fog
+is half as apparent when a wall is in the middle of it" — the channel mask added
+before the multiply, the near fade, and dhewm3's own texture-matrix addition to
+the vertex half are all line for line.
+
+The one thing it does *not* take is the gamma correction, and that is stated in
+the original rather than inferred: `soft_particle.vfp` carries
+`nodhewm3gammahack` so `R_LoadARBProgram` leaves it alone, "because that looks
+bad when rendered with additive blending (gets too bright)". So it derives from
+`ShaderProgram` rather than from `idEacpGammaProgram`, exactly as the generic
+stage does.
+
+The screen coordinate is rebuilt out of a varying and divided by w, which is
+`idEacpHeatHazeProgram`'s trick and is exact rather than approximate — a varying
+is interpolated with w already divided out, so the quotient is the normalized
+device coordinate at that fragment. This one carries z as well as x and y,
+because it needs the fragment's own depth to compare against the buffer's.
+
+**Measured on the gate: 297 of 297 identical against `step5-c13b`,** on two
+captures of the build, which are also identical to each other. That is the
+expected result and not a null one. 4e.8 established that soft particles are
+invisible to this tour — `r_useSoftParticles 0` moved nothing over 297 frames,
+five emitters reach the soft branch and none contributes a visible pixel at a
+captured instant — so what 297/297 says here is the other thing: **a second
+suspension of the frame's pass per view, on top of 4e.3's, costs the existing
+picture nothing.**
+
+**So this was verified by looking at it, which is what gap 24's entry promised.**
+Ten pinned cameras in `demo_mars_city1`, at the six particle emitters the level
+itself places — read out of the `.map` — with `com_fixedTic 1` and a scratch
+`fs_savepath` and `fs_configpath`, at 640x480 asked for and 2048x1536 written:
+
+| camera | what it looks at | mean of 255 | worst channel | pixels moved |
+| --- | --- | --- | --- | --- |
+| cam10 `-230 -1820 60 90` | `mc1_understeam` over a floor grate | **0.5866** | 28 | 841050 |
+| cam02 `-330 -1820 90 90` | the same steam, closer | **0.4171** | 18 | 782076 |
+| cam01 `-300 -1939 116 90` | the same steam, down the corridor | **0.1284** | 34 | 248176 |
+| cam04 `-2740 -1740 130 270` | `mc1_hotgrate`, a lit plume | 0.0188 | **147** | 9898 |
+| cam03 `-192 -1650 260 90` | `marscity_smoke` | 0.0061 | 18 | 4903 |
+| cam07 `-2369 -2560 300 270` | `delta2b_fridgefog` | 0.0004 | 6 | 726 |
+| cam06 `-2589 -2480 300 270` | `mc1_exhaustvent` | 0.0004 | 2 | 1056 |
+| cam05, cam08, cam09 | topvent, mirror, sinkdrip | 0.0000 | 0 | 0 |
+| **all ten** | | **0.1158** | 147 | |
+
+`r_useSoftParticles 1` against `0`, same build, same tick. **Seven of the ten
+cameras move and three are byte-identical**, so no soft-particle surface reaches
+those three frames at all — `SetSofteningRadii` gives a stage a radius only if it
+is view-aligned and more than two units across, and a stage without one takes the
+generic path either way.
+
+The number to look at twice is cam04's, which is small and important: 0.0188 of
+255 over the frame with a **worst channel of 147**. The hot grate's plume is a
+few hundred pixels of a dark 2048x1536 image, and where it enters the floor it
+changes by more than half of the range. A mean over a whole frame is the wrong
+instrument for a small bright thing, which is why the worst column is here.
+
+**The noise floor is 0.0003 and it had to be measured rather than assumed.** Two
+runs of one configuration are byte-identical on nine of the ten cameras and
+differ on cam01 by **one level over about 1300 pixels** — 0.0003 of 255. So
+`com_fixedTic 1` is not quite the byte-identical instrument 4e.6 found it to be
+at *its* camera, and the floor is what the differences above have to clear. They
+do: cam10 is 2000 times it and cam01's own 0.1284 with a worst of 34 is not one
+level over anything.
+
+**`r_enableDepthCapture 0` is the same picture as `r_useSoftParticles 0`**, which
+is the check that the switch reaches all the way down rather than only part way:
+0.0003 of 255 with a worst of 1 on cam01 and byte-identical on the other nine —
+the noise floor exactly. And the log agrees: **17 programs and 73 pipelines** with
+either switch off, against **20 and 77** with the feature on — the same 17 and 73
+under both switches, which is what says neither the depth copy nor the particle
+program is even compiled when it is not wanted. The `+3` and `+4` are a net
+figure rather than a decomposition: the depth copy is one of each, and the rest
+is the soft-particle program's reached sampling variants and their pipelines,
+less whatever generic-stage pipelines it took those draws away from.
+
+Clean under `MTL_DEBUG_LAYER=1` with `MTL_SHADER_VALIDATION=1` and GPU
+validation: nothing in the log but the two "Validation Enabled" lines.
+
+**What is not here.** The drawable's own depth buffer, which `GPUView::setDepth`
+still creates render-target-only — §5's gap 25. Nothing in this port wants it,
+everything having gone through the frame target since 4e.1, but the eacp API is
+asymmetric now in a way it was not before. And the eacp side of this step is not
+committed: it waits in the `~/Code/eacp` working tree for the user's own commit,
+which gap 24 says more about.
+
 ### Shader inventory for Phase 2
 
 Roughly 10–15 EDSL programs, each in the sampling variants §4.3 sizes — 8 worst case
@@ -2990,10 +3204,10 @@ rather than a program beside it, compiled lazily:
   (`arbVP_glasswarp.txt`, `arbFP_glasswarp.txt`) are not shipped, so the SDL/GL
   build cannot draw it either and there would be no reference picture to check
   one against.
-- **the soft-particle program (#3878) — after step 5**, blocked on gap 24. Not
-  counted above, and it would be one entry: two textures, the frame's depth and
-  the particle's own image. It is the only program left in Doom 3 that this
-  backend does not have.
+- ~~**the soft-particle program (#3878) — after step 5**, blocked on gap 24~~ —
+  **done**, step 6, and gap 24 closed with it. Not counted above, and it is one
+  entry as predicted: two textures, the frame's depth and the particle's own
+  image. It was the last program in Doom 3 that this backend did not have.
 
 The EDSL earns its keep here: one source per shader covering Metal and D3D12, against
 Doom 3's original two hand-written ARB programs per path.
@@ -3250,7 +3464,7 @@ Phase 2 is the first work that compiles against eacp. In rough order:
          the tour and none of them contributes a visible pixel at any of the
          297 captured instants. So this is the one piece of the port that will
          have to be verified by looking at it, and it is the reason gap 24's
-         entry says so.
+         entry says so. [**Done**, step 6 in §6, and gap 24 with it.]
        - **`r_showTris` and the other `r_show*` — never**, and §7's cut
          stands. `RB_RenderDebugTools` has one caller, at the tail of
          `RB_STD_DrawView`, which only the GL backend calls; the file's 345
@@ -3287,8 +3501,8 @@ Phase 2 is the first work that compiles against eacp. In rough order:
    the program's name beside the two handles, and the eacp backend never reads
    the handles at all. C6 landed the stub at 297/297, `fragmentPrograms` and all.
 
-Three things are open, and none of them is in that order because none of them
-blocks another.
+Two things are open, and neither is in that order because neither blocks the
+other.
 
 **The Windows host.** The port is macOS-only from step 2b (§6), and step 5 made
 that the buildsystem's position rather than an accident: `neo/CMakeLists.txt`
@@ -3328,9 +3542,12 @@ settings menu back up. §7 says what step 5 decided and why the menu was kept
 rather than deleted; the work is a platform backend and a renderer backend
 against `idRenderBackendEacp`, neither of which ImGui ships.
 
-**Soft particles**, behind gap 24. Unchanged by step 5 and still the one piece
-of the port that will have to be verified by looking at it rather than by the
-gate.
+~~**Soft particles**, behind gap 24.~~ — **done**, step 6 in §6, and gap 24 is
+closed with it. It was the last program in Doom 3 this backend did not have, and
+it stays the one piece of the port that was verified by looking at it rather than
+by the gate: 297 of 297 frames identical either way, exactly as 4e.8 predicted,
+and the picture measured instead at ten pinned cameras, where seven move and the
+largest reads 0.59 of 255 against a run-to-run floor of 0.0003.
 
 **Why 4e.8 went before step 5 rather than after it, in one number.** At the
 tour's second camera stop the two builds disagreed by 0.458 of 255, and the heat
