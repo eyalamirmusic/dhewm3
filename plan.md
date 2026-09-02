@@ -757,9 +757,11 @@ Three things it cost to get there, all written up in `regression/README.md`:
   **Reproducible is not correct**, and a comparison harness that writes anywhere
   the program also reads is a feedback loop.
 
-The demo data is already unpacked at `cmake-build-debug/neo/demo/demo00.pk4`
+The demo data is already unpacked at `<build tree>/neo/demo/demo00.pk4`
 (`CMake/DemoData.cmake` fetches it at configure time), so the gate needs no
-retail install.
+retail install. Since step 5 the build tree the gate defaults to is
+`cmake-build-eacp`; the `cmake-build-debug` this was first written against still
+holds the Phase 1 SDL/GL binary, which is what `gate.sh`'s libSDL3 guard is for.
 
 ### Phase 2 — cut the platform layer and the backend together ← **done, apart from the Windows host**
 
