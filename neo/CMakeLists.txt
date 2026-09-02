@@ -545,10 +545,11 @@ set(src_idlib
 
 add_globbed_headers(src_idlib "idlib")
 
+# Dear ImGui core only. Its two backends - the SDL3 platform one and the
+# OpenGL2 renderer one - went with the host they belonged to in step 5, and eacp
+# has no replacement for either yet. The menu is still compiled; sys_imgui.cpp
+# says what it does without them.
 set(src_imgui
-	libs/imgui/backends/imgui_impl_sdl3.cpp
-	libs/imgui/backends/imgui_impl_opengl2.cpp
-
 	libs/imgui/imgui.h
 	libs/imgui/imgui.cpp
 	libs/imgui/imgui_draw.cpp

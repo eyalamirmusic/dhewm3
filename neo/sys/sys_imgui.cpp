@@ -1,42 +1,28 @@
 
+/*
+The in-game settings menu, with no backend under it.
+
+Dear ImGui needs two: a platform backend that feeds it events and a renderer
+backend that draws its vertex buffers. This tree had ImGui_ImplSDL3 and
+ImGui_ImplOpenGL2, and step 5 deleted both of them with the host they belonged
+to. eacp has neither yet - the port's renderer is idRenderBackendEacp rather
+than raw Metal, so ImGui's own imgui_impl_metal.mm is not simply a drop-in, and
+the state save/restore that used to sit in EndFrame() has no analogue here.
+
+So the menu is compiled and dark rather than deleted: it is a headline dhewm3
+feature and porting it is a step of its own (plan.md). Init() is what would
+create the ImGui context, and nothing calls it on this build - it returns false
+and says why. Everything else here holds imguiCtx == NULL as the thing that
+means "no menu", and refuses on it rather than dereferencing it.
+*/
+
 #define IMGUI_DEFINE_MATH_OPERATORS
 
-#include "sys_sdl.h"
-
-#if SDL_VERSION_ATLEAST(3, 0, 0)
-  // compat with SDL2
-  #define SDL_TEXTINPUT SDL_EVENT_TEXT_INPUT
-  #define SDL_CONTROLLERAXISMOTION SDL_EVENT_GAMEPAD_AXIS_MOTION
-  #define SDL_CONTROLLERBUTTONDOWN SDL_EVENT_GAMEPAD_BUTTON_DOWN
-  #define SDL_MOUSEBUTTONDOWN SDL_EVENT_MOUSE_BUTTON_DOWN
-  #define SDL_MOUSEMOTION SDL_EVENT_MOUSE_MOTION
-  #define SDL_MOUSEWHEEL SDL_EVENT_MOUSE_WHEEL
-  #define SDL_KEYDOWN SDL_EVENT_KEY_DOWN
-#endif
-
-
 #include "sys_imgui.h"
-
-#include "../libs/imgui/backends/imgui_impl_opengl2.h"
-
-#if SDL_VERSION_ATLEAST(3, 0, 0)
-  #include "../libs/imgui/backends/imgui_impl_sdl3.h"
-  #define ImGui_ImplSDLx_InitForOpenGL ImGui_ImplSDL3_InitForOpenGL
-  #define ImGui_ImplSDLx_Shutdown ImGui_ImplSDL3_Shutdown
-  #define ImGui_ImplSDLx_NewFrame ImGui_ImplSDL3_NewFrame
-  #define ImGui_ImplSDLx_ProcessEvent ImGui_ImplSDL3_ProcessEvent
-#else
-  #include "../libs/imgui/backends/imgui_impl_sdl2.h"
-  #define ImGui_ImplSDLx_InitForOpenGL ImGui_ImplSDL2_InitForOpenGL
-  #define ImGui_ImplSDLx_Shutdown ImGui_ImplSDL2_Shutdown
-  #define ImGui_ImplSDLx_NewFrame ImGui_ImplSDL2_NewFrame
-  #define ImGui_ImplSDLx_ProcessEvent ImGui_ImplSDL2_ProcessEvent
-#endif
 
 #include "framework/Common.h"
 #include "framework/KeyInput.h"
 #include "framework/Session_local.h" // sessLocal.GetActiveMenu()
-#include "renderer/qgl.h"
 #include "renderer/tr_local.h" // glconfig
 #include "ui/DeviceContext.h"
 #include "ui/UserInterface.h"
@@ -82,7 +68,6 @@ namespace ImGuiHooks {
   #include "proggyvector_font_base85.h"
 #endif
 
-static SDL_Window* sdlWindow = NULL;
 ImGuiContext* imguiCtx = NULL;
 static bool haveNewFrame = false;
 static int openImguiWindows = 0; // or-ed enum D3ImGuiWindow values
@@ -173,27 +158,11 @@ void ShowWarningOverlay( const char* text )
 
 static float GetDefaultScale()
 {
-	if ( glConfig.winWidth != glConfig.vidWidth ) {
-		// in HighDPI mode, the font sizes are already scaled (to window coordinates), apparently
-		return 1.0f;
-	}
-
-#if SDL_VERSION_ATLEAST(3, 0, 0)
-	float ret = SDL_GetWindowDisplayScale( sdlWindow );
-#else
-	float ret = ImGui_ImplSDL2_GetContentScaleForWindow( sdlWindow );
-#endif
-
-	// Validate that the reported scale is a reasonable size
-	// For example: if xrandr fails to read the EDID of the display,
-	// a default value 1mm x 1mm will be reported, resulting in an
-	// absurdly high DPI
-	if ( ret <= 0.0f || ret > 10.0f ) {
-		return 1.0f;
-	}
-
-	ret = round(ret*2.0)*0.5; // round to .0 or .5
-	return ret;
+	// This used to ask the platform backend for the window's display scale.
+	// There is no platform backend on this build, and the one thing the engine
+	// already knows is enough for the HighDPI case: in HighDPI mode the font
+	// sizes are already scaled to window coordinates.
+	return 1.0f;
 }
 
 float GetScale()
@@ -212,92 +181,17 @@ void SetScale( float scale )
 
 static bool imgui_initialized = false;
 
-// using void* instead of SDL_Window and SDL_GLContext to avoid dragging SDL headers into sys_imgui.h
-bool Init(void* _sdlWindow, void* sdlGlContext)
+// The two void* were an SDL_Window and an SDL_GLContext, to keep SDL's headers
+// out of sys_imgui.h. Nothing calls this on the eacp host: the ImGui context is
+// created here and only here, so leaving it uncreated is what keeps every other
+// entry point below dark. Creating one without a platform or renderer backend
+// would be worse than not creating it - the menu would take input it cannot
+// draw a response to.
+bool Init(void* window, void* renderContext)
 {
-	common->Printf( "Initializing ImGui\n" );
-
-	sdlWindow = (SDL_Window*)_sdlWindow;
-
-	// Setup Dear ImGui context
-	IMGUI_CHECKVERSION();
-	imguiCtx = ImGui::CreateContext();
-	if ( imguiCtx == NULL ) {
-		common->Warning( "Failed to create ImGui Context!\n" );
-		return false;
-	}
-	ImGuiIO& io = ImGui::GetIO();
-	io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;     // Enable Keyboard Controls
-	io.ConfigFlags |= ImGuiConfigFlags_NavEnableGamepad;      // Enable Gamepad Controls
-
-	static idStr iniPath;
-	iniPath = cvarSystem->GetCVarString( "fs_configpath" );
-	iniPath += "/imgui.ini";
-	io.IniFilename = iniPath.c_str();
-
-  // Setup styles
-	SetImGuiStyle( Style::Dhewm3 );
-	userStyle = ImGui::GetStyle(); // set dhewm3 style as default, in case the user style is missing values
-	if ( DG::ReadImGuiStyle( userStyle, GetUserStyleFilename() ) && imgui_style.GetInteger() == 2 ) {
-		ImGui::GetStyle() = userStyle;
-	} else if ( imgui_style.GetInteger() == 1 ) {
-		ImGui::GetStyle() = ImGuiStyle();
-		ImGui::StyleColorsDark();
-	}
-
-	imgui_scale.SetModified();
-
-	// Setup fonts, size will come from style.FontSizeBase
-#ifdef _MSC_VER
-	io.Fonts->AddFontFromMemoryCompressedTTF(ProggyVector_compressed_data, ProggyVector_compressed_size);
-#else
-	io.Fonts->AddFontFromMemoryCompressedBase85TTF(ProggyVector_compressed_data_base85);
-#endif
-
-	// Setup Platform/Renderer backends
-	if ( ! ImGui_ImplSDLx_InitForOpenGL( sdlWindow, sdlGlContext ) ) {
-		ImGui::DestroyContext( imguiCtx );
-		imguiCtx = NULL;
-		common->Warning( "Failed to initialize ImGui SDL platform backend!\n" );
-		return false;
-	}
-
-	if ( ! ImGui_ImplOpenGL2_Init() ) {
-		ImGui_ImplSDLx_Shutdown();
-		ImGui::DestroyContext( imguiCtx );
-		imguiCtx = NULL;
-		common->Warning( "Failed to initialize ImGui OpenGL renderer backend!\n" );
-		return false;
-	}
-
-	// Load Fonts
-	// - If no fonts are loaded, dear imgui will use the default font. You can also load multiple fonts and use ImGui::PushFont()/PopFont() to select them.
-	// - AddFontFromFileTTF() will return the ImFont* so you can store it if you need to select the font among multiple.
-	// - If the file cannot be loaded, the function will return a nullptr. Please handle those errors in your application (e.g. use an assertion, or display an error and quit).
-	// - The fonts will be rasterized at a given size (w/ oversampling) and stored into a texture when calling ImFontAtlas::Build()/GetTexDataAsXXXX(), which ImGui_ImplXXXX_NewFrame below will call.
-	// - Use '#define IMGUI_ENABLE_FREETYPE' in your imconfig file to use Freetype for higher quality font rendering.
-	// - Read 'docs/FONTS.md' for more instructions and details.
-	// - Remember that in C/C++ if you want to include a backslash \ in a string literal you need to write a double backslash \\ !
-	//io.Fonts->AddFontDefault();
-	//io.Fonts->AddFontFromFileTTF("c:\\Windows\\Fonts\\segoeui.ttf", 18.0f);
-	//io.Fonts->AddFontFromFileTTF("../../misc/fonts/DroidSans.ttf", 16.0f);
-	//io.Fonts->AddFontFromFileTTF("../../misc/fonts/Roboto-Medium.ttf", 16.0f);
-	//io.Fonts->AddFontFromFileTTF("../../misc/fonts/Cousine-Regular.ttf", 15.0f);
-	//ImFont* font = io.Fonts->AddFontFromFileTTF("c:\\Windows\\Fonts\\ArialUni.ttf", 18.0f, nullptr, io.Fonts->GetGlyphRangesJapanese());
-	//IM_ASSERT(font != nullptr);
-
-	const char* f10bind = idKeyInput::GetBinding( K_F10 );
-	if ( f10bind && f10bind[0] != '\0' ) {
-		if ( idStr::Icmp( f10bind, "dhewm3Settings" ) != 0 ) {
-			// if F10 is already bound, but not to dhewm3Settings, show a message
-			common->Printf( "... the F10 key is already bound to '%s', otherwise it could be used to open the dhewm3 Settings Menu\n" , f10bind );
-		}
-	} else {
-		idKeyInput::SetBinding( K_F10, "dhewm3Settings" );
-	}
-
-	imgui_initialized = true;
-	return true;
+	common->Warning( "The dhewm3 settings menu is not available on this build yet: "
+	                 "Dear ImGui has no backend for the eacp host.\n" );
+	return false;
 }
 
 void Shutdown()
@@ -305,10 +199,8 @@ void Shutdown()
 	if ( imgui_initialized ) {
 		common->Printf( "Shutting down ImGui\n" );
 
-		// TODO: only if init was successful!
-		ImGui_ImplOpenGL2_Shutdown();
-		ImGui_ImplSDLx_Shutdown();
 		ImGui::DestroyContext( imguiCtx );
+		imguiCtx = NULL;
 		imgui_initialized = false;
 	}
 }
@@ -319,12 +211,10 @@ void NewFrame()
 {
 	D3P_ScopedCPUSample(Imgui_NewFrame);
 
-	// Init() is called from GLimp_Init(), so there is no context at all when the
-	// renderer never started: com_skipRenderer 1, a dedicated server, or the
-	// eacp host before its renderer lands. Everything below would then be called
-	// on a NULL ImGui context - which crashed rather than did nothing, because
-	// the "all windows closed" early-out two blocks down still runs a couple of
-	// frames first.
+	// There is no context at all until Init() makes one, and on this build
+	// nothing does. Everything below would then be called on a NULL ImGui
+	// context - which crashed rather than did nothing, because the "all windows
+	// closed" early-out two blocks down still runs a couple of frames first.
 	if ( imguiCtx == NULL ) {
 		return;
 	}
@@ -362,14 +252,11 @@ void NewFrame()
 	}
 
 	// Start the Dear ImGui frame
-	ImGui_ImplOpenGL2_NewFrame();
-
 	if ( ShouldShowCursor() )
 		ImGui::GetIO().ConfigFlags &= ~ImGuiConfigFlags_NoMouseCursorChange;
 	else
 		ImGui::GetIO().ConfigFlags |= ImGuiConfigFlags_NoMouseCursorChange;
 
-	ImGui_ImplSDLx_NewFrame();
 	ImGui::NewFrame();
 	haveNewFrame = true;
 
@@ -389,80 +276,14 @@ void NewFrame()
 
 bool keybindModeEnabled = false;
 
-// called with every SDL event by Sys_GetEvent()
-// returns true if ImGui has handled the event (so it shouldn't be handled by D3)
-bool ProcessEvent(const void* sdlEvent)
+// Was called with every SDL event by Sys_GetEvent(), and returned true if ImGui
+// had handled it. Deciding that is the platform backend's job - it is the half
+// that reads a window system's events and writes ImGuiIO - and there is none
+// here, so no event is ever ImGui's and the engine gets all of them. The eacp
+// input layer does not call this at all; the declaration stays because a host
+// that grows a backend will want it back.
+bool ProcessEvent(const void* event)
 {
-	if (openImguiWindows == 0)
-		return false;
-
-	const SDL_Event* ev = (const SDL_Event*)sdlEvent;
-	// ImGui_ImplSDL2_ProcessEvent() doc says:
-	//   You can read the io.WantCaptureMouse, io.WantCaptureKeyboard flags to tell if dear imgui wants to use your inputs.
-	//   - When io.WantCaptureMouse is true, do not dispatch mouse input data to your main application, or clear/overwrite your copy of the mouse data.
-	//   - When io.WantCaptureKeyboard is true, do not dispatch keyboard input data to your main application, or clear/overwrite your copy of the keyboard data.
-	//   Generally you may always pass all inputs to dear imgui, and hide them from your application based on those two flags.
-
-	bool imguiUsedEvent = ImGui_ImplSDLx_ProcessEvent( ev );
-	if ( keybindModeEnabled ) {
-		// in keybind mode, all input events are passed to Doom3 so it can translate them
-		// to internal events and we can access and use them to create a new binding
-		return false;
-	}
-
-	if ( ImGui::IsWindowFocused( ImGuiFocusedFlags_AnyWindow )
-	    && (ev->type == SDL_CONTROLLERAXISMOTION || ev->type == SDL_CONTROLLERBUTTONDOWN) ) {
-		// don't pass on controller axis events to avoid moving the mouse cursor
-		// and controller button events to avoid emulating mouse clicks
-		return true;
-	}
-
-	switch( ev->type ) {
-		// Hack: detect if any key was pressed to close the warning overlay
-		case SDL_CONTROLLERBUTTONDOWN:
-		case SDL_MOUSEWHEEL:
-		case SDL_MOUSEBUTTONDOWN:
-		case SDL_KEYDOWN:
-			// TODO: controller trigger?
-			hadKeyDownEvent = true;
-	}
-	if( imguiUsedEvent ) {
-		ImGuiIO& io = ImGui::GetIO();
-
-		if ( io.WantCaptureMouse ) {
-			switch( ev->type ) {
-				case SDL_MOUSEMOTION:
-				case SDL_MOUSEWHEEL:
-				case SDL_MOUSEBUTTONDOWN:
-
-				// Note: still pass button up events to the engine, so if they were pressed down
-				//   before an imgui window got focus they don't remain pressed indefinitely
-				//case SDL_MOUSEBUTTONUP:
-					return true;
-			}
-		}
-
-		if ( io.WantCaptureKeyboard ) {
-			switch( ev->type ) {
-				case SDL_TEXTINPUT:
-					return true;
-				case SDL_KEYDOWN:
-				//case SDL_KEYUP: NOTE: see above why key up events are passed to the engine
-#if SDL_VERSION_ATLEAST(3, 0, 0)
-					if ( ev->key.key < SDLK_F1 || ev->key.key > SDLK_F12) {
-#else
-					if ( ev->key.keysym.sym < SDLK_F1 || ev->key.keysym.sym > SDLK_F12) {
-#endif
-						// F1 - F12 are passed to the engine so its shortcuts
-						// (like quickload or screenshot) still work
-						// Doom3's menu does the same
-						return true;
-					}
-			}
-		}
-
-	}
-
 	return false;
 }
 
@@ -532,6 +353,13 @@ bool ShouldShowCursor()
 
 void EndFrame()
 {
+	// Called every frame from RB_SwapBuffers, so this is the guard that matters
+	// most. NewFrame() has always had one; this one had none, which made an open
+	// window on a build with no context a null dereference two calls later.
+	if ( imguiCtx == NULL ) {
+		return;
+	}
+
 	if (openImguiWindows == 0 && !haveNewFrame)
 		return;
 
@@ -542,39 +370,9 @@ void EndFrame()
 	haveNewFrame = false;
 	ImGui::Render();
 
-	// Doom3 uses the OpenGL ARB shader extensions, for most things it renders.
-	// disable those shaders, the OpenGL classic integration of ImGui doesn't use shaders
-	qglDisable( GL_VERTEX_PROGRAM_ARB );
-	qglDisable( GL_FRAGMENT_PROGRAM_ARB );
-
-	// Doom3 uses OpenGL's ARB_vertex_buffer_object extension to use VBOs on the GPU
-	// as buffers for glDrawElements() (instead of passing userspace buffers to that function)
-	// ImGui however uses userspace buffers, so remember the currently bound VBO
-	// and unbind it (after drawing, bind it again)
-	GLint curArrayBuffer = 0;
-	if ( glConfig.ARBVertexBufferObjectAvailable ) {
-		qglGetIntegerv( GL_ARRAY_BUFFER_BINDING_ARB, &curArrayBuffer );
-		qglBindBufferARB( GL_ARRAY_BUFFER_ARB, 0 );
-	}
-
-	// disable all texture units, ImGui_ImplOpenGL2_RenderDrawData() will enable texture 0
-	// and bind its own textures to it as needed
-	for ( int i = glConfig.maxTextureUnits - 1 ; i >= 0 ; i-- ) {
-		GL_SelectTexture( i );
-		qglDisable( GL_TEXTURE_2D );
-		if ( glConfig.texture3DAvailable ) {
-			qglDisable( GL_TEXTURE_3D );
-		}
-		if ( glConfig.cubeMapAvailable ) {
-			qglDisable( GL_TEXTURE_CUBE_MAP_EXT );
-		}
-	}
-
-	ImGui_ImplOpenGL2_RenderDrawData( ImGui::GetDrawData() );
-
-	if ( curArrayBuffer != 0 ) {
-		qglBindBufferARB( GL_ARRAY_BUFFER_ARB, curArrayBuffer );
-	}
+	// This is where the renderer backend drew ImGui's draw data, wrapped in
+	// save/restore of the fixed-function GL state Doom 3 had left behind. Both
+	// halves went with the GL backend; the draw data is built and dropped.
 
 	// reset this at the end of each frame, will be set again by ProcessEvent()
 	if ( hadKeyDownEvent ) {
@@ -585,6 +383,15 @@ void EndFrame()
 
 void OpenWindow( D3ImGuiWindow win )
 {
+	if ( imguiCtx == NULL ) {
+		// no context, so no window to open and nothing that could draw one.
+		// SetNextWindowFocus() below dereferences the context unconditionally,
+		// which is what made `dhewm3Settings` a crash rather than a no-op.
+		common->Printf( "The dhewm3 settings menu is not available on this build yet: "
+		                "Dear ImGui has no backend for the eacp host.\n" );
+		return;
+	}
+
 	if ( openImguiWindows & win )
 		return; // already open
 
@@ -602,6 +409,10 @@ void OpenWindow( D3ImGuiWindow win )
 
 void CloseWindow( D3ImGuiWindow win )
 {
+	if ( imguiCtx == NULL ) {
+		return; // nothing was ever opened
+	}
+
 	if ( (openImguiWindows & win) == 0 )
 		return; // already closed
 

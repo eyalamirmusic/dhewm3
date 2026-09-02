@@ -2,8 +2,6 @@
 
 #include <algorithm> // std::sort - TODO: replace with something custom..
 
-#include "sys/sys_sdl.h"
-
 #define IMGUI_DEFINE_MATH_OPERATORS
 
 #include "Common.h"
@@ -110,6 +108,17 @@ static bool IsCancelKeyPressed() {
 	       || IsKeyPressed( ImGuiKey_GamepadStart );
 }
 
+// Sys_GetLocalizedJoyKeyName() returns NULL for a key it has no name for, and
+// on a host with no gamepad support it returns NULL for every one of them. The
+// results below are handed to %s and to ImGui's text functions, and a NULL
+// through %s is undefined - Apple's libc prints "(null)" and others crash. The
+// engine's other caller, idKeyInput::GetBinding, has always null-checked it;
+// this file did not.
+static const char* GetJoyKeyName( int keyNum ) {
+	const char* name = Sys_GetLocalizedJoyKeyName( keyNum );
+	return ( name != NULL ) ? name : "<unnamed gamepad button>";
+}
+
 static const char* GetGamepadStartName() {
 	return D3_GetGamepadStartButtonName();
 }
@@ -117,16 +126,16 @@ static const char* GetGamepadStartName() {
 static const char* GetGamepadCancelButtonNames() {
 	static char ret[64];
 	// on xbox: "Pad B or Pad Start"
-	D3_snprintfC99( ret, sizeof(ret), "%s or %s", Sys_GetLocalizedJoyKeyName( K_JOY_BTN_EAST ), GetGamepadStartName() );
+	D3_snprintfC99( ret, sizeof(ret), "%s or %s", GetJoyKeyName( K_JOY_BTN_EAST ), GetGamepadStartName() );
 	return ret;
 }
 
 static const char* GetGamepadBindNowButtonName() { // TODO: rename to confirm or sth
-	return Sys_GetLocalizedJoyKeyName( K_JOY_BTN_SOUTH ); // xbox A
+	return GetJoyKeyName( K_JOY_BTN_SOUTH ); // xbox A
 }
 
 static const char* GetGamepadUnbindButtonName() {
-	return Sys_GetLocalizedJoyKeyName( K_JOY_BTN_NORTH ); // xbox Y
+	return GetJoyKeyName( K_JOY_BTN_NORTH ); // xbox Y
 }
 
 
@@ -1940,28 +1949,18 @@ static void DrawVideoOptionsMenu()
 		AddTooltip( "r_customWidth / r_customHeight" );
 	}
 
-	// resolution info text
-#if SDL_VERSION_ATLEAST(3, 0, 0)
-	// in SDL3 it's a Display ID, in SDL2 a Display Index, in both cases the value
-	// can be fed into SDL_GetDisplayBounds()
-	SDL_DisplayID sdlDisplayId_x = SDL_GetDisplayForWindow( SDL_GL_GetCurrentWindow() );
-#else // SDL2
-	int sdlDisplayId_x = SDL_GetWindowDisplayIndex( SDL_GL_GetCurrentWindow() );
-#endif
-	SDL_Rect displayRect = {};
-	SDL_GetDisplayBounds( sdlDisplayId_x, &displayRect );
+	// resolution info text.
+	// The display's own size used to be printed under this, from
+	// SDL_GetDisplayBounds() on SDL_GL_GetCurrentWindow(). Both went with SDL,
+	// and the row is left out rather than filled with a made-up number - the
+	// window's size is what the engine knows, and glConfig is where it keeps it.
 	if ( (int)glConfig.winWidth != glConfig.vidWidth ) {
 		ImGui::TextDisabled( "Current Resolution: %g x %g (Physical: %d x %d)",
 		                     glConfig.winWidth, glConfig.winHeight, glConfig.vidWidth, glConfig.vidHeight );
 		AddDescrTooltip( "Apparently your system is using a HighDPI mode, where the logical resolution (used to specify"
 		                 " window sizes) is lower than the physical resolution (number of pixels actually rendered)." );
-		float scale = float(glConfig.vidWidth)/glConfig.winWidth;
-		int pw = scale * displayRect.w;
-		int ph = scale * displayRect.h;
-		ImGui::TextDisabled( "Display Size: %d x %d (Physical: %d x %d)", displayRect.w, displayRect.h, pw, ph );
 	} else {
 		ImGui::TextDisabled( "Current Resolution: %d x %d", glConfig.vidWidth, glConfig.vidHeight );
-		ImGui::TextDisabled( "Display Size: %d x %d", displayRect.w, displayRect.h );
 	}
 
 	// MSAA
