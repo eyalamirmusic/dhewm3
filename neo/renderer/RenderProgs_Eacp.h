@@ -504,15 +504,18 @@ public:
 
 	shadowDraw_t			ShadowDraw( int stateBits, int cullType, eacpStencil_t stencil );
 
-	// The frame onto the screen. Its pipeline is the one thing here that is not
-	// compiled against the render target: it draws into the drawable, so it
-	// takes the drawable's sample count rather than the target's one.
+	// The frame onto the screen, and the frame into an idImage's texture. Their
+	// pipelines are the two things here that are not compiled against the
+	// render target - one draws into the drawable and takes its sample count,
+	// the other into an image and takes its format - so the one program is
+	// asked for through whichever of the two the destination calls for.
 	struct blitDraw_t {
 		idEacpBlitProgram *						program;
 		const eacp::GPU::RenderPipeline *		pipeline;
 	};
 
 	blitDraw_t				BlitDraw( void );
+	blitDraw_t				CaptureDraw( void );
 
 	// Geometry for one draw, in a buffer no frame still in flight is reading.
 	// The reference is good until this frame's pool comes round again, which is
@@ -582,13 +585,19 @@ private:
 	std::optional<eacp::GPU::ShaderLibrary>	shadowLibrary;
 	eacp::Vector<statePipeline_t>			shadowPipelines;
 
-	// The blit, which has one of everything: one program, one pipeline, and no
-	// state to key either on. It is also the only pipeline here that is not
-	// built by PipelineFor, because what it draws into is the drawable rather
-	// than the render target and the two do not agree on sample count.
+	// The blit, which has one program and no state to key it on - and two
+	// pipelines, because it has two destinations: the drawable, which the frame
+	// is presented on, and an idImage's texture, which is where _currentRender
+	// and _scratch are kept. Neither is built by PipelineFor, that one being
+	// written against the render target's attachments and these two being
+	// written against something else.
 	std::optional<idEacpBlitProgram>		blitProgram;
 	std::optional<eacp::GPU::ShaderLibrary>	blitLibrary;
 	eacp::OwningPointer<eacp::GPU::RenderPipeline>	blitPipeline;
+	eacp::OwningPointer<eacp::GPU::RenderPipeline>	capturePipeline;
+
+	// The program above, compiled on the first of the two draws that wants it.
+	idEacpBlitProgram *		BlitProgram( void );
 
 	// The pipeline all three caches build, from the state Doom 3 asks for and
 	// the program that is going to be drawn with it. Empty if it would not

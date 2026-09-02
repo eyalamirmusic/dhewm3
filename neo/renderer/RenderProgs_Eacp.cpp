@@ -372,7 +372,16 @@ void idEacpBlitProgram::define( void ) {
 	// is inside the frustum on both APIs - the pipeline tests no depth anyway.
 	setPosition( GPU::float4( position, 0.0f, 1.0f ) );
 
-	setFragment( GPU::sample( image, varying( texcoord ) ) );
+	// **Opaque, and the alpha is not a detail.** OpenGL copies the frame into an
+	// image as GL_RGB8, so what a material samples out of _scratch or
+	// _currentRender has no alpha channel and reads 1 - and the materials that
+	// draw them are `blend blend`, so they are drawn straight over what is under
+	// them. eacp has no three-channel format, so the four-channel one has to say
+	// the same thing: sampled alpha here is whatever the frame's own stages
+	// happened to leave in that channel, and carrying it through makes the
+	// berserk and double-vision overlays translucent - the frame blended with
+	// itself, which reads as a picture that is simply too bright.
+	setFragment( GPU::float4( GPU::sample( image, varying( texcoord ) ).xyz(), 1.0f ) );
 }
 
 /*
@@ -654,6 +663,7 @@ void idEacpRenderProgs::Shutdown( void ) {
 	shadowLibrary.reset();
 	shadowProgram.reset();
 
+	capturePipeline.reset();
 	blitPipeline.reset();
 	blitLibrary.reset();
 	blitProgram.reset();
@@ -703,6 +713,10 @@ int idEacpRenderProgs::NumPipelines( void ) const {
 	total += shadowPipelines.size();
 
 	if ( blitPipeline ) {
+		total++;
+	}
+
+	if ( capturePipeline ) {
 		total++;
 	}
 
@@ -1002,10 +1016,38 @@ idEacpRenderProgs::shadowDraw_t idEacpRenderProgs::ShadowDraw( int stateBits, in
 
 /*
 ====================
+idEacpRenderProgs::BlitProgram
+
+The one quad both blits are drawn with, compiled on the first of them. Which
+attachments it is compiled *for* is the two callers' business and is the whole
+of what separates them - see BlitDraw and CaptureDraw.
+
+NULL if the shader would not compile, which both callers answer by skipping
+their draw.
+====================
+*/
+idEacpBlitProgram *idEacpRenderProgs::BlitProgram( void ) {
+	if ( !blitProgram.has_value() ) {
+		blitProgram.emplace();
+		blitLibrary.emplace( GPU::Device::shared(), blitProgram->source() );
+
+		if ( !blitLibrary->isValid() ) {
+			common->Warning( "eacp: the blit shader failed to compile, so the frame "
+							 "will not reach the screen" );
+			blitProgram.reset();
+			return NULL;
+		}
+	}
+
+	return &*blitProgram;
+}
+
+/*
+====================
 idEacpRenderProgs::BlitDraw
 
-The frame onto the screen, and the one pipeline here that PipelineFor does not
-build.
+The frame onto the screen, and one of the two pipelines here that PipelineFor
+does not build.
 
 Everything else draws into the render target, which is single-sampled and
 carries a depth-stencil buffer; this draws into the *drawable*, which is
@@ -1029,19 +1071,11 @@ idEacpRenderProgs::blitDraw_t idEacpRenderProgs::BlitDraw( void ) {
 		return draw;
 	}
 
-	if ( !blitProgram.has_value() ) {
-		blitProgram.emplace();
-		blitLibrary.emplace( GPU::Device::shared(), blitProgram->source() );
+	draw.program = BlitProgram();
 
-		if ( !blitLibrary->isValid() ) {
-			common->Warning( "eacp: the blit shader failed to compile, so the frame "
-							 "will not reach the screen" );
-			blitProgram.reset();
-			return draw;
-		}
+	if ( !draw.program ) {
+		return draw;
 	}
-
-	draw.program = &*blitProgram;
 
 	if ( !blitPipeline ) {
 		GPU::RenderPipelineDescriptor	descriptor;
@@ -1072,6 +1106,61 @@ idEacpRenderProgs::blitDraw_t idEacpRenderProgs::BlitDraw( void ) {
 	}
 
 	draw.pipeline = blitPipeline;
+
+	return draw;
+}
+
+/*
+====================
+idEacpRenderProgs::CaptureDraw
+
+The same quad into an idImage's texture rather than onto the screen -
+_currentRender and _scratch, which is step 4e.3.
+
+A third description of the same shader, and each of the three fields that
+differ is the destination's rather than a choice. The image's texture is
+RGBA8Unorm, being every other image on this backend's format and what a
+material samples; it carries no depth buffer, an image having no use for one;
+and it is single-sampled like everything a texture target does.
+====================
+*/
+idEacpRenderProgs::blitDraw_t idEacpRenderProgs::CaptureDraw( void ) {
+	blitDraw_t	draw;
+
+	draw.program = BlitProgram();
+	draw.pipeline = NULL;
+
+	if ( !draw.program ) {
+		return draw;
+	}
+
+	if ( !capturePipeline ) {
+		GPU::RenderPipelineDescriptor	descriptor;
+
+		descriptor.library = &*blitLibrary;
+		descriptor.vertexLayout = blitProgram->vertexLayout();
+		descriptor.topology = GPU::PrimitiveTopology::Triangles;
+
+		descriptor.colorFormat = GPU::pixelFormatFor( GPU::TextureFormat::RGBA8Unorm );
+		descriptor.sampleCount = 1;
+
+		// No attachment to name, so nothing to test against and nothing to
+		// declare. A pipeline claiming a depth buffer the pass has not got is a
+		// validation error rather than an untested draw.
+		descriptor.depth = false;
+		descriptor.stencil = false;
+
+		capturePipeline.create( GPU::Device::shared(), descriptor );
+
+		if ( !capturePipeline->isValid() ) {
+			common->Warning( "eacp: no pipeline for the frame capture, so "
+							 "_currentRender will not be filled in" );
+			capturePipeline.reset();
+			return draw;
+		}
+	}
+
+	draw.pipeline = capturePipeline;
 
 	return draw;
 }

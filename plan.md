@@ -11,13 +11,15 @@ menu on screen through Metal**, **loads a level**, **lights it** and
 `interaction.vfp` and `shadow.vp` are in the EDSL, the stencil shadow volumes
 are counted two-sided in one pass over each volume, and at a pinned camera in
 `demo_mars_city1` the two backends draw **the same 71 draws, 1644 triangles and
-2376 shadow triangles**, volume for volume. 4e is two steps in: the frame is
-composed into an app-owned **render target**, and that target is now **read back
-to the CPU** — so the eacp build takes the game's own camera shots, writes
-screenshots, and **runs the regression gate**, 297 frames hashed and identical
-across two captures. Every comparison from here is a hash rather than a screen
-grab. What is left in 4e is `_currentRender`, a pass per view, fog, blend lights
-and the texgen variants.**
+2376 shadow triangles**, volume for volume. 4e is three steps in: the frame is
+composed into an app-owned **render target**, that target is **read back to the
+CPU** — so the eacp build takes the game's own camera shots, writes screenshots,
+and **runs the regression gate**, 297 frames hashed and identical across two
+captures — and it is now **copied into an image**, so `_currentRender` and
+`_scratch` are filled in and the player-view effects draw the frame they are
+supposed to. Every comparison from here is a hash rather than a screen grab.
+What is left in 4e is a pass per view, fog, blend lights and the texgen
+variants.**
 
 Reference implementation for almost everything on the platform side:
 `~/Code/PureDOOM/examples/EACP` — a complete engine hosted on eacp, with its own
@@ -107,6 +109,8 @@ place to start reading.
 - `RenderPipelineDescriptor::cullMode` with the clip-space winding convention pinned
   on both backends (counter-clockwise = front, glTF's convention)
 - `RenderPass::bind(program, vertices)` — a program drawn over geometry the app owns
+- `RenderPassDescriptor::depthAction` — a pass that keeps the depth and stencil
+  it was handed, which is what an interrupted one needs (§5, gap 22)
 - `GPU::StreamingBuffers` — per-frame allocations out of a pool, handed back as
   sub-ranges. **This is `idVertexCache`'s exact shape**, and it already exists.
 - `Buffer::update` — dynamic geometry re-uploaded in place
@@ -311,15 +315,18 @@ Re-verified against `main` at `be7a749` rather than carried forward on trust.
 *starting* Phase 2 — each degrades the picture or has a workaround, and the list is
 better driven by real content than guessed at now.
 
-That last sentence has now been tested. 12, 17, 19, 20 and 21 are what it turned
-up — the gaps this port found by walking real content rather than by reading
-eacp. 12 and 17 stopped the next step rather than degrading it, and both are
-closed, in §6 under step 4b′. 19 does not stop anything today, because it is
+That last sentence has now been tested. 12, 17, 19, 20, 21 and 22 are what it
+turned up — the gaps this port found by walking real content rather than by
+reading eacp. 12 and 17 stopped the next step rather than degrading it, and both
+are closed, in §6 under step 4b′. 19 does not stop anything today, because it is
 D3D12's alone and the eacp host is macOS-only for other reasons; it stops
 Windows. 20 is a price already paid, in multisampling, for what step 4e.1
 bought. **21 is closed too**, in §6 under step 4e.2, and it is the one that was
 stopping something worth having: eacp grew `Texture::read` and `Frame::flush`,
-and this build's frames are hashes now rather than screen grabs.
+and this build's frames are hashes now rather than screen grabs. **22 is closed
+by step 4e.3**, which needed a pass to survive being interrupted — the copy that
+fills `_currentRender` has to end the pass, and everything drawn after it has to
+be occluded by the depth buffer that pass was writing.
 
 Numbers are never reused, so a hole is an entry that closed.
 
@@ -489,6 +496,42 @@ Numbers are never reused, so a hole is an entry that closed.
     recorded and carry on recording. The two are separable and each has its own
     reason to exist, so they are two calls; `Tests/GPU/TextureReadTests.cpp`
     pins the pair, and fails without the flush.
+
+22. ~~**A pass could not keep the depth buffer it was handed.**~~ — **closed**,
+    and kept because the shape of the answer is the interesting part.
+    `Frame::beginPass` cleared depth and stencil unconditionally and Metal
+    stored neither, so a pass that ended came back empty. `clear` already said
+    what to do with the colour and there was nothing that said it about the
+    other two planes.
+
+    Found by step 4e.3 and closed with it. What needs this is a **suspended**
+    pass: a texture cannot be sampled by the pass rendering into it, so an app
+    that copies the frame it has drawn so far — Doom 3's `_currentRender`, a
+    refraction reading what is behind it — has to end its pass, copy, and open
+    another over the same attachments, and everything drawn after the copy
+    otherwise has nothing to be occluded by.
+
+    `RenderPassDescriptor::depthAction` is `DepthAction::Clear`, `Keep` or
+    `Resume`, which is **one enum rather than the two booleans the load and the
+    store would be**, because the illegal pairing is the point: loading what the
+    pass before was told to discard has no answer, and a three-valued name
+    cannot say it. Clear is the default and is what every pass did before.
+
+    Two things worth keeping. **The store is Metal's alone** — a D3D12 depth
+    buffer is a committed resource resting in `DEPTH_WRITE`, so what a pass
+    wrote is simply still there and only the clear has to be skipped; the
+    backends differ in what the enum *costs* rather than in what it means.
+    And **the depth half of the test would have passed without the store**:
+    putting `MTLStoreActionDontCare` back leaves every depth case in
+    `Tests/GPU/DepthActionTests.cpp` green on Apple silicon, the tile memory
+    holding the values across the boundary anyway, and fails the stencil one.
+    That is `RenderTargetDepthTests`' architecture-dependent silence one step
+    along, and it is why that file tests both planes.
+
+    On eacp `main` at `5d15c30`, with the full suite at **1314 tests, all
+    passing** and the GPU half clean under `MTL_DEBUG_LAYER=1` with
+    `MTL_SHADER_VALIDATION=1` and GPU validation. The D3D12 half is written and
+    unrun, the eacp host being macOS-only (§8).
 
 ### Checked, and *not* gaps
 
@@ -1622,6 +1665,103 @@ comparable with each other — they are two renderers — so each is compared
 against itself, which is the rule `regression/README.md` already states for
 machines and GPUs.
 
+#### Step 4e.3 — the frame into an image, and `_currentRender` — **done**
+
+`CopyFramebufferToImage` is 4e.1's blit with the destination changed: the same
+quad, the same program, into an `idImage`'s own texture instead of onto the
+drawable. On OpenGL the frame is in the back buffer and `glCopyTexSubImage2D`
+reads it; here it is in a texture this backend owns, and **a texture is copied
+by drawing it**. So the entry that has been waiting since 4e.1 is one more
+pipeline rather than one more idea.
+
+Its users are `_currentRender` and `_scratch`: the post-process dump inside
+`DrawShaderPasses`, which is no longer guarded away, and `RB_CopyRender`, which
+is the wipe on a map change and the player-view effects — double vision, berserk
+vision, influence vision. The last of those is what this step was measured on,
+because it puts **the whole frame through `_scratch` and back on the screen
+every frame**, so a copy that is wrong is a screen that is wrong.
+
+**The rectangle arrives upside down and stays that way.** Doom 3 measures from
+the bottom left and `glCopyTexImage2D` puts the row at `y` into the
+destination's row 0, so what a material samples at `t = 0` is the *bottom* of
+the screen — and every caller is written against that, drawing `_scratch` with
+`t` running 1 to 0. So the copy maps the source region's bottom edge onto the
+destination's first row. Confirmed by reading the texture back: the dump is the
+scene inverted, which is what makes the picture upright.
+
+**The power-of-two dance is kept although nothing here needs it**, extra
+duplicated edge row and column included. eacp samples a texture of any size, but
+`uploadWidth` and `uploadHeight` are what the renderer *above* the seam scales
+screen coordinates by, so a backend that sized them differently would be
+answering a question the shared code asks in another unit.
+
+**Two things about the destination were found by getting them wrong.** OpenGL
+copies as `GL_RGB8` — no alpha channel, so a material samples 1 — and eacp has
+no three-channel format, so the blit writes `float4(rgb, 1)` outright; carrying
+the frame's own alpha through makes the `blend blend` overlays translucent,
+which reads as a picture that is simply too bright. And the sampler state
+`glTexParameterf` sets on the GL texture at this point is `TF_LINEAR` /
+`TR_CLAMP`, which on this backend is not state on the texture but the choice of
+compiled variant, so it is written onto the `idImage` where the variant is read
+from.
+
+**It needed a pass to survive being interrupted, which is eacp gap 22** — closed
+on eacp `main` at `5d15c30`. The copy has to close the frame's pass, and
+`clear = false` only ever said what to do with the *colour*: everything drawn
+after the copy came back to an empty depth buffer. `SuspendPass` / `ResumePass`
+now bracket it, opening with `DepthAction::Resume` and re-sending the viewport
+and the scissor, which are pass state on eacp and which Doom 3 sets once per
+view rather than once per draw. `ReadPixels` was interrupting the pass the same
+way and not putting it back, and does now.
+
+**Measured.** The gate is **297/297 identical** against 4e.2, which is what says
+the change costs the existing path nothing — the tour has no post-process
+surface and takes no capture. What it *is* verified by is berserk vision at the
+tour's own camera: the eacp build's picture through `_scratch` agrees with the
+SDL/GL build's at a mean of **5.7 to 6.7 of 255** over four frames, against
+**3.75** for the same camera drawn directly, the extra being what a 1024x512
+downsample and a 4x upscale do to two renderers' edges. Clean under
+`MTL_DEBUG_LAYER=1` with `MTL_SHADER_VALIDATION=1` and GPU validation, at 9
+programs and 40 pipelines — the capture being one more pipeline on the blit's
+one program.
+
+**And it found a bug it did not cause and has not fixed.** Driving the same
+camera with berserk vision on, the eacp build produces a **~3x over-bright,
+flatly-lit frame for about two frames** at one fixed moment in the level, and
+the correct picture on either side of it. It is worth being precise about,
+because the shape of the evidence is what says it is not this step's:
+
+- The SDL/GL build is flat at 30.2–32.0 over the same twenty-four screenshots;
+  the eacp build reads 96.5 and 81.4 at shots 7 and 8 and 26–41 everywhere else.
+- **It reproduces on the build before 4e.3**, where the same run has one frame
+  at 13.2 against a 4.5–5.6 baseline — the same ratio over a screen that is
+  nearly black because nothing had filled `_scratch` in yet.
+- Removing the blit from `CopyFramebufferToImage` and leaving only the
+  suspend and resume does not stop it. Neither does `r_useScissor 0`, nor
+  having `ReadPixels` hand the pass back.
+- `r_debugRenderToTexture 1` reports the *identical* command counts on the good
+  frames and the bad ones — `3d: 1, 2d: 2, SetBuf: 1, SwpBuf: 1, CpyRenders: 1,
+  CpyFrameBuf: 1` — so the frontend is emitting the same frame and the backend
+  is drawing it differently.
+- It is one-off rather than periodic: twenty-four screenshots at a fixed camera
+  put it at 7 and 8 and nowhere else, so it is tied to a moment in the level
+  rather than to a count of frames.
+
+What it looks like is the frame composed without its colour clear and drawn over
+what was already there, which is what a second view rendered outside the frame's
+pass would do — 4e.2's camshot case, one step along. Not proven, and not
+chased further here: it is a defect of its own with a reproducer, and 4e.3 is
+measurable without fixing it.
+
+**What is not here.** `TG_SCREEN` and `TG_SCREEN2`, the screen-space texgens a
+material samples `_currentRender` *through*, are still skipped with the rest of
+the texgen variants — nothing in the demo's content reaches them outside a
+`newStage`, so there would be nothing to check them against. They join 4e.5, and
+what this step gives them is the copy they need and the `uploadWidth` scale
+factor to read it with. `CopyDepthbufferToImage` stays empty for the reason it
+always had: `_currentDepth` feeds the soft-particle program, which is behind
+`BE_ARB2`.
+
 ### Shader inventory for Phase 2
 
 Roughly 10–15 EDSL programs, each in the sampling variants §4.3 sizes — 8 worst case
@@ -1647,7 +1787,9 @@ rather than a program beside it, compiled lazily:
 - **the blit** — **done**, step 4e.1, and the one entry on this list Doom 3 has
   no counterpart for. It puts the render target on the drawable, which is a
   draw here and is nothing at all on OpenGL, where the frame was in the back
-  buffer the moment it was drawn. One texture, no transform, six vertices.
+  buffer the moment it was drawn. One texture, no transform, six vertices. Step
+  4e.3 gave it a second *pipeline* and no second program: `_currentRender` is
+  the same quad into an image's texture, and what differs is the attachment.
 - generic material stage, in its texgen variants: normal, reflect, skybox, wobblesky
 - fog
 - light blend
@@ -1786,16 +1928,29 @@ Phase 2 is the first work that compiles against eacp. In rough order:
        `r_skipSpecular 1`. The objective camshots, the `screenshot` command and
        `R_ReadTiledPixels` came with it — the last of those off `qgl` and onto
        the seam, which cost the GL build nothing (297/297).
-     - **4e.3. `_currentRender`** ← **next**, which is 4e.1's blit into an
-       image's texture rather than into the drawable, plus the shared code that
-       currently skips the copy on any backend that is not `BE_ARB2`.
-     - **4e.4. A pass per view**, and so subviews and mirrors: gap 18 said a
+     - ~~**4e.3. `_currentRender`.**~~ — **done**, §6. 4e.1's blit with the
+       destination changed, so `_currentRender` and `_scratch` are filled in
+       and the wipe and the player-view effects draw the frame rather than a
+       stale image. It needed eacp gap 22 — a pass that keeps the depth and
+       stencil it was handed — because a copy has to interrupt the frame's
+       pass and everything after it has to be occluded by the same buffer.
+       297/297 on the gate, and the picture through `_scratch` agrees with the
+       GL build's at 5.7 of 255 where the same camera drawn directly agrees at
+       3.75. It also turned up an over-bright frame that predates it, which is
+       written down where it was found.
+     - **4e.4. A pass per view** ← **next**, and so subviews and mirrors: gap 18 said a
        second pass could not keep the first's colour, and a texture target
        stores rather than resolving, so `clear = false` now means what it says.
-     - **4e.5. The rest.** Fog and blend lights, the texgen variants (reflect,
-       skybox, wobblesky — two of the three want cube maps, gap 5), and
+     - **4e.5. The rest.** Fog and blend lights, the texgen variants (screen,
+       reflect, skybox, wobblesky — two of the four want cube maps, gap 5, and
+       the screen one now has the `_currentRender` 4e.3 fills to read), and
        `r_gammaInShader` (step 4d.2 — the identity at the default settings, and
        nothing at any other).
+     - **The over-bright frame**, which is not a step of 4e but is loose: the
+       eacp build renders about two frames of any run three times too bright
+       and flatly lit, at a fixed moment in the level, where the SDL/GL build is
+       steady. Found and characterised by 4e.3, older than it, and written up
+       under that step with its reproducer.
 5. **Delete** `glimp.cpp`, `events.cpp`, `threads.cpp`, `neo/sys/linux/`, SDL,
    and fold `dhewm3-eacp` back into `dhewm3`.
 

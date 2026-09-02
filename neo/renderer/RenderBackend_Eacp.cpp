@@ -267,11 +267,27 @@ private:
 
 	// The pass every draw goes into. One per frame so far - see DrawView on why
 	// a view does not get its own yet.
-	void			BeginPass( bool clearColor );
+	void			BeginPass( bool clearColor,
+							   GPU::DepthAction depthAction = GPU::DepthAction::Keep );
 	void			EndPass( void );
+
+	// The same pass interrupted and put back, which is what copying out of the
+	// frame target costs - a texture cannot be sampled by the pass rendering
+	// into it. Suspend says whether there was one to put back.
+	bool			SuspendPass( void );
+	void			ResumePass( void );
 
 	// And the pass that puts the finished one on the screen.
 	void			PresentFrameTarget( void );
+
+	// One rectangle of the frame target onto one rectangle of an image, which
+	// is what a copy is on a backend that has no copy. Both are in pixels; the
+	// source is in Doom 3's coordinates, measured up from the bottom, and the
+	// destination in the image's own rows, which run down from the top.
+	void			CopyFrameRegion( GPU::RenderPass &into,
+									 const idEacpRenderProgs::blitDraw_t &draw,
+									 int srcX, int srcY, int srcWidth, int srcHeight,
+									 int dstX, int dstY, int dstWidth, int dstHeight );
 
 	// RB_BeginDrawingView: where on the target this view lands, what part of it
 	// may be written, and the state the view starts from.
@@ -352,6 +368,21 @@ private:
 	OwningPointer<GPU::Texture>		frameTarget;
 	int								frameTargetWidth;
 	int								frameTargetHeight;
+
+	// What the open pass was last told to rasterize into, and what the
+	// suspended one was told before it closed. Pass state on eacp - a new pass
+	// starts on the whole target - and Doom 3 sets both once per view rather
+	// than once per draw, so a pass that came back without them would draw the
+	// rest of its view over the whole frame.
+	Graphics::Rect		appliedViewport;
+	Graphics::Rect		appliedScissor;
+	bool				hasViewport;
+	bool				hasScissor;
+
+	Graphics::Rect		suspendedViewport;
+	Graphics::Rect		suspendedScissor;
+	bool				suspendedHasViewport;
+	bool				suspendedHasScissor;
 
 	// The image on each texture unit, which is what a draw binds. The GL
 	// backend has no equivalent because GL remembers this itself.
@@ -434,6 +465,10 @@ static void R_EacpDrawInteraction( const drawInteraction_t *din ) {
 idRenderBackendEacp::idRenderBackendEacp() {
 	frameTargetWidth = 0;
 	frameTargetHeight = 0;
+	hasViewport = false;
+	hasScissor = false;
+	suspendedHasViewport = false;
+	suspendedHasScissor = false;
 	memset( boundImages, 0, sizeof( boundImages ) );
 	drawProgram = NULL;
 	drawPipeline = NULL;
@@ -646,18 +681,27 @@ bool idRenderBackendEacp::EnsureFrameTarget( void ) {
 idRenderBackendEacp::BeginPass / EndPass
 
 One eacp pass per Doom 3 view, and the mapping is not arbitrary: a pass clears
-depth and stencil unconditionally as it opens and can be told whether to clear
-colour, which is exactly what RB_BeginDrawingView asks for - the depth buffer
-and the stencil buffer emptied for this view, the colour left where the views
-before it put it.
+depth and stencil as it opens and can be told whether to clear colour, which is
+exactly what RB_BeginDrawingView asks for - the depth buffer and the stencil
+buffer emptied for this view, the colour left where the views before it put it.
 
 Into the render target rather than the drawable, which is step 4e's whole
 change and is what a second pass on one frame needs: a texture target is stored
 and can be loaded back, where a multisampled drawable resolves and keeps nothing
 (§5, gap 18).
+
+**Every pass opened here keeps its depth and stencil planes on the way out**,
+which is DepthAction::Keep and is what SuspendPass below needs: a copy has to
+close the pass, and the pass that takes over from it can only load what the one
+before it was told to store. Whether a frame is going to copy is not knowable
+when its pass opens - the command that asks arrives later - so this is paid
+always rather than predicted. What it costs is the target's depth-stencil buffer
+written out to memory once per pass instead of being discarded in tile memory,
+which is eight bytes a pixel on Metal and nothing at all on D3D12, where the
+buffer is a resource that keeps what was written to it either way.
 ======================
 */
-void idRenderBackendEacp::BeginPass( bool clearColor ) {
+void idRenderBackendEacp::BeginPass( bool clearColor, GPU::DepthAction depthAction ) {
 	if ( pass ) {
 		return;
 	}
@@ -673,6 +717,7 @@ void idRenderBackendEacp::BeginPass( bool clearColor ) {
 	GPU::RenderPassDescriptor	descriptor;
 
 	descriptor.clear = clearColor;
+	descriptor.depthAction = depthAction;
 
 	// What Doom 3 clears the stencil buffer to, and it is deliberately not
 	// zero: a shadow volume's count goes down as well as up, and the buffer is
@@ -700,6 +745,70 @@ void idRenderBackendEacp::EndPass( void ) {
 
 	pass->end();
 	pass.reset();
+
+	hasViewport = false;
+	hasScissor = false;
+}
+
+/*
+======================
+idRenderBackendEacp::SuspendPass / ResumePass
+
+The pass interrupted and put back, which is what a copy out of the frame target
+costs: a texture cannot be sampled by the pass rendering into it, so the copy
+has to happen between two passes rather than inside one.
+
+**What comes back is the pass, not a new one.** The colour is loaded rather than
+cleared, the depth and stencil planes are the ones the suspended pass stored
+(DepthAction::Resume, and eacp gap 22 is what closing that took), and the
+viewport and the scissor are re-sent - those being pass state on eacp, which a
+new pass resets, and Doom 3 setting them once per view rather than once per
+draw. Everything else a draw needs is an argument to the draw on this backend
+and so was never the pass's to lose.
+
+Suspend answers whether there was a pass at all, because a copy asked for
+outside one - the level load's own screen update, a console command - has
+nothing to put back.
+======================
+*/
+bool idRenderBackendEacp::SuspendPass( void ) {
+	if ( !pass ) {
+		return false;
+	}
+
+	const Graphics::Rect	viewport = appliedViewport;
+	const Graphics::Rect	scissor = appliedScissor;
+	const bool				hadViewport = hasViewport;
+	const bool				hadScissor = hasScissor;
+
+	EndPass();
+
+	suspendedViewport = viewport;
+	suspendedScissor = scissor;
+	suspendedHasViewport = hadViewport;
+	suspendedHasScissor = hadScissor;
+
+	return true;
+}
+
+void idRenderBackendEacp::ResumePass( void ) {
+	BeginPass( false, GPU::DepthAction::Resume );
+
+	if ( !pass ) {
+		return;
+	}
+
+	if ( suspendedHasViewport ) {
+		pass->setViewport( suspendedViewport, depthRangeNear, depthRangeFar );
+		appliedViewport = suspendedViewport;
+		hasViewport = true;
+	}
+
+	if ( suspendedHasScissor ) {
+		pass->setScissorRect( suspendedScissor );
+		appliedScissor = suspendedScissor;
+		hasScissor = true;
+	}
 }
 
 /*
@@ -890,15 +999,17 @@ view's bounds do not.
 void idRenderBackendEacp::SetViewport( const idScreenRect &rect ) {
 	const float	height = (float)pass->targetHeight();
 
+	appliedViewport = Graphics::Rect( (float)rect.x1,
+									  height - (float)( rect.y2 + 1 ),
+									  (float)( rect.x2 + 1 - rect.x1 ),
+									  (float)( rect.y2 + 1 - rect.y1 ) );
+	hasViewport = true;
+
 	// The depth range goes out with the viewport rather than on its own, which
 	// is eacp's shape and not Doom 3's: glDepthRange is its own call, and the
 	// two depth hacks use it without touching the rectangle. Re-sending the
 	// rectangle to change the range costs nothing and keeps one call site.
-	pass->setViewport( Graphics::Rect( (float)rect.x1,
-									   height - (float)( rect.y2 + 1 ),
-									   (float)( rect.x2 + 1 - rect.x1 ),
-									   (float)( rect.y2 + 1 - rect.y1 ) ),
-					   depthRangeNear, depthRangeFar );
+	pass->setViewport( appliedViewport, depthRangeNear, depthRangeFar );
 }
 
 void idRenderBackendEacp::SetScissor( const idScreenRect &rect ) {
@@ -912,7 +1023,10 @@ void idRenderBackendEacp::SetScissor( const idScreenRect &rect ) {
 	const float	w = (float)( rect.x2 + 1 - rect.x1 );
 	const float	h = (float)( rect.y2 + 1 - rect.y1 );
 
-	pass->setScissorRect( Graphics::Rect( x, height - ( y + h ), w, h ) );
+	appliedScissor = Graphics::Rect( x, height - ( y + h ), w, h );
+	hasScissor = true;
+
+	pass->setScissorRect( appliedScissor );
 }
 
 /*
@@ -1918,12 +2032,12 @@ void idRenderBackendEacp::DrawInteraction( const drawInteraction_t *din ) {
 ======================
 idRenderBackendEacp::DrawShaderPasses
 
-RB_STD_DrawShaderPasses. Two of its parts are not here and neither is a
-shortcut: the ARB program environment, this backend having no ARB programs to
-give one to, and the _currentRender copy, which the shared code already skips on
-any backend that is not BE_ARB2 - so a post-process material samples a stale
-_currentRender on this path exactly as it would on OpenGL's, and the fix is step
-4e's render target rather than anything here.
+RB_STD_DrawShaderPasses. One of its parts is not here and is not a shortcut: the
+ARB program environment, this backend having no ARB programs to give one to.
+
+The other one - the _currentRender copy before the post-process surfaces - is
+here since step 4e.3, and the shared code's own is still guarded by BE_ARB2, so
+the two paths do it once each rather than one of them twice.
 
 Returns how far it got, which is not always the whole list: the post-process
 surfaces are deliberately left for a second call, after the fog that has to be
@@ -1946,11 +2060,21 @@ int idRenderBackendEacp::DrawShaderPasses( drawSurf_t **drawSurfs, int numDrawSu
 			return 0;
 		}
 
-		// Nothing to copy from: a 2D view never dumps the framebuffer even on
-		// OpenGL, and a 3D view's dump is guarded by BE_ARB2 in the shared
-		// code. Saying it has been copied is what keeps the loop below from
-		// stopping at the first post-process surface, which is what OpenGL
-		// does here for the same reason.
+		// Only in a 3D view, which is the shared path's rule too: the console
+		// and the menus are drawn by this same function and there is nothing
+		// behind them to refract.
+		if ( backEnd.viewDef->viewEntitys ) {
+			globalImages->currentRenderImage->CopyFramebuffer(
+				backEnd.viewDef->viewport.x1,
+				backEnd.viewDef->viewport.y1,
+				backEnd.viewDef->viewport.x2 - backEnd.viewDef->viewport.x1 + 1,
+				backEnd.viewDef->viewport.y2 - backEnd.viewDef->viewport.y1 + 1,
+				true );
+		}
+
+		// Said whether or not anything was copied, because what it stops is the
+		// loop below breaking at the first post-process surface - which is how
+		// the two calls to this function divide the list between them.
 		backEnd.currentRenderCopied = true;
 	}
 
@@ -2579,27 +2703,229 @@ void idRenderBackendEacp::SetImageBorderColor( const idImage *image, const float
 ====================
 idRenderBackendEacp::CopyFramebufferToImage
 
-_currentRender, and it is the one thing here that needs a different frame shape
-rather than a different call: a texture cannot be sampled by the pass that is
-rendering into it, so this needs the composited frame to live in an app-owned
-render target that the drawable is blitted from at the end - PureDOOM's
-captureTarget, which plan.md section 3 flags as the answer for exactly this.
+_currentRender and _scratch: the frame so far, into an image's own texture. Step
+4e.3, and it is the same blit PresentFrameTarget does with the destination
+changed - which is why it needed 4e.1 first. On OpenGL the frame is in the back
+buffer and glCopyTexSubImage2D reads it; here it is in a texture this backend
+owns, and a texture is copied by drawing it.
+
+**The rectangle is GL's, so it arrives upside down and stays that way.** x and y
+measure from the bottom left of the frame, and glCopyTexImage2D puts the row at
+y into the destination's row 0 - so what a material samples at t = 0 is the
+*bottom* of the screen. Every caller is written against that: the wipe and the
+player-view effects draw _scratch with t going 1 to 0. So the quad below maps
+the source region's bottom edge onto the destination's first row, which is the
+same picture the GL build produces rather than the same one flipped.
+
+**The power-of-two dance is kept even though nothing here needs it.** eacp
+samples a texture of any size, but uploadWidth and uploadHeight are what the
+renderer above the seam scales screen coordinates by (RB_SetProgramEnvironment's
+first two parameters), so a backend that sized these differently would be
+answering a question the shared code asks in another unit. The extra row and
+column GL duplicates along the edges go with it, for the bilerp that samples
+just past the copied region.
+
+Nothing is drawn here if the destination pipeline would not compile, which is
+the same answer every other draw gives - the picture is missing rather than
+wrong.
 ====================
 */
 void idRenderBackendEacp::CopyFramebufferToImage( idImage *image, int x, int y,
 												  int imageWidth, int imageHeight,
 												  bool useOversizedBuffer ) {
-	if ( !warnedCopyFramebuffer ) {
-		warnedCopyFramebuffer = true;
-		common->Warning( "eacp: copying the framebuffer into an image is not implemented yet" );
+	backEnd.c_copyFrameBuffer++;
+
+	if ( image == NULL || !eacpFrame || !frameTarget ) {
+		// Outside a frame, which is where a level load's own screen update and
+		// a console command run. There is nothing composed to copy.
+		if ( !warnedCopyFramebuffer ) {
+			warnedCopyFramebuffer = true;
+			common->Warning( "eacp: the frame can only be copied into an image "
+							 "from inside one" );
+		}
+
+		return;
 	}
 
-	backEnd.c_copyFrameBuffer++;
+	if ( cvarSystem->GetCVarBool( "g_lowresFullscreenFX" ) ) {
+		imageWidth = 512;
+		imageHeight = 512;
+	}
+
+	int	potWidth = MakePowerOfTwo( imageWidth );
+	int	potHeight = MakePowerOfTwo( imageHeight );
+
+	image->GetDownsize( imageWidth, imageHeight );
+	image->GetDownsize( potWidth, potHeight );
+
+	if ( imageWidth < 1 || imageHeight < 1 ) {
+		return;
+	}
+
+	// The region in the target's own rows, which run the other way. Refused
+	// rather than clamped if it does not fit, for the reason eacp's own
+	// Texture::update gives: a clamped region goes on reading at the width it
+	// was asked for and quietly produces a skewed picture.
+	const int	top = frameTargetHeight - ( y + imageHeight );
+
+	if ( x < 0 || top < 0 || x + imageWidth > frameTargetWidth
+		 || y + imageHeight > frameTargetHeight ) {
+		return;
+	}
+
+	idEacpRenderProgs::blitDraw_t	draw = eacpRenderProgs.CaptureDraw();
+
+	if ( !draw.pipeline ) {
+		return;
+	}
+
+	GPU::Texture *	texture = TextureFor( image );
+
+	// Only resize if what is there cannot hold it at all, or - when the caller
+	// is not asking for an oversized buffer - if it is not the size asked for.
+	// The first is what stops a subview rendering at one size from thrashing
+	// the texture a full view left. The third case is this backend's own: an
+	// image that has only ever been uploaded to has a texture that cannot be
+	// rendered into, whatever size it is.
+	const bool	rebuild = texture == NULL
+		|| !texture->isRenderTarget()
+		|| ( useOversizedBuffer
+			 && ( image->uploadWidth < potWidth || image->uploadHeight < potHeight ) )
+		|| ( !useOversizedBuffer
+			 && ( image->uploadWidth != potWidth || image->uploadHeight != potHeight ) );
+
+	if ( rebuild ) {
+		image->uploadWidth = potWidth;
+		image->uploadHeight = potHeight;
+
+		GPU::TextureDescriptor	descriptor;
+
+		descriptor.width = potWidth;
+		descriptor.height = potHeight;
+		descriptor.format = GPU::TextureFormat::RGBA8Unorm;
+		descriptor.renderTarget = true;
+
+		ReplaceTexture( image, makeOwned<GPU::Texture>( GPU::Device::shared(),
+														descriptor, (const void *)NULL ) );
+
+		texture = TextureFor( image );
+
+		if ( !texture->isValid() || !texture->isRenderTarget() ) {
+			common->Warning( "eacp: no %ix%i render target for image '%s'",
+							 potWidth, potHeight, image->imgName.c_str() );
+			ReplaceTexture( image, NULL );
+			return;
+		}
+	}
+
+	image->type = TT_2D;
+
+	// What the GL backend sets on the texture object at this same point, said
+	// in the two fields this backend reads its sampling from - eacp bakes the
+	// sampler into the shader, so an image's filter and repeat are not state to
+	// set on it but the choice of which compiled variant samples it. Linear and
+	// clamp either way, which is what a screen-sized copy wants and is not what
+	// the image was created with: CaptureRenderToImage asks for TR_REPEAT.
+	image->filter = TF_LINEAR;
+	image->repeat = TR_CLAMP;
+
+	// The pass this is drawn from cannot be the one that is drawing the frame,
+	// so the frame's pass is put down here and picked up at the end with
+	// everything it had - see SuspendPass.
+	const bool	resume = SuspendPass();
+
+	draw.program->image = *frameTarget;
+
+	GPU::RenderPassDescriptor	descriptor;
+
+	// Cleared only when the texture is new, which is where GL memsets its
+	// power-of-two allocation to zero; a texture that is being copied over
+	// again keeps whatever the last copy left outside the region, exactly as
+	// glCopyTexSubImage2D does.
+	descriptor.clear = rebuild;
+
+	GPU::RenderPass	into = eacpFrame->beginPass( *texture, descriptor );
+
+	// The region, then the row and the column GL duplicates past its edges when
+	// the copy does not fill the power-of-two allocation - so a bilerp one texel
+	// outside the picture reads the picture's own edge rather than the zeroes
+	// beside it.
+	CopyFrameRegion( into, draw, x, y, imageWidth, imageHeight,
+					 0, 0, imageWidth, imageHeight );
+
+	if ( imageWidth != potWidth ) {
+		CopyFrameRegion( into, draw, x + imageWidth - 1, y, 1, imageHeight,
+						 imageWidth, 0, 1, imageHeight );
+	}
+
+	if ( imageHeight != potHeight ) {
+		CopyFrameRegion( into, draw, x, y + imageHeight - 1, imageWidth, 1,
+						 0, imageHeight, imageWidth, 1 );
+	}
+
+	into.end();
+
+	if ( resume ) {
+		ResumePass();
+	}
+}
+
+/*
+====================
+idRenderBackendEacp::CopyFrameRegion
+
+One rectangle of the frame target onto one rectangle of an image, and the whole
+of what a "copy" is on a backend that has no copy: a quad, a viewport and two
+texture coordinates.
+
+The source is in GL's coordinates - measured up from the bottom - because that
+is what CopyFramebufferToImage was handed; the destination is in the image's own
+rows, which run down from the top. So the source's *bottom* edge is the
+destination's first row, and that inversion is the whole reason the two
+rectangles are not simply the same numbers.
+====================
+*/
+void idRenderBackendEacp::CopyFrameRegion( GPU::RenderPass &into,
+										   const idEacpRenderProgs::blitDraw_t &draw,
+										   int srcX, int srcY, int srcWidth, int srcHeight,
+										   int dstX, int dstY, int dstWidth, int dstHeight ) {
+	const float	s0 = (float)srcX / (float)frameTargetWidth;
+	const float	s1 = (float)( srcX + srcWidth ) / (float)frameTargetWidth;
+
+	// The region's bottom edge and its top edge, as rows of the target.
+	const float	tBottom = (float)( frameTargetHeight - srcY ) / (float)frameTargetHeight;
+	const float	tTop = (float)( frameTargetHeight - ( srcY + srcHeight ) )
+					   / (float)frameTargetHeight;
+
+	const eacpBlitVert_t	quad[6] = {
+		{ { -1.0f,  1.0f }, { s0, tBottom } },
+		{ { -1.0f, -1.0f }, { s0, tTop } },
+		{ {  1.0f, -1.0f }, { s1, tTop } },
+		{ { -1.0f,  1.0f }, { s0, tBottom } },
+		{ {  1.0f, -1.0f }, { s1, tTop } },
+		{ {  1.0f,  1.0f }, { s1, tBottom } },
+	};
+
+	const GPU::Buffer &	vertices = eacpRenderProgs.StreamVertices( quad, sizeof( quad ) );
+
+	into.setViewport( Graphics::Rect( (float)dstX, (float)dstY,
+									  (float)dstWidth, (float)dstHeight ) );
+
+	into.setPipeline( *draw.pipeline );
+	into.setVertexBuffer( vertices );
+
+	draw.program->bindTextures( into );
+
+	into.draw( 6 );
 }
 
 void idRenderBackendEacp::CopyDepthbufferToImage( idImage *image, int x, int y,
 												  int imageWidth, int imageHeight,
 												  bool useOversizedBuffer ) {
+	// #3877's early depth capture, which feeds _currentDepthImage to the soft
+	// particle program - and that program is behind BE_ARB2, so nothing on this
+	// backend samples what this would write. r_enableDepthCapture is what asks,
+	// and FillDepthBuffer says where it does not.
 }
 
 /*
@@ -2654,13 +2980,18 @@ bool idRenderBackendEacp::ReadPixels( int x, int y, int width, int height, byte 
 		return false;
 	}
 
-	EndPass();
+	const bool	resume = SuspendPass();
+
 	eacpFrame->flush();
 
 	byte *	bgra = (byte *)R_StaticAlloc( width * height * 4 );
 
 	frameTarget->read( Graphics::Rect( (float)x, (float)top,
 									   (float)width, (float)height ), bgra );
+
+	if ( resume ) {
+		ResumePass();
+	}
 
 	const int	row = ( width * 3 + 3 ) & ~3;
 
