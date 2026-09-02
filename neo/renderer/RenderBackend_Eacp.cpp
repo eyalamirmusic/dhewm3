@@ -99,6 +99,12 @@ extern idCVar r_useCarmacksReverse;
 static GPU::GPUView *	eacpView = NULL;
 static GPU::Frame *		eacpFrame = NULL;
 
+// Whether a screen has already been put on the drawable inside the frame that
+// is open, which is what tells SwapBuffers that this frame is carrying more
+// than one of them. Cleared with the frame rather than counted, since all that
+// is ever asked of it is "again?".
+static bool				eacpFramePresented = false;
+
 void R_EacpSetView( GPU::GPUView *view ) {
 	eacpView = view;
 }
@@ -109,6 +115,7 @@ GPU::GPUView *R_EacpGetView( void ) {
 
 void R_EacpSetFrame( GPU::Frame *frame ) {
 	eacpFrame = frame;
+	eacpFramePresented = false;
 }
 
 /*
@@ -1273,11 +1280,37 @@ reaches the drawable, because the drawable is not what it was drawn into.
 
 Closing the pass first is not optional: a pass outliving the frame that made it
 is undefined, and the one below samples what this one wrote.
+
+**And a frame that reaches here twice submits the first one on its own.** One
+eacp frame is one command buffer, and dhewm3 puts more than one screen on some
+of them: a level load runs whole BeginFrame/Draw/EndFrame rounds inside the one
+common->Frame() the frame is open around - idSessionLocal::PacifierUpdate on
+every print, CompleteWipe for com_wipeSeconds, and ShowLoadingGui for a second,
+which is 60 rounds when the game clock paces it and thousands when com_fixedTic
+takes the pacing away. Each round records two more render passes onto this
+command buffer, and one that collects thousands of them runs the driver out of
+kernel storage: on Metal that is an abort inside IOGPU if it lands while an
+encoder is being opened, and otherwise a command buffer that quietly stops
+being able to draw - a black frame for the rest of the run, which is what a
+`com_fixedTic 1` level load used to be.
+
+So the screen before this one goes as its own submission, which is what
+Frame::flush is: the work is sent and the frame carries on recording. Deferred
+to the *next* SwapBuffers rather than done after every one, so that a frame
+presenting once - which is every frame that is not a load - is submitted exactly
+as it was before and costs nothing.
 ======================
 */
 void idRenderBackendEacp::SwapBuffers( void ) {
 	EndPass();
+
+	if ( eacpFrame && eacpFramePresented ) {
+		eacpFrame->flush();
+	}
+
 	PresentFrameTarget();
+
+	eacpFramePresented = ( eacpFrame != NULL );
 }
 
 /*
