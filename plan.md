@@ -443,9 +443,9 @@ Numbers are never reused, so a hole is an entry that closed.
    reason, and the region-shaped `update` and `read` are no-ops on a cube rather
    than quietly addressing +X.
 
-   In the working tree of eacp at `e2df82a`, **uncommitted** as of this step —
-   the dhewm3 build is pointed at that checkout with `CPM_eacp_SOURCE` until it
-   lands on `main` — with the GPU suite at **261 tests, all passing** against
+   On eacp `main` as `1178e12`, committed after the step from the working tree
+   the dhewm3 build was pointed at with `CPM_eacp_SOURCE` meanwhile, with the
+   GPU suite at **261 tests, all passing** against
    253 before, clean under `MTL_DEBUG_LAYER=1` with `MTL_SHADER_VALIDATION=1`
    and GPU validation. The D3D12 half is written and unrun, the eacp host being
    macOS-only (§8) — the same standing gap 22's entry carries.
@@ -711,7 +711,7 @@ Numbers are never reused, so a hole is an entry that closed.
     float about one; the number this has to keep apart from the far plane is the
     soft-particle shader's own 0.9994 clamp.
 
-    On eacp `main` at `e652e7a` plus this change, with the full suite at **1332
+    On eacp `main` as `df86cb6`, with the full suite at **1332
     tests, all passing** and the GPU half (265 of them) clean under
     `MTL_DEBUG_LAYER=1` with `MTL_SHADER_VALIDATION=1` and GPU validation.
     `Tests/GPU/DepthTextureTests.cpp` pins all three claims: that a target says
@@ -721,10 +721,20 @@ Numbers are never reused, so a hole is an entry that closed.
     none did, and that an R32Float target hands back 0.9994 rather than 1. The
     D3D12 half is written and unrun, the eacp host being macOS-only (§8).
 
-    **The eacp change itself is uncommitted.** It stands in the `~/Code/eacp`
-    working tree awaiting the user's own commit — eacp's rules do not let an
-    agent commit there — so `e652e7a` is the parent it applies to rather than
-    the SHA that carries it, and this entry will record that SHA once it exists.
+    **Landed on eacp `main` as `df86cb6`**, the user's own commit — eacp's rules
+    do not let an agent make one — and it carries `Apps/GPU/DepthSampling` with
+    it: the feature's first consumer outside the tests, and the effect it was
+    built for. Four panels of one scene — the colour plane, the depth plane
+    through `depthTexture()` as a grey ramp, six steam puffs cut off along a
+    straight line where they enter the floor, and the same six fading over 0.4
+    world units against the depth the first pass kept — and a headless `--check`
+    that prints the precision argument in the scene's own units: one step of the
+    format at the probe's depth is 0.000005 world units in `R32Float`, 0.04 in a
+    half float and 0.35 in a byte, so the fade is 76260 steps of the copy, nine
+    of a half float and one of a byte. Writing it also found what the feature
+    still lacks, which is gap 27, and corrected two claims in the test file's own
+    prose: without `Keep` the depth samples as 0.0 everywhere on an Apple M5 Max
+    too, and a half float does hold one value between 0.9994 and 1.
 
 25. **The drawable's depth buffer still cannot be sampled, only a texture
     target's.** Step 6 closed gap 24 by letting a
@@ -759,6 +769,29 @@ Numbers are never reused, so a hole is an entry that closed.
     names in `Graphics::MouseCursor` — `NSCursor` has
     `_windowResizeNorthEastSouthWestCursor` and both platforms have a wait
     cursor — and the mapping in `Gui::toMouseCursor` to go with them.
+
+27. **The EDSL has no fragment-coordinate builtin.** Every use `RenderPass.h`
+    names for a sampleable depth — a soft particle fading at the wall behind it,
+    a fog thick by distance, a decal projected onto what is there — needs the
+    fragment's own screen position to find the texel under it, and both backends
+    hand it over for free: MSL's `[[position]]` as a fragment input, HLSL's
+    `SV_Position`. `ShaderEmitter.cpp` already prints those two spellings, but
+    only for the vertex output, so there is no EDSL surface for it. Three
+    programs now rebuild it by hand from a clip-space varying divided by w with a
+    y flip — the port's heat haze (4e.8), its soft particles (step 6) and
+    `Apps/GPU/DepthSampling` — and the flip is the kind of line that is silently
+    wrong.
+
+    Found by the demo as the feature's first consumer outside the tests, along
+    with three smaller things worth a line each rather than a number: which way
+    `v` runs when sampling a target one drew into is documented nowhere near the
+    depth API, and the demo inferred it from a test's quad table;
+    `supportsComputeWrite` refuses `R32Float` although the format's own comment
+    lists kernel-written uses, and `R32_FLOAT` is in D3D12's guaranteed
+    typed-UAV set where the `RGBA32Float` it allows is not; and
+    `setFragmentDepthTexture` through a target made without `sampleableDepth` is
+    a silent no-op where the analogous wrong-kind binds assert. Nothing in the
+    port is blocked on any of them.
 
 ### Checked, and *not* gaps
 
@@ -823,10 +856,11 @@ retail install. Since step 5 the build tree the gate defaults to is
 `cmake-build-eacp`; the `cmake-build-debug` this was first written against still
 holds the Phase 1 SDL/GL binary, which is what `gate.sh`'s libSDL3 guard is for.
 Since step 7 that tree is configured with `-DCPM_eacp_SOURCE=$HOME/Code/eacp
--DCPM_imgui-eacp_SOURCE=$HOME/Code/imgui-eacp`, because steps 6 and 7 each depend
-on changes that stand in those working trees and are not yet on either
-repository's `main`: a tree configured without the two overrides fetches `main`
-and does not build until they are committed.
+-DCPM_imgui-eacp_SOURCE=$HOME/Code/imgui-eacp`. The first is the convenience
+`CMake/Eacp.cmake` describes, step 6's eacp change being on `main` as
+`df86cb6`; the second is still required, because step 7's imgui-eacp change
+stands in that working tree and is not yet on its `main` — a tree configured
+without it fetches `main` and does not build until it is committed.
 
 ### Phase 2 — cut the platform layer and the backend together ← **done, apart from the Windows host**
 
@@ -3152,9 +3186,9 @@ validation: nothing in the log but the two "Validation Enabled" lines.
 **What is not here.** The drawable's own depth buffer, which `GPUView::setDepth`
 still creates render-target-only — §5's gap 25. Nothing in this port wants it,
 everything having gone through the frame target since 4e.1, but the eacp API is
-asymmetric now in a way it was not before. And the eacp side of this step is not
-committed: it waits in the `~/Code/eacp` working tree for the user's own commit,
-which gap 24 says more about.
+asymmetric now in a way it was not before. The eacp side of this step is on
+`main` as `df86cb6`, together with the `DepthSampling` example that shows it;
+gap 24 says more about both.
 
 #### Step 7 — the settings menu on eacp — **done**
 
@@ -3209,8 +3243,8 @@ the event-feeding rules out of `ImGuiView` into `Gui::sendMousePosition` /
 this port and `ImGuiView` feed an `ImGuiIO` through one implementation of each
 rule rather than two — the rules worth sharing being which wheel delta is one
 ImGui notch and which of a key's characters count as typing. **Both are
-uncommitted**, the way step 6's eacp change is: they stand in the
-`~/Code/imgui-eacp` working tree awaiting the user's own commit — imgui-eacp's
+uncommitted**, the way step 6's eacp change was until it landed: they stand in
+the `~/Code/imgui-eacp` working tree awaiting the user's own commit — imgui-eacp's
 rules, like eacp's, do not let an agent commit there — with its own tests at **19
 of 19**, and this section will record the SHA once it exists.
 
