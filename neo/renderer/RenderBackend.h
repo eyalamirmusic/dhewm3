@@ -66,6 +66,13 @@ Suite 120, Rockville, Maryland 20850 USA.
 typedef struct srfTriangles_s srfTriangles_t;
 class idImage;
 
+// Dear ImGui's finished frame - the vertex and index buffers, the draw lists,
+// the clip rectangles and the textures the settings menu wants uploaded. Named
+// rather than included because this header is the seam and Dear ImGui is not
+// the renderer's business: sys/sys_imgui.cpp owns the menu, calls ImGui::Render
+// and hands the result here.
+struct ImDrawData;
+
 // Which of the frontend's paths a backend consumes. Doom 3 had one per family
 // of hardware; all but ARB2 were deleted long before this port, and step 5
 // deleted that one too, so there is one left. It is not only a backend's own
@@ -132,6 +139,30 @@ public:
 	// Present. Does not include the frame's own end-of-frame work - the
 	// renderer still drives ImGui around this.
 	virtual void			SwapBuffers( void ) = 0;
+
+	// Dear ImGui's renderer backend: the settings menu drawn into the frame the
+	// engine has just finished, from RB_SwapBuffers and therefore before the
+	// present above.
+	//
+	// It is on the seam rather than in sys/sys_imgui.cpp because that file is
+	// the menu and this is a renderer - triangles with a texture, a scissor
+	// rectangle and a blend, which is a thing only a backend can say. ImGui
+	// ships an OpenGL backend and a Metal one and neither fits: the port's
+	// renderer is an idRenderBackend rather than either API, and what the menu
+	// has to be drawn *into* is the frame this backend is composing.
+	//
+	// A backend implements it by doing whatever its API's own Dear ImGui backend
+	// does, plus the two things that being *inside somebody else's frame* adds:
+	// the draws land in the target the frame is composed into, and whatever
+	// state the last view left - a viewport, a scissor - is given back first.
+	//
+	// What to declare on the ImGuiIO about it is the host's business rather than
+	// this file's, because only the host knows which backend it linked; here
+	// that is sys/eacp/ImGuiBackend.cpp.
+	//
+	// A no-op on a backend that has no answer, which is what the whole of this
+	// interface does with a path it has not been taught.
+	virtual void			DrawImGui( ImDrawData *drawData ) = 0;
 
 	// The GLS_* bitfield from tr_local.h: blend, depth func, depth and colour
 	// masks, alpha test, polygon mode. This is the whole of Doom 3's per-draw

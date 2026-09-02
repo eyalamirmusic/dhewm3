@@ -50,6 +50,10 @@ void mouseButton(const Graphics::MouseEvent& event, bool down);
 void mouseMotion(const Graphics::MouseEvent& event);
 void mouseWheel(const Graphics::MouseEvent& event);
 
+// The pointer left the window, which is the settings menu's business and not
+// the engine's - Doom 3 has no notion of a cursor that is nowhere.
+void mouseExited();
+
 // eacp reports Shift, Ctrl, Alt and Command as modifier *state* and never as
 // key events (plan.md §5, gap 9), and Doom 3 binds all but Command as ordinary
 // keys - _attack, _strafe and _speed in the stock config. So they are polled

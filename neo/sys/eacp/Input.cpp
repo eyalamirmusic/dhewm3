@@ -18,6 +18,7 @@ arrive as callbacks and want the same treatment.
 */
 
 #include "Input.h"
+#include "ImGuiBackend.h"
 #include "View.h"
 
 #include <eacp/Graphics/Window/Window.h>
@@ -642,9 +643,25 @@ View* getView()
     return activeView;
 }
 
+/*
+    The settings menu gets first refusal on every one of the four producers
+    below, and what it consumes the engine never sees.
+
+    That is where sys/events.cpp put the same decision - `if
+    (D3::ImGuiHooks::ProcessEvent(&ev)) continue;` at the head of its poll loop -
+    and it is the right place for the same reason: an event the menu has used is
+    not an event the game missed, it is an event that was addressed to the menu.
+    What is different is only the shape. SDL had one tagged union and so one
+    function; eacp has four typed callbacks, so the question is asked four times,
+    and ImGuiBackend.h says what the answer depends on.
+*/
+
 void keyEvent(const KeyEvent& event, bool down)
 {
     if (!engineWantsInput())
+        return;
+
+    if (ImGuiBackend::keyEvent(event, down))
         return;
 
     // Before the key itself, so the modifier's own down lands ahead of what it
@@ -716,6 +733,9 @@ void mouseButton(const MouseEvent& event, bool down)
     if (!engineWantsInput())
         return;
 
+    if (ImGuiBackend::mouseButton(event, down))
+        return;
+
     // Same reason as in keyEvent: a Ctrl-click has to reach the engine as Ctrl
     // and then the button, in that order.
     syncModifiers(event.modifiers);
@@ -759,6 +779,9 @@ void mouseButton(const MouseEvent& event, bool down)
 void mouseMotion(const MouseEvent& event)
 {
     if (!engineWantsInput())
+        return;
+
+    if (ImGuiBackend::mouseMotion(event))
         return;
 
     if (!inRelativeMouseMode)
@@ -815,6 +838,9 @@ void mouseWheel(const MouseEvent& event)
     if (!engineWantsInput())
         return;
 
+    if (ImGuiBackend::mouseWheel(event))
+        return;
+
     // A notched wheel reports whole lines and a trackpad reports points, so one
     // press of K_MWHEELUP is not the same number in the two cases. eacp says
     // which arrived; these are the thresholds that make a detent one notch and
@@ -848,8 +874,19 @@ void mouseWheel(const MouseEvent& event)
     }
 }
 
+void mouseExited()
+{
+    ImGuiBackend::mouseExited();
+}
+
 void syncModifiers(const ModifierKeys& current)
 {
+    // The menu wants these whether or not the engine does, and unconditionally
+    // rather than as something to consume: a modifier is state rather than an
+    // event, so there is nothing for the game to be denied. What the game is
+    // denied is the *key* it modifies, which keyEvent above decides.
+    ImGuiBackend::syncModifiers(current);
+
     if (!engineWantsInput())
     {
         heldModifiers = current;
@@ -870,9 +907,23 @@ void syncModifiers(const ModifierKeys& current)
         {current.command, heldModifiers.command, K_LWIN},
     };
 
+    const auto menuTakesKeys = ImGuiBackend::capturesKeyboard();
+
     for (const auto& change: changes)
-        if (change.held != change.wasHeld)
-            pushKeyEvent(change.key, change.held);
+    {
+        if (change.held == change.wasHeld)
+            continue;
+
+        // The same rule the four producers follow: a press the menu is taking
+        // is not the game's, and a release always is - so Ctrl held before the
+        // menu got focus is let go of rather than firing the weapon for the
+        // rest of the run. It matters here more than it looks: the stock config
+        // binds Shift and Ctrl to _speed and _attack.
+        if (change.held && menuTakesKeys)
+            continue;
+
+        pushKeyEvent(change.key, change.held);
+    }
 
     // One key each for Shift, Ctrl and Alt, where the SDL build tells the left
     // and the right ones apart (K_SHIFT against K_RIGHT_SHIFT). eacp's
@@ -884,6 +935,10 @@ void syncModifiers(const ModifierKeys& current)
 void setFocus(bool hasFocus)
 {
     inHasFocus = hasFocus;
+
+    // Not consumable, and told either way: the menu has its own keys to let go
+    // of, for the same reason the engine does.
+    ImGuiBackend::setFocus(hasFocus);
 
     if (hasFocus || !engineWantsInput())
         return;

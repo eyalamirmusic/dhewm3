@@ -44,6 +44,14 @@ Suite 120, Rockville, Maryland 20850 USA.
 
 #include "renderer/RenderProgs_Eacp.h"
 
+// Dear ImGui and its eacp backend, for the same reason and on the same side of
+// the line: both are full of standard headers, so they go above Doom 3's rather
+// than below them. This is the file where the settings menu's draw lists become
+// draws, and the only place in the renderer that has heard of either.
+#ifndef IMGUI_DISABLE
+  #include <imgui-eacp/ImGuiEacp.h>
+#endif
+
 #include "sys/platform.h"
 
 #include "renderer/tr_local.h"
@@ -207,6 +215,7 @@ public:
 	virtual void	SetDefaultState( void );
 	virtual void	SetDrawBuffer( int buffer );
 	virtual void	SwapBuffers( void );
+	virtual void	DrawImGui( ImDrawData *drawData );
 	virtual void	SetState( int stateBits );
 	virtual void	ClearStateDelta( void );
 	virtual void	SetCull( int cullType );
@@ -302,6 +311,17 @@ private:
 
 	// And the pass that puts the finished one on the screen.
 	void			PresentFrameTarget( void );
+
+	// The settings menu's renderer, which is imgui-eacp's rather than this
+	// file's. Built on the first frame that has a menu to draw, because building
+	// it compiles a shader and a pipeline and a run that never opens the menu
+	// should pay for neither.
+	bool			EnsureImGuiRenderer( void );
+
+	// The textures ImGui still holds, handed back while its context is still
+	// alive. Shutdown's, and the ordering is what makes it possible - see the
+	// definition.
+	void			ReleaseImGuiTextures( void );
 
 	// One rectangle of the frame target onto one rectangle of an image, which
 	// is what a copy is on a backend that has no copy. Both are in pixels; the
@@ -553,6 +573,15 @@ private:
 	int					cubeFaceBytes;
 	int					cubeFacesFilled;
 
+	// imgui-eacp's renderer half, and everything the settings menu costs the GPU:
+	// one shader, one pipeline, the font atlas and a streaming buffer pair. In
+	// an optional because its constructor builds the pipeline, so it cannot be
+	// made before there is a device - and should not be made at all until a menu
+	// is opened.
+#ifndef IMGUI_DISABLE
+	std::optional<Gui::DrawRenderer>	imguiRenderer;
+#endif
+
 	// What the next DrawIndexed will use, and the reason the GL backend needs
 	// no equivalent: in OpenGL every one of these *is* context state, set by
 	// whoever last touched it and still there when glDrawElements is reached.
@@ -784,6 +813,10 @@ idRenderBackendEacp::Shutdown
 void idRenderBackendEacp::Shutdown( void ) {
 	EndPass();
 	memset( boundImages, 0, sizeof( boundImages ) );
+
+	// Before the frame target below, and before GLimp_Shutdown takes the window
+	// away: the ImGui context is still alive here and is told what went.
+	ReleaseImGuiTextures();
 
 	// While there is still a device to hand it back to - this backend is a
 	// static, and its destructor runs long after the device has gone.
@@ -1116,6 +1149,168 @@ void idRenderBackendEacp::SwapBuffers( void ) {
 	EndPass();
 	PresentFrameTarget();
 }
+
+/*
+================================================================================
+
+	Dear ImGui.
+
+	The dhewm3 settings menu, which is dhewm3's own feature rather than id's and
+	is the reason step 5 kept it compiled rather than deleting it (plan.md §7).
+
+	**Almost none of this is written here.** ImGui needs two backends under it -
+	a platform one that feeds ImGuiIO and a renderer one that draws ImDrawData -
+	and both already exist for eacp, in imgui-eacp: `Gui::DrawRenderer` is the
+	renderer half, with ImGui's shader in eacp's EDSL, its textures on
+	Texture::update's region overload and its geometry through
+	GPU::StreamingBuffers. What is left for this file is where in the frame the
+	two halves of it run.
+
+	**The order is the whole of the integration, and it is not free choice.**
+	prepare() creates textures, uploads to them and rewrites the streaming
+	buffers, all of which both of eacp's backends want done with no encoder open;
+	encode() records draws and therefore has to be inside one. The frame's pass
+	is open when RB_SwapBuffers reaches here, so the sequence is suspend, prepare,
+	resume, encode - which is 4e.3's machinery doing exactly what it was built
+	for, a pass interrupted and put back with the colour, depth and stencil it
+	left.
+
+================================================================================
+*/
+
+#ifndef IMGUI_DISABLE
+
+/*
+======================
+idRenderBackendEacp::EnsureImGuiRenderer
+
+Built on the first frame that has a menu to draw rather than at Init, so a run
+that never opens one compiles neither the shader nor the pipeline. That is worth
+the `if`: DrawImGui is only reached at all once a window has been opened, because
+D3::ImGuiHooks::EndFrame returns before it otherwise.
+
+**The target it is told about is the frame's, not the drawable's.** Since 4e.1
+the frame is composed into an app-owned texture that carries a depth-stencil
+buffer, and both of eacp's backends reject a draw whose pipeline disagrees with
+its pass about that - so the pipeline has to declare the two planes even though
+the UI neither tests nor writes either. That is what Gui::DrawTarget is for, and
+it is the one thing this integration needed imgui-eacp to grow: ImGuiView opens
+its own pass with no depth at all, and an overlay drawn inside somebody else's
+frame does not get to.
+======================
+*/
+bool idRenderBackendEacp::EnsureImGuiRenderer( void ) {
+	if ( imguiRenderer.has_value() ) {
+		return true;
+	}
+
+	Gui::DrawTarget	target;
+
+	// Single-sampled, which is the render target's rather than a preference
+	// (§5, gap 20), and BGRA8Unorm, which EnsureFrameTarget picked so that these
+	// pipelines could draw into either it or the drawable.
+	target.sampleCount = 1;
+	target.colorFormat = GPU::PixelFormat::BGRA8Unorm;
+	target.depth = true;
+	target.stencil = true;
+
+	imguiRenderer.emplace( target );
+
+	return true;
+}
+
+/*
+======================
+idRenderBackendEacp::ReleaseImGuiTextures
+
+Called from Shutdown, and the ordering it depends on is already right:
+idRenderSystemLocal::ShutdownOpenGL runs the backend down *before* GLimp_Shutdown,
+and GLimp_Shutdown is what destroys the ImGui context. So the ImTextureData the
+atlas is named in are still there to be handed back, which is the one moment ImGui
+cannot ask for the destroys itself - the atlases go down with the context.
+======================
+*/
+void idRenderBackendEacp::ReleaseImGuiTextures( void ) {
+	if ( !imguiRenderer.has_value() ) {
+		return;
+	}
+
+	if ( ImGui::GetCurrentContext() != NULL ) {
+		imguiRenderer->releaseTextures( ImGui::GetPlatformIO().Textures );
+	}
+
+	imguiRenderer.reset();
+}
+
+/*
+======================
+idRenderBackendEacp::DrawImGui
+
+ImDrawData, drawn into the frame the engine has just finished. Reached from
+RB_SwapBuffers by way of D3::ImGuiHooks::EndFrame, which is before SwapBuffers
+above - so the menu is in the render target when the blit carries it to the
+screen.
+
+**The pass is normally still open here**, because nothing between the last view
+and this closes one. It is suspended rather than simply ended, so that resuming
+loads back the colour the frame drew and the depth and stencil planes it wrote:
+the pipeline declares both, and a pass that cleared them would be a different
+attachment as far as the API is concerned. A frame with no pass at all - one
+drawn while a level loads - opens one without the colour clear instead.
+
+The viewport and the scissor are given back to the whole target before encoding.
+The last view left a sub-rectangle in both, and ImGui's projection covers the
+display: left alone, the menu would be squashed into whatever the last view was
+drawing.
+======================
+*/
+void idRenderBackendEacp::DrawImGui( ImDrawData *drawData ) {
+	if ( !drawData || !eacpFrame ) {
+		return;
+	}
+
+	if ( !EnsureImGuiRenderer() ) {
+		return;
+	}
+
+	const bool	hadPass = SuspendPass();
+
+	// Textures and geometry, with no encoder open - which is what the suspend
+	// above is for and the reason this cannot simply happen inside the pass.
+	imguiRenderer->prepare( *drawData );
+
+	if ( hadPass ) {
+		ResumePass();
+	} else {
+		BeginPass( false );
+	}
+
+	if ( !pass ) {
+		return;
+	}
+
+	pass->clearViewport();
+	pass->clearScissorRect();
+
+	hasViewport = false;
+	hasScissor = false;
+
+	imguiRenderer->encode( *pass );
+
+	// encode() gives the scissor back itself; the fields above are what say so
+	// to the rest of this file, since a pass on this backend carries both and
+	// SwapBuffers is about to end this one anyway.
+}
+
+#else
+
+void idRenderBackendEacp::DrawImGui( ImDrawData * ) {
+}
+
+void idRenderBackendEacp::ReleaseImGuiTextures( void ) {
+}
+
+#endif
 
 /*
 ================================================================================

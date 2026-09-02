@@ -25,6 +25,7 @@ away entirely when idRenderBackendEacp landed.
 #include "framework/Common.h"
 #include "renderer/tr_local.h"
 #include "renderer/RenderBackend_Eacp.h"
+#include "sys/sys_imgui.h"
 
 static void GLimp_Unreachable( const char *what ) {
 	// Not a warning. Every one of these is either OpenGL's own or a window
@@ -77,6 +78,18 @@ bool GLimp_Init( glimpParms_t parms ) {
 					glConfig.vidWidth, glConfig.vidHeight,
 					glConfig.winWidth, glConfig.winHeight, scale );
 
+	// The settings menu, which the SDL host also brought up from here - at the
+	// end of glimp.cpp's own GLimp_Init, once there was a window and a context
+	// to draw into. Here there is a window and the two sizes just measured,
+	// which is what the menu's scale and its projection are measured against;
+	// the render backend comes up after this and neither half of ImGui touches
+	// the device before its first draw.
+	//
+	// A failure is not fatal, and is not treated as one anywhere: Init warns and
+	// leaves imguiCtx NULL, which is the thing every entry point in
+	// sys/sys_imgui.cpp holds as "no menu".
+	D3::ImGuiHooks::Init();
+
 	return true;
 }
 
@@ -89,7 +102,13 @@ bool GLimp_SetScreenParms( glimpParms_t parms ) {
 
 void GLimp_Shutdown() {
 	// Reached through idRenderSystemLocal::ShutdownOpenGL, which the shutdown
-	// path calls whether or not anything was ever started. Nothing to undo.
+	// path calls whether or not anything was ever started.
+	//
+	// The settings menu is the one thing there is to undo, and this is where the
+	// SDL host undid it too. The order matters and is already right: that
+	// function runs the render backend down first, which is what lets go of
+	// ImGui's textures while the context they are named in still exists.
+	D3::ImGuiHooks::Shutdown();
 }
 
 void GLimp_SwapBuffers() {

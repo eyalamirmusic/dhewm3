@@ -45,6 +45,7 @@ struct View final : GPU::GPUView
     void mouseUp(const Graphics::MouseEvent& event) override;
     void mouseMoved(const Graphics::MouseEvent& event) override;
     void mouseDragged(const Graphics::MouseEvent& event) override;
+    void mouseExited(const Graphics::MouseEvent& event) override;
     void mouseWheel(const Graphics::MouseEvent& event) override;
 
 private:

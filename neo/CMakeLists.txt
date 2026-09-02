@@ -538,19 +538,19 @@ set(src_idlib
 
 add_globbed_headers(src_idlib "idlib")
 
-# Dear ImGui core only. Its two backends - the SDL3 platform one and the
-# OpenGL2 renderer one - went with the host they belonged to in step 5, and eacp
-# has no replacement for either yet. The menu is still compiled; sys_imgui.cpp
-# says what it does without them.
+# The settings menu, and only the part of it that is dhewm3's own.
+#
+# Dear ImGui itself is no longer compiled here. Its sources are still the ones in
+# libs/imgui - ../CMake/FindImGui.cmake builds them, and says at length why there
+# has to be exactly one copy of them in the binary - but the target they are
+# built into is imgui-eacp's dependency as much as this one's, so it is declared
+# at the repository root where both can see it. This target links imgui::imgui,
+# which brings the headers with it.
+#
+# The two backends that went in step 5 are back, and neither is here: the
+# platform one is sys/eacp/ImGuiBackend.cpp and the renderer one is imgui-eacp's
+# Gui::DrawRenderer, reached through idRenderBackend::DrawImGui.
 set(src_imgui
-	libs/imgui/imgui.h
-	libs/imgui/imgui.cpp
-	libs/imgui/imgui_draw.cpp
-	libs/imgui/imgui_tables.cpp
-	libs/imgui/imgui_widgets.cpp
-
-	libs/imgui/imgui_demo.cpp
-
 	sys/sys_imgui.h
 	sys/sys_imgui.cpp
 	sys/imgui_savestyle.cpp
@@ -754,6 +754,8 @@ set(src_sys
 	sys/eacp/GLimp.cpp
 	sys/eacp/Input.h
 	sys/eacp/Input.cpp
+	sys/eacp/ImGuiBackend.h
+	sys/eacp/ImGuiBackend.cpp
 
 	# Window-system-free, and shared with the SDL/GL host until step 5 deleted
 	# it: the threading is on the standard library, the rest is POSIX and Cocoa.
@@ -804,7 +806,9 @@ if(CORE)
 	# reasons - qgl.h's GL types, idlib's endian macros, the script debugger's
 	# mutexes, and the odds and ends in cpu.cpp, posix_main.cpp and Common.cpp -
 	# and this line is the proof: a surviving reference would not link.
-	target_link_libraries(dhewm3 PRIVATE idlib eacp-gpu OpenAL::OpenAL "-framework Cocoa")
+	# imgui-eacp brings imgui::imgui and eacp-sprites with it, which is where
+	# <imgui.h> and the whole GPU stack come from on this target.
+	target_link_libraries(dhewm3 PRIVATE idlib eacp-gpu imgui-eacp OpenAL::OpenAL "-framework Cocoa")
 
 	if(CURL_FOUND)
 		target_link_libraries(dhewm3 PRIVATE CURL::libcurl)

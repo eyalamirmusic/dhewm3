@@ -181,6 +181,14 @@ void View::mouseDragged(const Graphics::MouseEvent& event)
     Input::mouseMotion(event);
 }
 
+void View::mouseExited(const Graphics::MouseEvent&)
+{
+    // Doom 3 has nothing to do with this - the pointer leaving the window says
+    // nothing about a player's aim - and the settings menu does: a widget the
+    // cursor was over stays highlighted for the rest of the run otherwise.
+    Input::mouseExited();
+}
+
 void View::mouseWheel(const Graphics::MouseEvent& event)
 {
     Input::mouseWheel(event);

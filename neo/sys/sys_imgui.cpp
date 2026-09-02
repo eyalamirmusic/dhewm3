@@ -1,19 +1,21 @@
 
 /*
-The in-game settings menu, with no backend under it.
+The in-game settings menu, and the half of it that belongs to neither backend.
 
-Dear ImGui needs two: a platform backend that feeds it events and a renderer
-backend that draws its vertex buffers. This tree had ImGui_ImplSDL3 and
-ImGui_ImplOpenGL2, and step 5 deleted both of them with the host they belonged
-to. eacp has neither yet - the port's renderer is idRenderBackendEacp rather
-than raw Metal, so ImGui's own imgui_impl_metal.mm is not simply a drop-in, and
-the state save/restore that used to sit in EndFrame() has no analogue here.
+Dear ImGui needs two under it: a platform backend that feeds ImGuiIO and a
+renderer backend that draws ImDrawData. This tree had ImGui_ImplSDL3 and
+ImGui_ImplOpenGL2, and step 5 deleted both with the host they belonged to; step
+7 gave it the two the eacp host needs, and neither of them is here. They are
+imgui-eacp's - Dear ImGui's own eacp integration - reached through
+D3::ImGuiHooks::Backend for the platform half and idRenderBackend::DrawImGui for
+the renderer one, because triangles with a texture, a scissor and a blend are a
+thing only a backend can say.
 
-So the menu is compiled and dark rather than deleted: it is a headline dhewm3
-feature and porting it is a step of its own (plan.md). Init() is what would
-create the ImGui context, and nothing calls it on this build - it returns false
-and says why. Everything else here holds imguiCtx == NULL as the thing that
-means "no menu", and refuses on it rather than dereferencing it.
+**So this file names no window system and no graphics API**, which it did not
+quite manage before: it included SDL for the display scale and qgl for the state
+save around ImGui_ImplOpenGL2_RenderDrawData. What is left is the menu itself -
+the context, the style, the fonts, which windows are open, and the rules for who
+gets an event - and it is the same file on any host that grows the two backends.
 */
 
 #define IMGUI_DEFINE_MATH_OPERATORS
@@ -23,6 +25,7 @@ means "no menu", and refuses on it rather than dereferencing it.
 #include "framework/Common.h"
 #include "framework/KeyInput.h"
 #include "framework/Session_local.h" // sessLocal.GetActiveMenu()
+#include "renderer/RenderBackend.h" // renderBackend->DrawImGui()
 #include "renderer/tr_local.h" // glconfig
 #include "ui/DeviceContext.h"
 #include "ui/UserInterface.h"
@@ -158,11 +161,26 @@ void ShowWarningOverlay( const char* text )
 
 static float GetDefaultScale()
 {
-	// This used to ask the platform backend for the window's display scale.
-	// There is no platform backend on this build, and the one thing the engine
-	// already knows is enough for the HighDPI case: in HighDPI mode the font
-	// sizes are already scaled to window coordinates.
-	return 1.0f;
+	if ( glConfig.winWidth != glConfig.vidWidth ) {
+		// In HighDPI mode the font sizes are already scaled to window
+		// coordinates: ImGuiIO::DisplaySize is in points and the rasterizer
+		// density follows the framebuffer scale, so the glyphs come out sharp
+		// at the size they were asked for and nothing here has to double them.
+		return 1.0f;
+	}
+
+	float ret = Backend::DisplayScale();
+
+	// Validate that the reported scale is a reasonable size
+	// For example: if xrandr fails to read the EDID of the display,
+	// a default value 1mm x 1mm will be reported, resulting in an
+	// absurdly high DPI
+	if ( ret <= 0.0f || ret > 10.0f ) {
+		return 1.0f;
+	}
+
+	ret = round(ret*2.0)*0.5; // round to .0 or .5
+	return ret;
 }
 
 float GetScale()
@@ -181,17 +199,72 @@ void SetScale( float scale )
 
 static bool imgui_initialized = false;
 
-// The two void* were an SDL_Window and an SDL_GLContext, to keep SDL's headers
-// out of sys_imgui.h. Nothing calls this on the eacp host: the ImGui context is
-// created here and only here, so leaving it uncreated is what keeps every other
-// entry point below dark. Creating one without a platform or renderer backend
-// would be worse than not creating it - the menu would take input it cannot
-// draw a response to.
-bool Init(void* window, void* renderContext)
+// The ImGui context is created here and only here, so imguiCtx == NULL stays
+// what "no menu" means everywhere below: a host with no platform backend simply
+// never reaches this, and every entry point holds the same guard rather than
+// dereferencing a context nothing could draw a response through.
+bool Init()
 {
-	common->Warning( "The dhewm3 settings menu is not available on this build yet: "
-	                 "Dear ImGui has no backend for the eacp host.\n" );
-	return false;
+	common->Printf( "Initializing ImGui\n" );
+
+	// Setup Dear ImGui context
+	IMGUI_CHECKVERSION();
+	imguiCtx = ImGui::CreateContext();
+	if ( imguiCtx == NULL ) {
+		common->Warning( "Failed to create ImGui Context!\n" );
+		return false;
+	}
+	ImGuiIO& io = ImGui::GetIO();
+	io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;     // Enable Keyboard Controls
+	io.ConfigFlags |= ImGuiConfigFlags_NavEnableGamepad;      // Enable Gamepad Controls
+
+	static idStr iniPath;
+	iniPath = cvarSystem->GetCVarString( "fs_configpath" );
+	iniPath += "/imgui.ini";
+	io.IniFilename = iniPath.c_str();
+
+  // Setup styles
+	SetImGuiStyle( Style::Dhewm3 );
+	userStyle = ImGui::GetStyle(); // set dhewm3 style as default, in case the user style is missing values
+	if ( DG::ReadImGuiStyle( userStyle, GetUserStyleFilename() ) && imgui_style.GetInteger() == 2 ) {
+		ImGui::GetStyle() = userStyle;
+	} else if ( imgui_style.GetInteger() == 1 ) {
+		ImGui::GetStyle() = ImGuiStyle();
+		ImGui::StyleColorsDark();
+	}
+
+	imgui_scale.SetModified();
+
+	// Setup fonts, size will come from style.FontSizeBase
+#ifdef _MSC_VER
+	io.Fonts->AddFontFromMemoryCompressedTTF(ProggyVector_compressed_data, ProggyVector_compressed_size);
+#else
+	io.Fonts->AddFontFromMemoryCompressedBase85TTF(ProggyVector_compressed_data_base85);
+#endif
+
+	// The backends last, so that everything they may want to look at - the
+	// style, the font, the config flags - is already there. This is where
+	// ImGui is told what the renderer can do, which is a fact about whichever
+	// backend the host linked rather than about this file.
+	if ( !Backend::Init() ) {
+		ImGui::DestroyContext( imguiCtx );
+		imguiCtx = NULL;
+		common->Warning( "Failed to initialize the ImGui backends!\n" );
+		return false;
+	}
+
+	const char* f10bind = idKeyInput::GetBinding( K_F10 );
+	if ( f10bind && f10bind[0] != '\0' ) {
+		if ( idStr::Icmp( f10bind, "dhewm3Settings" ) != 0 ) {
+			// if F10 is already bound, but not to dhewm3Settings, show a message
+			common->Printf( "... the F10 key is already bound to '%s', otherwise it could be used to open the dhewm3 Settings Menu\n" , f10bind );
+		}
+	} else {
+		idKeyInput::SetBinding( K_F10, "dhewm3Settings" );
+	}
+
+	imgui_initialized = true;
+	return true;
 }
 
 void Shutdown()
@@ -199,6 +272,12 @@ void Shutdown()
 	if ( imgui_initialized ) {
 		common->Printf( "Shutting down ImGui\n" );
 
+		Backend::Shutdown();
+
+		// The renderer half has already let its textures go: the backend's own
+		// Shutdown runs before GLimp_Shutdown, which is what calls this, so the
+		// device the textures belong to outlives them by exactly the right
+		// margin (idRenderSystemLocal::ShutdownOpenGL).
 		ImGui::DestroyContext( imguiCtx );
 		imguiCtx = NULL;
 		imgui_initialized = false;
@@ -211,10 +290,12 @@ void NewFrame()
 {
 	D3P_ScopedCPUSample(Imgui_NewFrame);
 
-	// There is no context at all until Init() makes one, and on this build
-	// nothing does. Everything below would then be called on a NULL ImGui
-	// context - which crashed rather than did nothing, because the "all windows
-	// closed" early-out two blocks down still runs a couple of frames first.
+	// Init() is called from the host once the renderer is up, so there is no
+	// context at all when the renderer never started: com_skipRenderer 1, a
+	// dedicated server, or an Init that failed. Everything below would then be
+	// called on a NULL ImGui context - which crashed rather than did nothing,
+	// because the "all windows closed" early-out two blocks down still runs a
+	// couple of frames first.
 	if ( imguiCtx == NULL ) {
 		return;
 	}
@@ -257,6 +338,10 @@ void NewFrame()
 	else
 		ImGui::GetIO().ConfigFlags |= ImGuiConfigFlags_NoMouseCursorChange;
 
+	// Before ImGui::NewFrame, because it is what the frame is measured against:
+	// the display size, its density and the time step.
+	Backend::NewFrame();
+
 	ImGui::NewFrame();
 	haveNewFrame = true;
 
@@ -276,22 +361,21 @@ void NewFrame()
 
 bool keybindModeEnabled = false;
 
-// Was called with every SDL event by Sys_GetEvent(), and returned true if ImGui
-// had handled it. Deciding that is the platform backend's job - it is the half
-// that reads a window system's events and writes ImGuiIO - and there is none
-// here, so no event is ever ImGui's and the engine gets all of them. The eacp
-// input layer does not call this at all; the declaration stays because a host
-// that grows a backend will want it back.
-bool ProcessEvent(const void* event)
-{
-	return false;
-}
-
 void SetKeyBindMode( bool enable )
 {
 	keybindModeEnabled = enable;
 	// make sure no keys are registered as down, neither when entering nor when exiting keybind mode
 	idKeyInput::ClearStates();
+}
+
+bool IsKeyBindMode()
+{
+	return keybindModeEnabled;
+}
+
+void NotifyKeyDownEvent()
+{
+	hadKeyDownEvent = true;
 }
 
 bool ShouldShowCursor()
@@ -370,11 +454,16 @@ void EndFrame()
 	haveNewFrame = false;
 	ImGui::Render();
 
-	// This is where the renderer backend drew ImGui's draw data, wrapped in
-	// save/restore of the fixed-function GL state Doom 3 had left behind. Both
-	// halves went with the GL backend; the draw data is built and dropped.
+	// The renderer backend, and that is the whole of it. What used to be here
+	// besides was save/restore of the fixed-function GL state Doom 3 left
+	// behind - the ARB programs disabled, the array buffer unbound, every
+	// texture unit turned off - because ImGui_ImplOpenGL2 drew through the same
+	// context and would otherwise have inherited all of it. There is no context
+	// to inherit here: every input to a draw is an argument to that draw.
+	renderBackend->DrawImGui( ImGui::GetDrawData() );
 
-	// reset this at the end of each frame, will be set again by ProcessEvent()
+	// reset this at the end of each frame, will be set again by the platform
+	// backend's event handlers through NotifyKeyDownEvent()
 	if ( hadKeyDownEvent ) {
 		hadKeyDownEvent = false;
 	}
@@ -386,9 +475,10 @@ void OpenWindow( D3ImGuiWindow win )
 	if ( imguiCtx == NULL ) {
 		// no context, so no window to open and nothing that could draw one.
 		// SetNextWindowFocus() below dereferences the context unconditionally,
-		// which is what made `dhewm3Settings` a crash rather than a no-op.
-		common->Printf( "The dhewm3 settings menu is not available on this build yet: "
-		                "Dear ImGui has no backend for the eacp host.\n" );
+		// which is what made `dhewm3Settings` a crash rather than a no-op on a
+		// build where Init() never ran.
+		common->Printf( "The dhewm3 settings menu is not available: Dear ImGui "
+		                "was not initialized.\n" );
 		return;
 	}
 
