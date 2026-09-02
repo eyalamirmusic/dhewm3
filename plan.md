@@ -852,22 +852,27 @@ Three things it cost to get there, all written up in `regression/README.md`:
 
 The demo data is already unpacked at `<build tree>/neo/demo/demo00.pk4`
 (`CMake/DemoData.cmake` fetches it at configure time), so the gate needs no
-retail install. Since step 5 the build tree the gate defaults to is
-`cmake-build-eacp`; the `cmake-build-debug` this was first written against still
-holds the Phase 1 SDL/GL binary, which is what `gate.sh`'s libSDL3 guard is for.
-Since step 7 that tree is configured with `-DCPM_eacp_SOURCE=$HOME/Code/eacp
--DCPM_imgui-eacp_SOURCE=$HOME/Code/imgui-eacp`. Both are the convenience
-`CMake/Eacp.cmake` describes and neither is required: step 6's eacp change is on
-`main` as `df86cb6` and step 7's imgui-eacp change as `2617ce4`, and a tree
-configured with no override at all — `cmake-build-verify`, fetching eacp at
-`c051ca7` and imgui-eacp at `2617ce4` from GitHub — builds, links neither SDL
-nor OpenGL, and captures the same 297 frames as the step 7 binary. Getting to
-"the same" took four captures of each, because that afternoon the gate showed
-capture-to-capture jitter for the first time on this build: three of the eight
-captures each moved a single frame by at most nineteen pixels of at most two
-levels, and the two binaries agree to the byte on every capture that did not.
-`regression/README.md` records the numbers and what to do with a single moved
-frame.
+retail install. From step 5 until the day after step 7 the build tree the gate
+defaulted to was the port's own `cmake-build-eacp`, a Debug tree pointed at the
+local eacp and imgui-eacp checkouts with `CPM_eacp_SOURCE` and
+`CPM_imgui-eacp_SOURCE`; the `cmake-build-debug` this was first written against
+still holds the Phase 1 SDL/GL binary, which is what `gate.sh`'s libSDL3 guard
+is for. **It defaults to `cmake-build-release` now**, the IDE's own Release
+tree, which fetches the demo data itself — and it can, because a Release build
+hashes identically to the Debug builds every baseline was captured on: 297 of
+297 against the step 7 baseline, checked before `cmake-build-eacp` was deleted.
+
+Neither source override is required either. Step 6's eacp change is on `main`
+as `df86cb6` and step 7's imgui-eacp change as `2617ce4`, and a tree configured
+with no override at all — fetching eacp at `c051ca7` and imgui-eacp at
+`2617ce4` from GitHub, built once to check exactly this and deleted after —
+built, linked neither SDL nor OpenGL, and captured the same 297 frames as the
+step 7 binary. Getting to "the same" took four captures of each, because that
+afternoon the gate showed capture-to-capture jitter for the first time on this
+build: three of the eight captures each moved a single frame by at most
+nineteen pixels of at most two levels, and the two binaries agree to the byte
+on every capture that did not. `regression/README.md` records the numbers and
+what to do with a single moved frame.
 
 ### Phase 2 — cut the platform layer and the backend together ← **done, apart from the Windows host**
 
@@ -1948,7 +1953,9 @@ enough to say a picture is right, useless for saying a change moved nothing —
 and `regression/gate.sh` took `GAME=dhewm3-eacp` from here on and answered that
 question for this backend the way it had answered it for the GL one since Phase
 1. (Step 5 folded the two targets into one and `GAME` has nothing left to
-choose; `BUILD` defaults to `cmake-build-eacp` now.)
+choose; `BUILD` defaulted to `cmake-build-eacp` from then until that tree was
+deleted the day after step 7, and to `cmake-build-release` since — see the gate
+section under Phase 1.)
 
 Two things about running it, both in `gate.sh`'s own header now. The display has
 to be held awake (`caffeinate -du`), because the engine is driven by the display

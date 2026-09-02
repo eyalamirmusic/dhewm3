@@ -29,7 +29,9 @@
 # and the ways it can sit there are not all worth enumerating.
 #
 # A build tree holds one binary, named dhewm3. BUILD says which tree, and
-# defaults to cmake-build-eacp, the one this port is built in:
+# defaults to cmake-build-release - the IDE's own Release tree, which fetches
+# the demo data itself (FETCH_DEMO_DATA) and hashes identically to the Debug
+# builds every baseline was captured on, 297 of 297 when that was checked:
 #
 #   BUILD=$PWD/some-other-tree ./regression/gate.sh capture x
 #
@@ -61,7 +63,7 @@
 set -eu
 
 root=$(cd "$(dirname "$0")/.." && pwd)
-build=${BUILD:-$root/cmake-build-eacp}
+build=${BUILD:-$root/cmake-build-release}
 timeout=${GATE_TIMEOUT:-300}
 work=$root/regression/work
 gamedir=demo
