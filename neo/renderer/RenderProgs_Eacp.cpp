@@ -467,6 +467,203 @@ void idEacpScreenProgram::define( void ) {
 /*
 ================================================================================
 
+	idEacpHeatHazeProgram
+
+================================================================================
+*/
+
+/*
+====================
+idEacpHeatHazeProgram::idEacpHeatHazeProgram
+
+**The mask's sampling is baked in even where nothing samples a mask**, and that
+is not an oversight. eacp declares every texture a program lists, whether
+define() reaches it or not, and Metal's validation layer refuses a draw with a
+declared texture left unbound - the same rule that made step 4e.5 write three
+texgen programs rather than one. Splitting the heat haze on the same rule would
+have made two programs out of what is plainly one shader with a switch, so the
+third slot stays declared, the unmasked form binds its own normal map there, and
+the key it is asked for under carries that normal map's sampling. What it costs
+is nothing at all: the slot is bound to a texture that already had to be, and
+the key space does not grow.
+====================
+*/
+idEacpHeatHazeProgram::idEacpHeatHazeProgram( bool mask, bool vertexColor,
+											  const sampling_t &sampling ) {
+	// Before compile(), as everywhere here: the build walk reads each texture's
+	// sampling to place the static sampler the generated source points at, and
+	// it reads the two switches because define() branches on them.
+	currentRenderImage.sampling = sampling.currentRender;
+	normalImage.sampling = sampling.normal;
+	maskImage.sampling = sampling.mask;
+
+	masked = mask;
+	vertexColored = vertexColor;
+
+	compile();
+}
+
+/*
+====================
+idEacpHeatHazeProgram::define
+
+heatHaze.vfp and its two masked forms, both halves of each.
+
+The vertex half computes three things and one of them is interesting. The
+scrolled coordinate and the raw one are what they look like; the third is the
+deform magnitude scaled by the projected width of a unit at this vertex's depth,
+which is what keeps the ripple a constant size on the screen as the surface
+recedes. `(1, 0, z, 1)` with z the view-space depth, dotted with rows 0 and 3 of
+the projection, is the numerator and the denominator of that width - and the
+`max` under the divide is the original's guard for a polygon crossing the view
+plane, where the denominator goes through zero.
+
+The fragment half offsets the screen position by the normal map and reads
+`_currentRender` there. Two details are the original's rather than this port's:
+the normal map's x comes out of the alpha channel, because idImage::GenerateImage
+swaps red and alpha on every normal map it uploads; and the offset is saturated
+into [0, 1] *before* the power-of-two scale, so a distortion that would have read
+off the edge of the frame reads the edge instead of the padding beside it.
+====================
+*/
+void idEacpHeatHazeProgram::define( void ) {
+	auto	position = vertexInput( &eacpDrawVert_t::xyz );
+	auto	texcoord = vertexInput( &eacpDrawVert_t::st );
+
+	// `MOV result.color, vertex.color`, and only heatHazeWithMaskAndVertex.vfp
+	// has that line. Pulled behind the switch rather than always, because an
+	// attribute pulled here is an attribute in this variant's vertex layout.
+	std::optional<GPU::Float4>	vertexColor;
+
+	if ( masked && vertexColored ) {
+		vertexColor = varying( vertexInput( &eacpDrawVert_t::color ) );
+	}
+
+	auto	model = GPU::float4( position, 1.0f );
+	auto	clip = modelViewProjection * model;
+
+	setPosition( clip );
+
+	// fragment.position, rebuilt. The clip position's (x, y, w) as a varying is
+	// interpolated with w divided out, so dividing it back in the fragment
+	// stage gives the normalized device coordinate at that fragment exactly -
+	// which is the window coordinate the ARB program reads, over the viewport
+	// size that program.env[1] divides it by. The half-and-shift is the
+	// remaining difference between [-1, 1] and [0, 1].
+	auto	screen = varying( GPU::float3( clip.x(), clip.y(), clip.w() ) );
+
+	// result.texcoord[1]: the normal map's coordinate, scrolled.
+	auto	scrolled = varying( texcoord + scroll.xy() );
+
+	// result.texcoord[2]: the deform magnitude, scaled by depth. Written as the
+	// original's dot products rather than folded into fewer uniforms, because
+	// the two projection rows are (2n/w, 0, (r+l)/w, 0) and (0, 0, -1, 0) only
+	// for the frustum R_SetupProjection happens to build.
+	auto	viewZ = GPU::dot( model, modelViewRowZ );
+	auto	depth = GPU::float4( 1.0f, 0.0f, viewZ, 1.0f );
+
+	auto	across = GPU::dot( depth, projectionRowX );
+	auto	forward = GPU::max( GPU::dot( depth, projectionRowW ), 1.0f );
+
+	auto	deform = varying( deformMagnitude.xy()
+							  * GPU::min( across / forward, 0.02f ) );
+
+	// The distortion itself: x out of alpha, then out of [0, 1] and into
+	// [-1, 1]. A mutable local because the mask multiplies into it, exactly as
+	// the original's localNormal register is written twice.
+	auto	normalTexel = GPU::sample( normalImage, scrolled );
+	auto	localNormal = var( normalTexel.wy() * 2.0f - 1.0f );
+
+	if ( masked ) {
+		auto	maskTexel = GPU::sample( maskImage, varying( texcoord ) );
+
+		// heatHazeWithMaskAndVertex.vfp's one extra line. The vertex colour is
+		// what fades a particle out, so a mask times a faded colour drops below
+		// the threshold and the fragment goes - which is how a heat plume
+		// disappears rather than shrinking.
+		auto	weighted = vertexColor.has_value()
+			? maskTexel.xy() * vertexColor->xy()
+			: maskTexel.xy();
+
+		auto	mask = weighted - 0.01f;
+
+		// KIL, which kills on any negative component - and only x and y were
+		// written by the SUB above, the other two being the mask texel's own
+		// and so never negative. So the smaller of the two is the whole test.
+		setDiscardBelow( GPU::min( mask.x(), mask.y() ), 0.0f );
+
+		localNormal = localNormal.get() * mask;
+	}
+
+	auto	screenCoord = screen.xy() / screen.z() * 0.5f + 0.5f;
+
+	auto	offset = GPU::clamp( localNormal.get() * deform + screenCoord, 0.0f, 1.0f );
+
+	setFragment( GammaCorrected( GPU::sample( currentRenderImage,
+											  offset * currentRenderScale.xy() ) ) );
+}
+
+/*
+================================================================================
+
+	idEacpColorProcessProgram
+
+================================================================================
+*/
+
+idEacpColorProcessProgram::idEacpColorProcessProgram( GPU::TextureSampling sampling ) {
+	currentRenderImage.sampling = sampling;
+
+	compile();
+}
+
+/*
+====================
+idEacpColorProcessProgram::define
+
+colorProcess.vfp. The frame, desaturated, mixed towards a hue.
+
+Its vertex program is four lines of which two are arithmetic on constants, and
+those two are here in the fragment stage instead: `1 - fraction` and
+`target * fraction` are the same value at every vertex, so interpolating them
+would be paying for a varying to carry a uniform.
+
+The screen coordinate is the heat haze's, and there is no distortion to add to
+it and no saturate over it - the original has neither.
+====================
+*/
+void idEacpColorProcessProgram::define( void ) {
+	auto	position = vertexInput( &eacpDrawVert_t::xyz );
+
+	auto	model = GPU::float4( position, 1.0f );
+	auto	clip = modelViewProjection * model;
+
+	setPosition( clip );
+
+	auto	screen = varying( GPU::float3( clip.x(), clip.y(), clip.w() ) );
+
+	auto	screenCoord = screen.xy() / screen.z() * 0.5f + 0.5f;
+
+	auto	source = GPU::sample( currentRenderImage,
+								  screenCoord * currentRenderScale.xy() );
+
+	// The original's grey: the three channels added and scaled by 0.33. Not a
+	// third, and not weighted for the eye - written out as it stands, like
+	// every other constant in these programs.
+	auto	grey = ( source.x() + source.y() + source.z() ) * 0.33f;
+
+	auto	blended = source.xyz() * ( 1.0f - fraction.xyz() )
+		+ targetColor.xyz() * fraction.xyz() * grey;
+
+	// Alpha is the frame's own, for the reason the heat haze's is:
+	// `MAD result.color.xyz` leaves w undefined and what this stage draws is
+	// the pixel that was already there.
+	setFragment( GammaCorrected( GPU::float4( blended, source.w() ) ) );
+}
+
+/*
+================================================================================
+
 	idEacpInteractionProgram
 
 ================================================================================
@@ -1135,6 +1332,8 @@ void idEacpRenderProgs::Shutdown( void ) {
 	cubes.clear();
 	bumpyReflects.clear();
 	screens.clear();
+	heatHazes.clear();
+	colorProcesses.clear();
 
 	shadowPipelines.clear();
 	shadowLibrary.reset();
@@ -1172,6 +1371,8 @@ int idEacpRenderProgs::NumPrograms( void ) const {
 	total += CountPrograms( cubes );
 	total += CountPrograms( bumpyReflects );
 	total += CountPrograms( screens );
+	total += CountPrograms( heatHazes );
+	total += CountPrograms( colorProcesses );
 
 	if ( shadowProgram.has_value() ) {
 		total++;
@@ -1210,6 +1411,8 @@ int idEacpRenderProgs::NumPipelines( void ) const {
 	total += CountPipelines( cubes );
 	total += CountPipelines( bumpyReflects );
 	total += CountPipelines( screens );
+	total += CountPipelines( heatHazes );
+	total += CountPipelines( colorProcesses );
 
 	total += shadowPipelines.size();
 	total += fogPipelines.size();
@@ -1498,6 +1701,100 @@ idEacpRenderProgs::screenDraw_t idEacpRenderProgs::ScreenDraw( const idImage *im
 	texgenVariant_t<idEacpScreenProgram> *	variant =
 		TexgenVariant( screens, GPU::samplingIndex( sampling ), "screen texgen",
 					   [&]( std::optional<idEacpScreenProgram> &program ) {
+						   program.emplace( sampling );
+					   } );
+
+	if ( !variant ) {
+		return draw;
+	}
+
+	draw.program = &*variant->program;
+
+	draw.pipeline = PipelineFor( variant->pipelines, *variant->library,
+								 variant->program->vertexLayout(),
+								 stateBits, cullType, ES_IGNORE );
+
+	return draw;
+}
+
+/*
+====================
+idEacpRenderProgs::HeatHazeDraw
+
+The three heatHaze programs, keyed on the two switches that tell them apart and
+on all three samplings - the third of which is the normal map's again where
+there is no mask, the program declaring a texture it does not read. Two bits a
+sampling and one each for the switches is a key space of 256; the demo's first
+level reaches two entries, `heatHaze.vfp` on the glass and
+`heatHazeWithMask.vfp` on the vent plumes, both with `_currentRender` linear and
+clamped and their normal maps linear and repeated.
+====================
+*/
+idEacpRenderProgs::heatHazeDraw_t
+idEacpRenderProgs::HeatHazeDraw( const idImage *currentRender, const idImage *normal,
+								 const idImage *mask, bool vertexColor,
+								 int stateBits, int cullType ) {
+	heatHazeDraw_t	draw;
+
+	draw.program = NULL;
+	draw.pipeline = NULL;
+
+	idEacpHeatHazeProgram::sampling_t	sampling;
+
+	sampling.currentRender = R_EacpSampling( currentRender );
+	sampling.normal = R_EacpSampling( normal );
+	sampling.mask = R_EacpSampling( mask ? mask : normal );
+
+	const bool	masked = ( mask != NULL );
+	const bool	colored = masked && vertexColor;
+
+	const int	key = (int)masked
+		| ( (int)colored << 1 )
+		| ( GPU::samplingIndex( sampling.currentRender ) << 2 )
+		| ( GPU::samplingIndex( sampling.normal ) << 4 )
+		| ( GPU::samplingIndex( sampling.mask ) << 6 );
+
+	texgenVariant_t<idEacpHeatHazeProgram> *	variant =
+		TexgenVariant( heatHazes, key, "heat haze",
+					   [&]( std::optional<idEacpHeatHazeProgram> &program ) {
+						   program.emplace( masked, colored, sampling );
+					   } );
+
+	if ( !variant ) {
+		return draw;
+	}
+
+	draw.program = &*variant->program;
+
+	draw.pipeline = PipelineFor( variant->pipelines, *variant->library,
+								 variant->program->vertexLayout(),
+								 stateBits, cullType, ES_IGNORE );
+
+	return draw;
+}
+
+/*
+====================
+idEacpRenderProgs::ColorProcessDraw
+
+colorProcess.vfp, whose one texture is always `_currentRender` - so the key is
+the one sampling and the space is four, of which the content reaches the linear
+clamped one and no other.
+====================
+*/
+idEacpRenderProgs::colorProcessDraw_t
+idEacpRenderProgs::ColorProcessDraw( const idImage *currentRender,
+									 int stateBits, int cullType ) {
+	colorProcessDraw_t	draw;
+
+	draw.program = NULL;
+	draw.pipeline = NULL;
+
+	const GPU::TextureSampling	sampling = R_EacpSampling( currentRender );
+
+	texgenVariant_t<idEacpColorProcessProgram> *	variant =
+		TexgenVariant( colorProcesses, GPU::samplingIndex( sampling ), "colour process",
+					   [&]( std::optional<idEacpColorProcessProgram> &program ) {
 						   program.emplace( sampling );
 					   } );
 

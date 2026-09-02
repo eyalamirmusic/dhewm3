@@ -854,6 +854,15 @@ void RB_STD_T_RenderShaderPasses( const drawSurf_t *surf ) {
 			if ( tr.backEndRenderer != BE_ARB2 ) {
 				continue;
 			}
+			// or if the program the material named never loaded, which is a
+			// stage this path can no longer draw: the handles are zero, and
+			// binding program 0 and enabling the target is an error rather than
+			// a no-op. Reachable since the material parser stopped deciding
+			// what a newStage is on these two handles - `shaderDemos/pinch`
+			// asks for `pinch.cg`, which no pk4 ships.
+			if ( !newStage->vertexProgram || !newStage->fragmentProgram ) {
+				continue;
+			}
 			if ( r_skipNewAmbient.GetBool() ) {
 				continue;
 			}

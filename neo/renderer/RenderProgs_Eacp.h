@@ -526,6 +526,178 @@ public:
 /*
 ================================================================================
 
+	idEacpHeatHazeProgram
+
+	The heat haze, which is three of Doom 3's four shipped `newStage` programs -
+	heatHaze.vfp, heatHazeWithMask.vfp and heatHazeWithMaskAndVertex.vfp - as
+	one program with two switches, because that is what they are. Read side by
+	side, the second is the first plus a mask texture and a MUL on the result,
+	and the third is the second plus a multiply by the vertex colour. Nothing
+	else differs, line for line.
+
+	**What it draws is the frame behind the surface, sampled somewhere else.**
+	The stage's first fragmentMap is `_currentRender`, which step 4e.3 fills in;
+	the second is a normal map, whose x and y push the read off the point the
+	fragment actually covers. So a pane of glass shows the room behind it
+	rippled, and a heat plume shows the wall behind it wobbling. A `newStage`
+	naming `_currentRender` is also what forces its material to SS_POST_PROCESS
+	(Material.cpp), which is what puts the copy before the draw.
+
+	**Where the screen coordinate comes from, and why it is not
+	idEacpScreenProgram.** The ARB fragment program reads `fragment.position` -
+	the window coordinate - and scales it by program.env[1], the reciprocal of
+	the viewport, to land in [0, 1]. The EDSL has no fragment-position input, so
+	the same number is rebuilt the way a projective texture read always is: the
+	vertex stage carries (x, y, w) of the clip position as a varying and the
+	fragment stage divides, which is exact rather than an approximation because
+	a varying is interpolated with w already divided out. What that gives is the
+	normalized device coordinate, and the half-and-shift into [0, 1] is written
+	here. TG_SCREEN's planes produce the same triple - which is why this looked
+	like a user for idEacpScreenProgram - but that texgen stops at (s/q, t/q)
+	and lands in [-1, 1], where this needs [0, 1]; they are two different
+	mappings of one position and only one of them is a texture coordinate for
+	`_currentRender`. So the screen program still has no user in the demo pk4.
+
+	**The deform magnitude is a per-vertex scalar and the arithmetic is the
+	original's.** `program.local[1]` is scaled by how wide a unit is at the
+	vertex's depth - one row of the modelview and two rows of the projection,
+	dotted with (1, 0, z, 1) - so the ripple is a constant size on the screen
+	rather than in the world, and it is clamped at 0.02 so that a surface
+	crossing the view plane does not tear the frame apart. The projection's
+	rows 0 and 3 are the same whichever depth hack SetSpace applied, both hacks
+	touching row 2 alone.
+
+	**The mask kills the fragment rather than fading it**, which is `KIL` in the
+	original and one `setDiscardBelow` here: below 0.01 in either of the mask's
+	first two channels and the pixel is gone. The same two channels then scale
+	the distortion, after the subtraction rather than before it - which is the
+	original's own order and means a mask at 0.01 exactly distorts by nothing.
+
+	**Alpha is `_currentRender`'s own.** `TEX result.color.xyz` leaves w
+	undefined under ARB_fragment_program, exactly as bumpyEnvironment.vfp does,
+	so there is no number to copy - and unlike that program there is no blend
+	mode here that makes one value invisible, a heat haze stage being (ONE,
+	ZERO) and writing whatever it writes. What is carried instead is the alpha
+	of the pixel this stage is drawing: the stage's whole picture is the frame
+	behind it, so its alpha is the frame's too. It reaches nothing measured -
+	`glass1` and `glass2` overwrite the channel with a `maskcolor` stage on the
+	next line, and `vp1` is a single-stage material - and the readback the gate
+	hashes is RGB.
+
+================================================================================
+*/
+
+class idEacpHeatHazeProgram : public idEacpGammaProgram {
+public:
+	// The three textures' samplings, in the order they are declared below. The
+	// mask's is part of the key even on the two forms that do not sample one,
+	// for the reason the constructor gives.
+	struct sampling_t {
+		eacp::GPU::TextureSampling	currentRender;
+		eacp::GPU::TextureSampling	normal;
+		eacp::GPU::TextureSampling	mask;
+	};
+
+							idEacpHeatHazeProgram( bool mask, bool vertexColor,
+												   const sampling_t &sampling );
+
+	virtual void			define( void ) override;
+
+	eacp::GPU::Uniform<eacp::GPU::Float4x4>		modelViewProjection;
+
+	// program.local[0]: added to the normal map's coordinate, so the ripple
+	// moves. Two of the four components are read, the material writing it as a
+	// pair of expressions in `time`.
+	eacp::GPU::Uniform<eacp::GPU::Float4>		scroll;
+
+	// program.local[1]: how far the distortion pushes the read, before the
+	// depth scaling below.
+	eacp::GPU::Uniform<eacp::GPU::Float4>		deformMagnitude;
+
+	// state.matrix.modelview.row[2] and rows 0 and 3 of state.matrix.projection,
+	// which are the three the depth scaling dots (1, 0, z, 1) against. Rows
+	// rather than the matrices because that is all the original reads, and
+	// because the modelview one is the *space's* while the two projection ones
+	// are the view's.
+	eacp::GPU::Uniform<eacp::GPU::Float4>		modelViewRowZ;
+	eacp::GPU::Uniform<eacp::GPU::Float4>		projectionRowX;
+	eacp::GPU::Uniform<eacp::GPU::Float4>		projectionRowW;
+
+	// program.env[0]: the viewport over the power-of-two allocation
+	// `_currentRender` was copied into, which is what turns a screen position
+	// in [0, 1] into a coordinate in that image. RB_SetProgramEnvironment
+	// computes it and this backend's CopyFramebufferToImage keeps the same
+	// padded size, so the two agree.
+	eacp::GPU::Uniform<eacp::GPU::Float4>		currentRenderScale;
+
+	eacp::GPU::Uniform<eacp::GPU::Texture2D>	currentRenderImage;
+	eacp::GPU::Uniform<eacp::GPU::Texture2D>	normalImage;
+	eacp::GPU::Uniform<eacp::GPU::Texture2D>	maskImage;
+
+	// gammaBrightness is idEacpGammaProgram's, and it is here because every
+	// ARB fragment program gets R_LoadARBProgram's injected correction unless
+	// it says nodhewm3gammahack, and none of these three does. What it amounts
+	// to in practice is the identity, these materials all being post-process -
+	// but that is the caller's answer rather than this program's.
+	EACP_SHADER( modelViewProjection, scroll, deformMagnitude,
+				 modelViewRowZ, projectionRowX, projectionRowW,
+				 currentRenderScale, gammaBrightness,
+				 currentRenderImage, normalImage, maskImage )
+
+private:
+	bool					masked;
+	bool					vertexColored;
+};
+
+/*
+================================================================================
+
+	idEacpColorProcessProgram
+
+	colorProcess.vfp, the fourth and last `newStage` program the base content
+	ships: `_currentRender` read straight, desaturated, and mixed towards a
+	target hue. It is what `textures/decals/bloodyfilmred` and its neighbours in
+	`kentest.mtr` put over the screen - the tinted, grainy overlays.
+
+	It samples one texture and reads no vertex attribute but the position, both
+	of its vertex parameters being constants the ARB vertex program does nothing
+	with but forward. They are uniforms here and the arithmetic that forwards
+	them is folded into the fragment stage, a varying that is the same value at
+	every vertex being a varying worth not having.
+
+	The grey is `(r + g + b) * 0.33` rather than a luminance, and the 0.33 is
+	the original's - not a third, and not weighted for the eye. Reproduced as
+	written, like every other constant here.
+
+================================================================================
+*/
+
+class idEacpColorProcessProgram : public idEacpGammaProgram {
+public:
+							idEacpColorProcessProgram( eacp::GPU::TextureSampling sampling );
+
+	virtual void			define( void ) override;
+
+	eacp::GPU::Uniform<eacp::GPU::Float4x4>		modelViewProjection;
+
+	// program.local[0]: 0 is the frame as it is and 1 is the target hue alone.
+	eacp::GPU::Uniform<eacp::GPU::Float4>		fraction;
+
+	// program.local[1]: the target hue at full intensity.
+	eacp::GPU::Uniform<eacp::GPU::Float4>		targetColor;
+
+	// program.env[0], as on the heat haze beside it.
+	eacp::GPU::Uniform<eacp::GPU::Float4>		currentRenderScale;
+
+	eacp::GPU::Uniform<eacp::GPU::Texture2D>	currentRenderImage;
+
+	EACP_SHADER( modelViewProjection, fraction, targetColor, currentRenderScale,
+				 gammaBrightness, currentRenderImage )
+};
+
+/*
+================================================================================
+
 	idEacpInteractionProgram
 
 	interaction.vfp, which is the whole of Doom 3's lighting: one light against
@@ -917,6 +1089,29 @@ public:
 
 	screenDraw_t			ScreenDraw( const idImage *image, int stateBits, int cullType );
 
+	// The two `newStage` programs, which are the hand-written ARB pairs the
+	// materials name rather than a texgen the engine picks. Same pair back, and
+	// a null pipeline means the same thing.
+	struct heatHazeDraw_t {
+		idEacpHeatHazeProgram *					program;
+		const eacp::GPU::RenderPipeline *		pipeline;
+	};
+
+	// `mask` is NULL on the unmasked form, and what goes into the shader's
+	// third slot then is the normal map - see the constructor for why a texture
+	// nothing samples still has to be bound.
+	heatHazeDraw_t			HeatHazeDraw( const idImage *currentRender, const idImage *normal,
+										  const idImage *mask, bool vertexColor,
+										  int stateBits, int cullType );
+
+	struct colorProcessDraw_t {
+		idEacpColorProcessProgram *				program;
+		const eacp::GPU::RenderPipeline *		pipeline;
+	};
+
+	colorProcessDraw_t		ColorProcessDraw( const idImage *currentRender,
+											  int stateBits, int cullType );
+
 	// The same for one light against one surface. Its five images arrive
 	// together because the program samples all five and its sampling variant is
 	// the tuple of what they ask for, not any one of them.
@@ -1130,6 +1325,14 @@ private:
 	eacp::OwnedVector<texgenVariant_t<idEacpCubeProgram>>			cubes;
 	eacp::OwnedVector<texgenVariant_t<idEacpBumpyReflectProgram>>	bumpyReflects;
 	eacp::OwnedVector<texgenVariant_t<idEacpScreenProgram>>			screens;
+
+	// The two newStage caches, on the same template and for the same reason:
+	// four fields, an int key, and a compile on first use. The heat haze's key
+	// is its two switches and its three samplings, so its space is 256 and the
+	// demo's first level reaches two of them; colorProcess's is one sampling,
+	// so four, of which the content reaches one.
+	eacp::OwnedVector<texgenVariant_t<idEacpHeatHazeProgram>>		heatHazes;
+	eacp::OwnedVector<texgenVariant_t<idEacpColorProcessProgram>>	colorProcesses;
 
 	// The shadow program, which has no variants - see the class. What it does
 	// have is more pipelines than either of the others per program: the count

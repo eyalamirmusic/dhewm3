@@ -191,6 +191,7 @@ typedef enum {
 
 static const int	MAX_FRAGMENT_IMAGES = 8;
 static const int	MAX_VERTEX_PARMS = 4;
+static const int	MAX_PROGRAM_NAME = 64;
 
 typedef struct {
 	int					vertexProgram;
@@ -200,6 +201,17 @@ typedef struct {
 	int					fragmentProgram;
 	int					numFragmentProgramImages;
 	idImage *			fragmentProgramImages[MAX_FRAGMENT_IMAGES];
+
+	// The name the material gave the program, kept beside the two GL handles
+	// above because the handles are the only thing here that a backend without
+	// GL cannot read: R_FindARBProgram hands back an index into draw_arb2.cpp's
+	// own table, and a stage is otherwise indistinguishable from every other
+	// one. What a backend needs to know is *which* hand-written program pair
+	// this stage asks for, and the name is that, unchanged since the .mtr said
+	// it. `program` and `fragmentProgram` both write it, those being the two
+	// tokens that name a fragment program; a `megaTexture` writes the name it
+	// implies.
+	char				programName[MAX_PROGRAM_NAME];
 
 	idMegaTexture		*megaTexture;		// handles all the binding and parameter setting
 } newShaderStage_t;

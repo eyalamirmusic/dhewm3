@@ -1500,12 +1500,14 @@ void idMaterial::ParseStage( idLexer &src, const textureRepeat_t trpDefault ) {
 			if ( src.ReadTokenOnLine( &token ) ) {
 				newStage.vertexProgram = R_FindARBProgram( GL_VERTEX_PROGRAM_ARB, token.c_str() );
 				newStage.fragmentProgram = R_FindARBProgram( GL_FRAGMENT_PROGRAM_ARB, token.c_str() );
+				idStr::Copynz( newStage.programName, token.c_str(), sizeof( newStage.programName ) );
 			}
 			continue;
 		}
 		if ( !token.Icmp( "fragmentProgram" ) ) {
 			if ( src.ReadTokenOnLine( &token ) ) {
 				newStage.fragmentProgram = R_FindARBProgram( GL_FRAGMENT_PROGRAM_ARB, token.c_str() );
+				idStr::Copynz( newStage.programName, token.c_str(), sizeof( newStage.programName ) );
 			}
 			continue;
 		}
@@ -1525,6 +1527,8 @@ void idMaterial::ParseStage( idLexer &src, const textureRepeat_t trpDefault ) {
 				}
 				newStage.vertexProgram = R_FindARBProgram( GL_VERTEX_PROGRAM_ARB, "megaTexture.vfp" );
 				newStage.fragmentProgram = R_FindARBProgram( GL_FRAGMENT_PROGRAM_ARB, "megaTexture.vfp" );
+				idStr::Copynz( newStage.programName, "megaTexture.vfp",
+							   sizeof( newStage.programName ) );
 				continue;
 			}
 		}
@@ -1548,7 +1552,16 @@ void idMaterial::ParseStage( idLexer &src, const textureRepeat_t trpDefault ) {
 
 
 	// if we are using newStage, allocate a copy of it
-	if ( newStage.fragmentProgram || newStage.vertexProgram ) {
+	//
+	// The name is in the test beside the two handles because the handles alone
+	// cannot answer the question. They are R_FindARBProgram's, which is zero on
+	// any backend with no ARB programs to load - so a renderer that draws these
+	// some other way would never see a newStage at all, and the stage would
+	// fall through to the fixed-function path with no image and draw a
+	// checkerboard. What the material said is what a stage *is*; whether one
+	// particular backend could compile it is a different question, asked in the
+	// backend.
+	if ( newStage.fragmentProgram || newStage.vertexProgram || newStage.programName[0] ) {
 		ss->newStage = (newShaderStage_t *)Mem_Alloc( sizeof( newStage ) );
 		*(ss->newStage) = newStage;
 	}

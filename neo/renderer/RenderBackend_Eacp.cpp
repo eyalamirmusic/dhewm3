@@ -429,6 +429,30 @@ private:
 										   const eacpStage_t &stage );
 	void			DrawScreenStage( const srfTriangles_t *tri, const eacpStage_t &stage );
 
+	// A new-style stage: the hand-written ARB program pair a material names for
+	// itself, rather than one of the texgens above that the engine picks. The
+	// dispatch is on the program's *name*, because that is the only thing about
+	// a newShaderStage_t this backend can read - see newShaderStage_t and
+	// DrawNewStage.
+	void			DrawNewStage( const srfTriangles_t *tri, const drawSurf_t *surf,
+								  const shaderStage_t *pStage );
+	void			DrawHeatHazeStage( const srfTriangles_t *tri, const drawSurf_t *surf,
+									   const shaderStage_t *pStage,
+									   int stateBits, bool mask, bool vertexColor );
+	void			DrawColorProcessStage( const srfTriangles_t *tri, const drawSurf_t *surf,
+										   const shaderStage_t *pStage, int stateBits );
+
+	// program.local[i] as RB_STD_T_RenderShaderPasses sends it: the four
+	// registers a vertexParm named, evaluated, or zero where the material
+	// declared no such parm - which is what an ARB program's untouched local
+	// holds.
+	static Float4	VertexParm( const newShaderStage_t *newStage, const float *regs, int parm );
+
+	// program.env[0]: the viewport over the power-of-two allocation
+	// `_currentRender` was copied into, which is what both newStage programs
+	// scale their screen coordinate by.
+	Float4			CurrentRenderScale( void ) const;
+
 	// The eye in the space currently being drawn, which three of the four
 	// texgens need and which is R_SkyboxTexGen's localViewOrigin and
 	// RB_SetProgramEnvironmentSpace's program.env[5] - the same value under two
@@ -569,6 +593,7 @@ private:
 	bool				warnedCompressed;
 	bool				warnedExternalFormat;
 	bool				warnedTexgen;
+	bool				warnedNewStage;
 	bool				warnedMissingTexture;
 	bool				warnedCubeShape;
 	bool				warnedReadPixels;
@@ -618,6 +643,7 @@ idRenderBackendEacp::idRenderBackendEacp() {
 	warnedCompressed = false;
 	warnedExternalFormat = false;
 	warnedTexgen = false;
+	warnedNewStage = false;
 	warnedMissingTexture = false;
 	warnedCubeShape = false;
 	warnedReadPixels = false;
@@ -2466,11 +2492,13 @@ void idRenderBackendEacp::DrawSurfaceShaderPasses( const drawSurf_t *surf ) {
 			continue;
 		}
 
-		// A new-style stage is a pair of hand-written ARB programs, and the
-		// OpenGL path skips them on any backend that is not BE_ARB2 - which
-		// this is not. The eacp answer to them is a program per newShaderStage,
-		// and it is nobody's step yet.
+		// A new-style stage is a pair of hand-written ARB programs the material
+		// named for itself, and it is drawn before anything below it happens:
+		// no image is bound (its textures are the newStage's own), no constant
+		// colour is computed and none of the three blend shortcuts applies,
+		// exactly as RB_STD_T_RenderShaderPasses branches out of its loop here.
 		if ( pStage->newStage ) {
+			DrawNewStage( tri, surf, pStage );
 			continue;
 		}
 
@@ -3540,6 +3568,346 @@ void idRenderBackendEacp::DrawScreenStage( const srfTriangles_t *tri,
 	StageColor( stage, true, draw.program->colorModulate, draw.program->colorAdd );
 
 	draw.program->image = *texture;
+
+	drawProgram = draw.program;
+	drawPipeline = draw.pipeline;
+
+	RB_DrawElementsWithCounters( tri );
+}
+
+/*
+================================================================================
+
+	The new-style stages.
+
+	Step 4e.8, and the last thing RB_STD_T_RenderShaderPasses does that this
+	backend did not. A `newStage` is a material naming a hand-written ARB
+	program pair for itself - `program heatHaze.vfp` and a list of
+	`fragmentMap`s and `vertexParm`s - rather than describing a stage the engine
+	knows how to draw. The base game ships four such programs and declares fifty
+	materials over them; three of the four are the heat haze family, which is
+	one shader with two switches, and the fourth is colorProcess.
+
+	**Which program a stage wants is its name and nothing else.** A
+	newShaderStage_t carried only the two handles R_FindARBProgram returns,
+	which are indexes into draw_arb2.cpp's own table and mean nothing here, so
+	the material parser keeps the name beside them now (Material.h). The
+	name-to-program lookup is here rather than there, which is the shape this
+	port already uses for a texgen: the shared code says what the material
+	asked for and the backend says what it draws that with.
+
+	**A program this backend does not have is a warning and a skipped stage**,
+	which is the whole of what an unknown name costs - the rest of the material
+	still draws, so a surface loses its refraction rather than disappearing.
+	Two of the six names in the demo pk4 land there and neither is drawable by
+	the SDL/GL build either, `pinch.cg` and `megaTexture.vfp` not being shipped.
+
+================================================================================
+*/
+
+/*
+======================
+R_EacpProgramIs
+
+Whether a stage's program name is the one named, with or without its extension -
+because R_FindARBProgram strips the extension before it compares, so a material
+may write either form and the two name one program.
+======================
+*/
+static bool R_EacpProgramIs( const char *name, const char *program ) {
+	const int	length = idStr::Length( program );
+
+	if ( idStr::Icmpn( name, program, length ) != 0 ) {
+		return false;
+	}
+
+	return name[length] == '\0' || name[length] == '.';
+}
+
+/*
+======================
+idRenderBackendEacp::VertexParm
+
+program.local[i], evaluated. RB_STD_T_RenderShaderPasses sends the first
+numVertexParms of them and leaves the rest as the ARB program found them, which
+for a local never written is zero - so that is what an undeclared parm is here.
+======================
+*/
+Float4 idRenderBackendEacp::VertexParm( const newShaderStage_t *newStage, const float *regs,
+										int parm ) {
+	if ( parm >= newStage->numVertexParms ) {
+		return asFloat4( 0.0f, 0.0f, 0.0f, 0.0f );
+	}
+
+	return asFloat4( regs[ newStage->vertexParms[parm][0] ],
+					 regs[ newStage->vertexParms[parm][1] ],
+					 regs[ newStage->vertexParms[parm][2] ],
+					 regs[ newStage->vertexParms[parm][3] ] );
+}
+
+/*
+======================
+idRenderBackendEacp::CurrentRenderScale
+
+program.env[0]: the viewport over the power-of-two allocation `_currentRender`
+was copied into, which is what turns a screen position in [0, 1] into a
+coordinate in that image.
+
+It is the *engine's* `_currentRender` that sizes it rather than whatever image
+the stage put on its first fragmentMap, because that is what
+RB_SetProgramEnvironment does - and every material in the pk4 puts
+`_currentRender` there, so the two are the same question asked twice.
+
+One is the answer before the first copy of a run, when the image has no
+allocation at all: nothing samples it then, the copy running before any
+post-process surface is drawn, but a divide by zero is not worth leaving to
+that.
+======================
+*/
+Float4 idRenderBackendEacp::CurrentRenderScale( void ) const {
+	const idImage *	image = globalImages->currentRenderImage;
+
+	if ( image->uploadWidth < 1 || image->uploadHeight < 1 ) {
+		return asFloat4( 1.0f, 1.0f, 0.0f, 1.0f );
+	}
+
+	const int	width = backEnd.viewDef->viewport.x2 - backEnd.viewDef->viewport.x1 + 1;
+	const int	height = backEnd.viewDef->viewport.y2 - backEnd.viewDef->viewport.y1 + 1;
+
+	return asFloat4( (float)width / (float)image->uploadWidth,
+					 (float)height / (float)image->uploadHeight,
+					 0.0f, 1.0f );
+}
+
+/*
+======================
+idRenderBackendEacp::DrawNewStage
+
+One new-style stage, dispatched on the program its material named.
+
+`r_skipNewAmbient` is honoured here and only here, exactly as the shared path
+honours it: it is tested inside the newStage branch, so it turns off these
+stages and nothing else on this backend - the soft particle program the same
+cvar also gates on OpenGL not being here to turn off. That is what lets the
+cvar reproduce the picture this build drew before this step, frame for frame,
+which is how the step was measured.
+
+The state is set here rather than by the caller because the caller sets it after
+three shortcuts that a newStage does not take - a stage with no constant colour
+of its own cannot be skipped for having a black one.
+======================
+*/
+void idRenderBackendEacp::DrawNewStage( const srfTriangles_t *tri, const drawSurf_t *surf,
+										const shaderStage_t *pStage ) {
+	if ( r_skipNewAmbient.GetBool() ) {
+		return;
+	}
+
+	const newShaderStage_t *	newStage = pStage->newStage;
+
+	SetState( pStage->drawStateBits );
+
+	int	stateBits = backEnd.glState.glStateBits;
+
+	// A 2D view runs with the depth test off, which RB_BeginDrawingView does
+	// with glDisable rather than through the bitfield - the same correction
+	// every other stage in this function gets.
+	if ( !backEnd.viewDef->viewEntitys ) {
+		stateBits |= GLS_DEPTHFUNC_ALWAYS | GLS_DEPTHMASK;
+	}
+
+	const char *	name = newStage->programName;
+
+	if ( R_EacpProgramIs( name, "heatHaze" ) ) {
+		DrawHeatHazeStage( tri, surf, pStage, stateBits, false, false );
+		return;
+	}
+
+	if ( R_EacpProgramIs( name, "heatHazeWithMask" ) ) {
+		DrawHeatHazeStage( tri, surf, pStage, stateBits, true, false );
+		return;
+	}
+
+	if ( R_EacpProgramIs( name, "heatHazeWithMaskAndVertex" ) ) {
+		DrawHeatHazeStage( tri, surf, pStage, stateBits, true, true );
+		return;
+	}
+
+	if ( R_EacpProgramIs( name, "colorProcess" ) ) {
+		DrawColorProcessStage( tri, surf, pStage, stateBits );
+		return;
+	}
+
+	// The one newStage in the pk4 that names a program this backend already
+	// had: `shaderDemos/bumpyReflect` asks for bumpyEnvironment.vfp, which
+	// step 4e.5 wrote for the reflect texgen that selects the same pair. So it
+	// is the same draw with its two images coming off the newStage's
+	// fragmentMaps instead of off a cube stage and a bump stage - the cube
+	// first and the normal map second, which is the order both the texgen path
+	// and this material use.
+	if ( R_EacpProgramIs( name, "bumpyEnvironment" ) ) {
+		if ( newStage->numFragmentProgramImages < 2 ) {
+			return;
+		}
+
+		eacpStage_t	draw;
+
+		draw.image = newStage->fragmentProgramImages[0];
+		draw.stateBits = stateBits;
+		draw.cullType = backEnd.glState.faceCulling;
+		draw.color = asFloat4( 1.0f, 1.0f, 1.0f, 1.0f );
+		draw.vertexColor = SVC_IGNORE;
+		draw.textureMatrix = NULL;
+		draw.alphaTest = false;
+		draw.alphaTestRef = 0.0f;
+		draw.clipPlane = NULL;
+		draw.texgen = TG_REFLECT_CUBE;
+		draw.bumpImage = newStage->fragmentProgramImages[1];
+		draw.texgenMatrix = NULL;
+
+		DrawBumpyReflectStage( tri, draw );
+		return;
+	}
+
+	if ( !warnedNewStage ) {
+		warnedNewStage = true;
+		common->Warning( "eacp: no program for '%s', so a stage of '%s' will not draw",
+						 name[0] ? name : "(unnamed)", surf->material->GetName() );
+	}
+}
+
+/*
+======================
+idRenderBackendEacp::DrawHeatHazeStage
+
+heatHaze.vfp and its two masked forms. Two or three images off the stage's own
+fragmentMaps, two vertex parms, and three matrix rows the ARB program reads out
+of the fixed-function matrix state.
+
+The projection rows are the *view's* rather than the space's, and they are the
+unhacked ones on purpose: SetSpace folds a weapon or model depth hack into
+element 14, which is row 2, and rows 0 and 3 are what this reads. So a depth
+hack moves where the surface is drawn and leaves the size of its ripple alone,
+which is what the fixed-function original does too.
+======================
+*/
+void idRenderBackendEacp::DrawHeatHazeStage( const srfTriangles_t *tri, const drawSurf_t *surf,
+											 const shaderStage_t *pStage, int stateBits,
+											 bool mask, bool vertexColor ) {
+	const newShaderStage_t *	newStage = pStage->newStage;
+
+	if ( newStage->numFragmentProgramImages < ( mask ? 3 : 2 ) ) {
+		return;
+	}
+
+	const idImage *	currentRender = newStage->fragmentProgramImages[0];
+	const idImage *	normal = newStage->fragmentProgramImages[1];
+	const idImage *	maskImage = mask ? newStage->fragmentProgramImages[2] : NULL;
+
+	const GPU::Texture *	currentRenderTexture = TextureForStage( currentRender, false );
+	const GPU::Texture *	normalTexture = TextureForStage( normal, false );
+
+	if ( !currentRenderTexture || !normalTexture ) {
+		return;
+	}
+
+	// The unmasked form declares a mask texture it never samples - see the
+	// program's constructor - so the normal map is bound there, a declared
+	// texture left unbound being a draw Metal's validation layer refuses.
+	const GPU::Texture *	maskTexture = maskImage ? TextureForStage( maskImage, false )
+													: normalTexture;
+
+	if ( !maskTexture ) {
+		return;
+	}
+
+	idEacpRenderProgs::heatHazeDraw_t	draw =
+		eacpRenderProgs.HeatHazeDraw( currentRender, normal, maskImage, vertexColor,
+									  stateBits, ViewCull( backEnd.glState.faceCulling ) );
+
+	if ( !draw.pipeline ) {
+		return;
+	}
+
+	const float *	regs = surf->shaderRegisters;
+
+	draw.program->modelViewProjection = asFloat4x4( modelViewProjection );
+
+	draw.program->scroll = VertexParm( newStage, regs, 0 );
+	draw.program->deformMagnitude = VertexParm( newStage, regs, 1 );
+
+	// Doom 3 keeps matrices in OpenGL's column-major order, so row i is
+	// elements i, i+4, i+8, i+12.
+	const float *	modelView = backEnd.currentSpace->modelViewMatrix;
+	const float *	projection = backEnd.viewDef->projectionMatrix;
+
+	draw.program->modelViewRowZ = asFloat4( modelView[2], modelView[6],
+											modelView[10], modelView[14] );
+	draw.program->projectionRowX = asFloat4( projection[0], projection[4],
+											 projection[8], projection[12] );
+	draw.program->projectionRowW = asFloat4( projection[3], projection[7],
+											 projection[11], projection[15] );
+
+	draw.program->currentRenderScale = CurrentRenderScale();
+
+	draw.program->currentRenderImage = *currentRenderTexture;
+	draw.program->normalImage = *normalTexture;
+	draw.program->maskImage = *maskTexture;
+
+	draw.program->gammaBrightness = R_EacpGammaBrightness( postProcessPass );
+
+	drawProgram = draw.program;
+	drawPipeline = draw.pipeline;
+
+	RB_DrawElementsWithCounters( tri );
+}
+
+/*
+======================
+idRenderBackendEacp::DrawColorProcessStage
+
+colorProcess.vfp: one image, two vertex parms and no geometry beyond the
+position.
+======================
+*/
+void idRenderBackendEacp::DrawColorProcessStage( const srfTriangles_t *tri,
+												 const drawSurf_t *surf,
+												 const shaderStage_t *pStage,
+												 int stateBits ) {
+	const newShaderStage_t *	newStage = pStage->newStage;
+
+	if ( newStage->numFragmentProgramImages < 1 ) {
+		return;
+	}
+
+	const idImage *	currentRender = newStage->fragmentProgramImages[0];
+
+	const GPU::Texture *	texture = TextureForStage( currentRender, false );
+
+	if ( !texture ) {
+		return;
+	}
+
+	idEacpRenderProgs::colorProcessDraw_t	draw =
+		eacpRenderProgs.ColorProcessDraw( currentRender, stateBits,
+										  ViewCull( backEnd.glState.faceCulling ) );
+
+	if ( !draw.pipeline ) {
+		return;
+	}
+
+	const float *	regs = surf->shaderRegisters;
+
+	draw.program->modelViewProjection = asFloat4x4( modelViewProjection );
+
+	draw.program->fraction = VertexParm( newStage, regs, 0 );
+	draw.program->targetColor = VertexParm( newStage, regs, 1 );
+
+	draw.program->currentRenderScale = CurrentRenderScale();
+
+	draw.program->currentRenderImage = *texture;
+
+	draw.program->gammaBrightness = R_EacpGammaBrightness( postProcessPass );
 
 	drawProgram = draw.program;
 	drawPipeline = draw.pipeline;
