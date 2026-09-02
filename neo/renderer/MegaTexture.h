@@ -57,8 +57,6 @@ public:
 
 	float			parms[4];
 
-	void			UpdateForCenter( float center[2] );
-	void			UpdateTile( int localX, int localY, int globalX, int globalY );
 	void			Invalidate();
 };
 
@@ -69,17 +67,20 @@ typedef struct {
 } megaTextureHeader_t;
 
 
+// Step 5 deleted the half of this class that drew: SetMappingForSurface,
+// BindForViewOrigin, Unbind, SetViewOrigin and the tile streaming under them
+// were called from draw_common.cpp and nowhere else, and they bound seven
+// texture units and set ARB vertex program parameters to do it. What is left is
+// the offline half - MakeMegaTexture builds a .mega file - plus the parse-time
+// InitFromMegaFile, so that a material naming a megaTexture still parses into
+// the shape it did before. Nothing draws one on this build.
 class idMegaTexture {
 public:
 	bool	InitFromMegaFile( const char *fileBase );
-	void	SetMappingForSurface( const srfTriangles_t *tri );	// analyzes xyz and st to create a mapping
-	void	BindForViewOrigin( const idVec3 origin );	// binds images and sets program parameters
-	void	Unbind();								// removes texture bindings
 
 	static	void MakeMegaTexture_f( const idCmdArgs &args );
 private:
 friend class idTextureLevel;
-	void	SetViewOrigin( const idVec3 origin );
 	static void	GenerateMegaMipMaps( megaTextureHeader_t *header, idFile *file );
 	static void	GenerateMegaPreview( const char *fileName );
 

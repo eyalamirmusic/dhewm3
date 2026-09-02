@@ -1261,45 +1261,17 @@ RENDER
 ============================================================
 */
 
-void RB_EnterWeaponDepthHack();
-void RB_EnterModelDepthHack( float depth );
-void RB_LeaveDepthHack();
-void RB_DrawElementsImmediate( const srfTriangles_t *tri );
-void RB_RenderTriangleSurface( const srfTriangles_t *tri );
-void RB_T_RenderTriangleSurface( const drawSurf_t *surf );
-void RB_RenderDrawSurfListWithFunction( drawSurf_t **drawSurfs, int numDrawSurfs,
-					  void (*triFunc_)( const drawSurf_t *) );
-void RB_RenderDrawSurfChainWithFunction( const drawSurf_t *drawSurfs,
-										void (*triFunc_)( const drawSurf_t *) );
-void RB_DrawShaderPasses( drawSurf_t **drawSurfs, int numDrawSurfs );
-void RB_LoadShaderTextureMatrix( const float *shaderRegisters, const textureStage_t *texture );
 void RB_GetShaderTextureMatrix( const float *shaderRegisters, const textureStage_t *texture, float matrix[16] );
+void RB_BakeTextureMatrixIntoTexgen( idPlane lightProject[3], const float textureMatrix[16] );
 void RB_CreateSingleDrawInteractions( const drawSurf_t *surf, void (*DrawInteraction)(const drawInteraction_t *) );
-
-const shaderStage_t *RB_SetLightTexture( const idRenderLightLocal *light );
 
 void RB_DrawView( const void *data );
 
 void RB_DetermineLightScale( void );
-void RB_STD_LightScale( void );
-void RB_BeginDrawingView (void);
-
-/*
-============================================================
-
-DRAW_STANDARD
-
-============================================================
-*/
 
 void RB_DrawElementsWithCounters( const srfTriangles_t *tri );
 void RB_DrawShadowElementsWithCounters( const srfTriangles_t *tri, int numIndexes );
-void RB_STD_FillDepthBuffer( drawSurf_t **drawSurfs, int numDrawSurfs );
 void RB_BindVariableStageImage( const textureStage_t *texture, const float *shaderRegisters );
-void RB_StencilShadowPass( const drawSurf_t *drawSurfs );
-void RB_STD_DrawView( void );
-void RB_STD_FogAllLights( void );
-void RB_BakeTextureMatrixIntoTexgen( idPlane lightProject[3], const float textureMatrix[16] );
 
 /*
 ============================================================

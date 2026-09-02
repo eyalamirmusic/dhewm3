@@ -40,36 +40,51 @@ If you have questions concerning this license or the applicable additional terms
 
 
 /*
-=================
-RB_DrawElementsImmediate
+=====================
+RB_BakeTextureMatrixIntoTexgen
 
-Draws with immediate mode commands, which is going to be very slow.
-This should never happen if the vertex cache is operating properly.
-=================
+Came over from draw_common.cpp when the fixed-function path went. It touches no
+GL of its own: it folds a light's texture matrix into the three texgen planes,
+which is arithmetic both backends need. The eacp path calls it for the same
+reason OpenGL did.
+=====================
 */
-void RB_DrawElementsImmediate( const srfTriangles_t *tri ) {
+void RB_BakeTextureMatrixIntoTexgen( idPlane lightProject[3], const float *textureMatrix ) {
+	float	genMatrix[16];
+	float	final[16];
 
-	backEnd.pc.c_drawElements++;
-	backEnd.pc.c_drawIndexes += tri->numIndexes;
-	backEnd.pc.c_drawVertexes += tri->numVerts;
+	genMatrix[0] = lightProject[0][0];
+	genMatrix[4] = lightProject[0][1];
+	genMatrix[8] = lightProject[0][2];
+	genMatrix[12] = lightProject[0][3];
 
-	if ( tri->ambientSurface != NULL  ) {
-		if ( tri->indexes == tri->ambientSurface->indexes ) {
-			backEnd.pc.c_drawRefIndexes += tri->numIndexes;
-		}
-		if ( tri->verts == tri->ambientSurface->verts ) {
-			backEnd.pc.c_drawRefVertexes += tri->numVerts;
-		}
-	}
+	genMatrix[1] = lightProject[1][0];
+	genMatrix[5] = lightProject[1][1];
+	genMatrix[9] = lightProject[1][2];
+	genMatrix[13] = lightProject[1][3];
 
-	qglBegin( GL_TRIANGLES );
-	for ( int i = 0 ; i < tri->numIndexes ; i++ ) {
-		qglTexCoord2fv( tri->verts[ tri->indexes[i] ].st.ToFloatPtr() );
-		qglVertex3fv( tri->verts[ tri->indexes[i] ].xyz.ToFloatPtr() );
-	}
-	qglEnd();
+	genMatrix[2] = 0;
+	genMatrix[6] = 0;
+	genMatrix[10] = 0;
+	genMatrix[14] = 0;
+
+	genMatrix[3] = lightProject[2][0];
+	genMatrix[7] = lightProject[2][1];
+	genMatrix[11] = lightProject[2][2];
+	genMatrix[15] = lightProject[2][3];
+
+	myGlMultMatrix( genMatrix, backEnd.lightTextureMatrix, final );
+
+	lightProject[0][0] = final[0];
+	lightProject[0][1] = final[4];
+	lightProject[0][2] = final[8];
+	lightProject[0][3] = final[12];
+
+	lightProject[1][0] = final[1];
+	lightProject[1][1] = final[5];
+	lightProject[1][2] = final[9];
+	lightProject[1][3] = final[13];
 }
-
 
 /*
 ================
@@ -111,186 +126,6 @@ void RB_DrawShadowElementsWithCounters( const srfTriangles_t *tri, int numIndexe
 
 
 /*
-===============
-RB_RenderTriangleSurface
-
-Sets texcoord and vertex pointers
-===============
-*/
-void RB_RenderTriangleSurface( const srfTriangles_t *tri ) {
-	if ( !tri->ambientCache ) {
-		RB_DrawElementsImmediate( tri );
-		return;
-	}
-
-
-	idDrawVert *ac = (idDrawVert *)vertexCache.Position( tri->ambientCache );
-	qglVertexPointer( 3, GL_FLOAT, sizeof( idDrawVert ), ac->xyz.ToFloatPtr() );
-	qglTexCoordPointer( 2, GL_FLOAT, sizeof( idDrawVert ), ac->st.ToFloatPtr() );
-
-	RB_DrawElementsWithCounters( tri );
-}
-
-/*
-===============
-RB_T_RenderTriangleSurface
-
-===============
-*/
-void RB_T_RenderTriangleSurface( const drawSurf_t *surf ) {
-	RB_RenderTriangleSurface( surf->geo );
-}
-
-/*
-===============
-RB_EnterWeaponDepthHack
-===============
-*/
-void RB_EnterWeaponDepthHack() {
-	qglDepthRange( 0, 0.5 );
-
-	float	matrix[16];
-
-	memcpy( matrix, backEnd.viewDef->projectionMatrix, sizeof( matrix ) );
-
-	matrix[14] *= 0.25;
-
-	qglMatrixMode(GL_PROJECTION);
-	qglLoadMatrixf( matrix );
-	qglMatrixMode(GL_MODELVIEW);
-}
-
-/*
-===============
-RB_EnterModelDepthHack
-===============
-*/
-void RB_EnterModelDepthHack( float depth ) {
-	qglDepthRange( 0.0f, 1.0f );
-
-	float	matrix[16];
-
-	memcpy( matrix, backEnd.viewDef->projectionMatrix, sizeof( matrix ) );
-
-	matrix[14] -= depth;
-
-	qglMatrixMode(GL_PROJECTION);
-	qglLoadMatrixf( matrix );
-	qglMatrixMode(GL_MODELVIEW);
-}
-
-/*
-===============
-RB_LeaveDepthHack
-===============
-*/
-void RB_LeaveDepthHack() {
-	qglDepthRange( 0, 1 );
-
-	qglMatrixMode(GL_PROJECTION);
-	qglLoadMatrixf( backEnd.viewDef->projectionMatrix );
-	qglMatrixMode(GL_MODELVIEW);
-}
-
-/*
-====================
-RB_RenderDrawSurfListWithFunction
-
-The triangle functions can check backEnd.currentSpace != surf->space
-to see if they need to perform any new matrix setup.  The modelview
-matrix will already have been loaded, and backEnd.currentSpace will
-be updated after the triangle function completes.
-====================
-*/
-void RB_RenderDrawSurfListWithFunction( drawSurf_t **drawSurfs, int numDrawSurfs,
-											  void (*triFunc_)( const drawSurf_t *) ) {
-	int				i;
-	const drawSurf_t		*drawSurf;
-
-	backEnd.currentSpace = NULL;
-
-	for (i = 0  ; i < numDrawSurfs ; i++ ) {
-		drawSurf = drawSurfs[i];
-
-		// change the matrix if needed
-		if ( drawSurf->space != backEnd.currentSpace ) {
-			qglLoadMatrixf( drawSurf->space->modelViewMatrix );
-		}
-
-		if ( drawSurf->space->weaponDepthHack ) {
-			RB_EnterWeaponDepthHack();
-		}
-
-		if ( drawSurf->space->modelDepthHack != 0.0f ) {
-			RB_EnterModelDepthHack( drawSurf->space->modelDepthHack );
-		}
-
-		// change the scissor if needed
-		if ( r_useScissor.GetBool() && !backEnd.currentScissor.Equals( drawSurf->scissorRect ) ) {
-			backEnd.currentScissor = drawSurf->scissorRect;
-			qglScissor( backEnd.viewDef->viewport.x1 + backEnd.currentScissor.x1,
-				backEnd.viewDef->viewport.y1 + backEnd.currentScissor.y1,
-				backEnd.currentScissor.x2 + 1 - backEnd.currentScissor.x1,
-				backEnd.currentScissor.y2 + 1 - backEnd.currentScissor.y1 );
-		}
-
-		// render it
-		triFunc_( drawSurf );
-
-		if ( drawSurf->space->weaponDepthHack || drawSurf->space->modelDepthHack != 0.0f ) {
-			RB_LeaveDepthHack();
-		}
-
-		backEnd.currentSpace = drawSurf->space;
-	}
-}
-
-/*
-======================
-RB_RenderDrawSurfChainWithFunction
-======================
-*/
-void RB_RenderDrawSurfChainWithFunction( const drawSurf_t *drawSurfs,
-										void (*triFunc_)( const drawSurf_t *) ) {
-	const drawSurf_t		*drawSurf;
-
-	backEnd.currentSpace = NULL;
-
-	for ( drawSurf = drawSurfs ; drawSurf ; drawSurf = drawSurf->nextOnLight ) {
-		// change the matrix if needed
-		if ( drawSurf->space != backEnd.currentSpace ) {
-			qglLoadMatrixf( drawSurf->space->modelViewMatrix );
-		}
-
-		if ( drawSurf->space->weaponDepthHack ) {
-			RB_EnterWeaponDepthHack();
-		}
-
-		if ( drawSurf->space->modelDepthHack ) {
-			RB_EnterModelDepthHack( drawSurf->space->modelDepthHack );
-		}
-
-		// change the scissor if needed
-		if ( r_useScissor.GetBool() && !backEnd.currentScissor.Equals( drawSurf->scissorRect ) ) {
-			backEnd.currentScissor = drawSurf->scissorRect;
-			qglScissor( backEnd.viewDef->viewport.x1 + backEnd.currentScissor.x1,
-				backEnd.viewDef->viewport.y1 + backEnd.currentScissor.y1,
-				backEnd.currentScissor.x2 + 1 - backEnd.currentScissor.x1,
-				backEnd.currentScissor.y2 + 1 - backEnd.currentScissor.y1 );
-		}
-
-		// render it
-		triFunc_( drawSurf );
-
-		if ( drawSurf->space->weaponDepthHack || drawSurf->space->modelDepthHack != 0.0f ) {
-			RB_LeaveDepthHack();
-		}
-
-		backEnd.currentSpace = drawSurf->space;
-	}
-}
-
-/*
 ======================
 RB_GetShaderTextureMatrix
 ======================
@@ -325,20 +160,6 @@ void RB_GetShaderTextureMatrix( const float *shaderRegisters,
 	matrix[7] = 0;
 	matrix[11] = 0;
 	matrix[15] = 1;
-}
-
-/*
-======================
-RB_LoadShaderTextureMatrix
-======================
-*/
-void RB_LoadShaderTextureMatrix( const float *shaderRegisters, const textureStage_t *texture ) {
-	float	matrix[16];
-
-	RB_GetShaderTextureMatrix( shaderRegisters, texture, matrix );
-	qglMatrixMode( GL_TEXTURE );
-	qglLoadMatrixf( matrix );
-	qglMatrixMode( GL_MODELVIEW );
 }
 
 /*
@@ -440,57 +261,6 @@ void RB_DetermineLightScale( void ) {
 	}
 }
 
-
-/*
-=================
-RB_BeginDrawingView
-
-Any mirrored or portaled views have already been drawn, so prepare
-to actually render the visible surfaces for this view
-=================
-*/
-void RB_BeginDrawingView (void) {
-
-	const viewDef_t* viewDef = backEnd.viewDef;
-
-	// set the modelview matrix for the viewer
-	qglMatrixMode(GL_PROJECTION);
-	qglLoadMatrixf( viewDef->projectionMatrix );
-	qglMatrixMode(GL_MODELVIEW);
-
-	// set the window clipping
-	qglViewport( tr.viewportOffset[0] + viewDef->viewport.x1,
-		tr.viewportOffset[1] + viewDef->viewport.y1,
-		viewDef->viewport.x2 + 1 - viewDef->viewport.x1,
-		viewDef->viewport.y2 + 1 - viewDef->viewport.y1 );
-
-	// the scissor may be smaller than the viewport for subviews
-	qglScissor( tr.viewportOffset[0] + viewDef->viewport.x1 + viewDef->scissor.x1,
-		tr.viewportOffset[1] + viewDef->viewport.y1 + viewDef->scissor.y1,
-		viewDef->scissor.x2 + 1 - viewDef->scissor.x1,
-		viewDef->scissor.y2 + 1 - viewDef->scissor.y1 );
-	backEnd.currentScissor = viewDef->scissor;
-
-	// ensures that depth writes are enabled for the depth clear
-	GL_State( GLS_DEFAULT );
-
-	// we don't have to clear the depth / stencil buffer for 2D rendering
-	if ( backEnd.viewDef->viewEntitys ) {
-		qglStencilMask( 0xff );
-		// some cards may have 7 bit stencil buffers, so don't assume this
-		// should be 128
-		qglClearStencil( 1<<(glConfig.stencilBits-1) );
-		qglClear( GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT );
-		qglEnable( GL_DEPTH_TEST );
-	} else {
-		qglDisable( GL_DEPTH_TEST );
-		qglDisable( GL_STENCIL_TEST );
-	}
-
-	backEnd.glState.faceCulling = -1;		// force face culling to set next time
-	GL_Cull( CT_FRONT_SIDED );
-
-}
 
 /*
 ==================
