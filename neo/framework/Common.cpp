@@ -26,13 +26,6 @@ If you have questions concerning this license or the applicable additional terms
 ===========================================================================
 */
 
-#include "sys/sys_sdl.h"
-
-#if SDL_VERSION_ATLEAST(3, 0, 0)
-  // DG: compat with SDL2
-  #define SDL_setenv SDL_setenv_unsafe
-#endif
-
 #include "sys/platform.h"
 #include "idlib/containers/HashTable.h"
 #include "idlib/LangDict.h"
@@ -2975,70 +2968,13 @@ void idCommonLocal::Init( int argc, char **argv ) {
 		exit(1);
 	}
 
-#ifdef ID_DEDICATED
-	// we want to use the SDL event queue for dedicated servers. That
-	// requires video to be initialized, so we just use the dummy
-	// driver for headless boxen
-#if SDL_VERSION_ATLEAST(3, 0, 0)
-	SDL_SetHint(SDL_HINT_VIDEO_DRIVER, "dummy");
-#elif SDL_VERSION_ATLEAST(2, 0, 0)
-	SDL_setenv("SDL_VIDEODRIVER", "dummy", 1);
-#else
-	char dummy[] = "SDL_VIDEODRIVER=dummy\0";
-	SDL_putenv(dummy);
-#endif
-#endif
-
-#ifndef D3_EACP
-	// The eacp host owns the loop, the window and the input devices, so SDL must
-	// not open a second video driver underneath it - on macOS that would be a
-	// second NSApplication delegate, fighting the one Apps::run installed. What
-	// is left of SDL in that build is headers, endian macros, Dear ImGui's
-	// backend and the script debugger's mutexes; none of it needs SDL_Init.
-	// (plan.md, Phase 2)
-#if SDL_VERSION_ATLEAST(3, 0, 0)
-	if ( ! SDL_Init(SDL_INIT_VIDEO | SDL_INIT_JOYSTICK | SDL_INIT_GAMEPAD) )
-	{
-		if ( SDL_Init(SDL_INIT_VIDEO) ) { // retry without joystick/gamepad if it failed
-			Sys_Printf( "WARNING: Couldn't get SDL gamepad support! Gamepads won't work!\n" );
-		} else
-#elif SDL_VERSION_ATLEAST(2, 0, 0)
-	if (SDL_Init(SDL_INIT_TIMER | SDL_INIT_VIDEO | SDL_INIT_JOYSTICK | SDL_INIT_GAMECONTROLLER) != 0)
-	{
-		if (SDL_Init(SDL_INIT_TIMER | SDL_INIT_VIDEO) == 0) { // retry without joystick/gamecontroller if it failed
-			Sys_Printf( "WARNING: Couldn't get SDL gamecontroller support! Gamepads won't work!\n" );
-		} else
-#else // SDL1.2
-	if (SDL_Init(SDL_INIT_TIMER | SDL_INIT_VIDEO) != 0) // no gamecontroller support in SDL1
-	{
-#endif
-		{
-			Sys_Error("Error while initializing SDL: %s", SDL_GetError());
-		}
-	}
-#endif // !D3_EACP
+	// SDL_Init went here, and with it a dummy video driver for dedicated
+	// servers and two window-manager hints. All three were the SDL host's, and
+	// the eacp host owns the loop, the window and the input devices, so none of
+	// them had run on this build since step 2 - they were behind D3_EACP.
+	// Step 5 deleted them and the D3_EACP switch with them.
 
 	Sys_InitThreads();
-
-#if !defined(D3_EACP) && SDL_VERSION_ATLEAST(2, 0, 0)
-	/* Force the window to minimize when focus is lost. This was the
-	 * default behavior until SDL 2.0.12 and changed with 2.0.14.
-	 * The windows staying maximized has some odd implications for
-	 * window ordering under Windows and some X11 window managers
-	 * like kwin. See:
-	 *  * https://github.com/libsdl-org/SDL/issues/4039
-	 *  * https://github.com/libsdl-org/SDL/issues/3656 */
-	SDL_SetHint( SDL_HINT_VIDEO_MINIMIZE_ON_FOCUS_LOSS, "1" );
-  #ifdef SDL_HINT_ENABLE_SCREEN_KEYBOARD
-	SDL_SetHint( SDL_HINT_ENABLE_SCREEN_KEYBOARD, "0" );
-  #else
-	// fallback for older SDL2 versions, maybe at least the runtime version is new enough
-	// for this hint if the compile time SDL2 version wasn't (and if not this won't hurt)
-	if (SDL_getenv("SDL_ENABLE_SCREEN_KEYBOARD") == NULL) {
-		SDL_setenv("SDL_ENABLE_SCREEN_KEYBOARD", "0", 0);
-	}
-  #endif
-#endif
 
 	try {
 
@@ -3069,27 +3005,10 @@ void idCommonLocal::Init( int argc, char **argv ) {
 		// register all static CVars
 		idCVar::RegisterStaticVars();
 
-		// print engine version
-#if SDL_VERSION_ATLEAST(3, 0, 0)
-		int sdlv = SDL_GetVersion();
-		int sdlvmaj = SDL_VERSIONNUM_MAJOR(sdlv);
-		int sdlvmin = SDL_VERSIONNUM_MINOR(sdlv);
-		int sdlvmicro = SDL_VERSIONNUM_MICRO(sdlv);
-		Printf( "%s using SDL v%d.%d.%d\n", version.string, sdlvmaj, sdlvmin, sdlvmicro );
-#else
-  #if SDL_VERSION_ATLEAST(2, 0, 0)
-		SDL_version sdlv;
-		SDL_GetVersion(&sdlv);
-  #else
-		SDL_version sdlv = *SDL_Linked_Version();
-  #endif
-		Printf( "%s using SDL v%u.%u.%u\n",
-				version.string, sdlv.major, sdlv.minor, sdlv.patch );
-#endif
-
-#if SDL_VERSION_ATLEAST(2, 0, 0)
-		Printf( "SDL video driver: %s\n", SDL_GetCurrentVideoDriver() );
-#endif
+		// print engine version. This used to name SDL and the video driver it
+		// had chosen; step 5 took SDL out and the platform layer is eacp, which
+		// prints what it opened for itself when the renderer starts it.
+		Printf( "%s\n", version.string );
 
 		// initialize key input/binding, done early so bind command exists
 		idKeyInput::Init();
@@ -3221,10 +3140,6 @@ void idCommonLocal::Shutdown( void ) {
 	// already torn the engine down, and shutting a shut-down engine down again
 	// dies in the file system.
 	com_fullyInitialized = false;
-
-#ifndef D3_EACP
-	SDL_Quit();
-#endif
 }
 
 /*

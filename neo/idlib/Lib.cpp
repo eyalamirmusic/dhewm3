@@ -35,31 +35,25 @@ If you have questions concerning this license or the applicable additional terms
 #include <unistd.h>
 #endif
 
-#ifdef D3_SDL3
-  #include <SDL3/SDL_endian.h>
-  // some defines for backwards-compat with SDL2
-  #define SDL_SwapBE16(X)  SDL_Swap16BE(X)
-  #define SDL_SwapLE16(X)  SDL_Swap16LE(X)
-  #define SDL_SwapBE32(X)  SDL_Swap32BE(X)
-  #define SDL_SwapLE32(X)  SDL_Swap32LE(X)
-#else // SDL1.2 or SDL2
-  #include <SDL_endian.h>
-#endif
-
+// Byte order. This used to be SDL_endian.h's SDL_BYTEORDER, cross-checked
+// against CMake's D3_IS_BIG_ENDIAN; step 5 dropped SDL, and CMake's answer is
+// the one that was authoritative anyway - it is what the rest of the build
+// compiles against, and the cross-check never had a way to be right when they
+// disagreed.
 #ifndef D3_IS_BIG_ENDIAN
   #error "D3_IS_BIG_ENDIAN should be defined by the build system (CMake)!"
 #endif
 
-#if SDL_BYTEORDER == SDL_BIG_ENDIAN
-  #if D3_IS_BIG_ENDIAN != 1
-    #error "CMake (which sets D3_IS_BIG_ENDIAN) and SDL disagree about the endianess! CMake says little, SDL says big"
-  #endif
-#elif SDL_BYTEORDER == SDL_LIL_ENDIAN
-  #if D3_IS_BIG_ENDIAN != 0
-    #error "CMake (which sets D3_IS_BIG_ENDIAN) and SDL disagree about the endianess! CMake says big, SDL says little"
-  #endif
+// The byte swap itself. SDL_Swap16/32 were wrappers over exactly these
+// intrinsics; both compilers this tree builds with have them, and both compile
+// them to one instruction.
+#ifdef _MSC_VER
+  #include <stdlib.h>
+  #define D3_BSWAP16(X)  _byteswap_ushort(X)
+  #define D3_BSWAP32(X)  _byteswap_ulong(X)
 #else
-  #error "According to SDL, endianess is neither Big nor Little - dhewm3 doesn't support other byteorders!"
+  #define D3_BSWAP16(X)  __builtin_bswap16(X)
+  #define D3_BSWAP32(X)  __builtin_bswap32(X)
 #endif
 
 #include "sys/platform.h"
@@ -189,7 +183,7 @@ dword PackColor( const idVec4 &color ) {
 	dz = ColorFloatToByte( color.z );
 	dw = ColorFloatToByte( color.w );
 
-#if SDL_BYTEORDER == SDL_LIL_ENDIAN
+#if !D3_IS_BIG_ENDIAN
 	return ( dx << 0 ) | ( dy << 8 ) | ( dz << 16 ) | ( dw << 24 );
 #else
 	return ( dx << 24 ) | ( dy << 16 ) | ( dz << 8 ) | ( dw << 0 );
@@ -202,7 +196,7 @@ UnpackColor
 ================
 */
 void UnpackColor( const dword color, idVec4 &unpackedColor ) {
-#if SDL_BYTEORDER == SDL_LIL_ENDIAN
+#if !D3_IS_BIG_ENDIAN
 	unpackedColor.Set( ( ( color >> 0 ) & 255 ) * ( 1.0f / 255.0f ),
 						( ( color >> 8 ) & 255 ) * ( 1.0f / 255.0f ),
 						( ( color >> 16 ) & 255 ) * ( 1.0f / 255.0f ),
@@ -227,7 +221,7 @@ dword PackColor( const idVec3 &color ) {
 	dy = ColorFloatToByte( color.y );
 	dz = ColorFloatToByte( color.z );
 
-#if SDL_BYTEORDER == SDL_LIL_ENDIAN
+#if !D3_IS_BIG_ENDIAN
 	return ( dx << 0 ) | ( dy << 8 ) | ( dz << 16 );
 #else
 	return ( dy << 16 ) | ( dz << 8 ) | ( dx << 0 );
@@ -240,7 +234,7 @@ UnpackColor
 ================
 */
 void UnpackColor( const dword color, idVec3 &unpackedColor ) {
-#if SDL_BYTEORDER == SDL_LIL_ENDIAN
+#if !D3_IS_BIG_ENDIAN
 	unpackedColor.Set( ( ( color >> 0 ) & 255 ) * ( 1.0f / 255.0f ),
 						( ( color >> 8 ) & 255 ) * ( 1.0f / 255.0f ),
 						( ( color >> 16 ) & 255 ) * ( 1.0f / 255.0f ) );
@@ -303,7 +297,7 @@ ID_INLINE static float FloatSwap( float f ) {
 	} id_attribute((may_alias)) dat;
 
 	dat.f = f;
-	dat.u = SDL_Swap32(dat.u);
+	dat.u = D3_BSWAP32(dat.u);
 
 	return dat.f;
 }
@@ -448,7 +442,7 @@ Swap_IsBigEndian
 ==========
 */
 bool Swap_IsBigEndian( void ) {
-#if SDL_BYTEORDER == SDL_LIL_ENDIAN
+#if !D3_IS_BIG_ENDIAN
 	return false;
 #else
 	return true;
@@ -456,23 +450,39 @@ bool Swap_IsBigEndian( void ) {
 }
 
 short	BigShort( short l ) {
-	return SDL_SwapBE16(l);
+#if !D3_IS_BIG_ENDIAN
+	return (short)D3_BSWAP16( (unsigned short)l );
+#else
+	return l;
+#endif
 }
 
 short	LittleShort( short l ) {
-	return SDL_SwapLE16(l);
+#if !D3_IS_BIG_ENDIAN
+	return l;
+#else
+	return (short)D3_BSWAP16( (unsigned short)l );
+#endif
 }
 
 int		BigInt( int l ) {
-	return SDL_SwapBE32(l);
+#if !D3_IS_BIG_ENDIAN
+	return (int)D3_BSWAP32( (unsigned int)l );
+#else
+	return l;
+#endif
 }
 
 int		LittleInt( int l ) {
-	return SDL_SwapLE32(l);
+#if !D3_IS_BIG_ENDIAN
+	return l;
+#else
+	return (int)D3_BSWAP32( (unsigned int)l );
+#endif
 }
 
 float	BigFloat( float l ) {
-#if SDL_BYTEORDER == SDL_LIL_ENDIAN
+#if !D3_IS_BIG_ENDIAN
 	return FloatSwap(l);
 #else
 	return l;
@@ -480,7 +490,7 @@ float	BigFloat( float l ) {
 }
 
 float	LittleFloat( float l ) {
-#if SDL_BYTEORDER == SDL_LIL_ENDIAN
+#if !D3_IS_BIG_ENDIAN
 	return l;
 #else
 	return FloatSwap(l);
@@ -488,7 +498,7 @@ float	LittleFloat( float l ) {
 }
 
 void	BigRevBytes( void *bp, int elsize, int elcount ) {
-#if SDL_BYTEORDER == SDL_LIL_ENDIAN
+#if !D3_IS_BIG_ENDIAN
 	RevBytesSwap(bp, elsize, elcount);
 #else
 	return;
@@ -496,7 +506,7 @@ void	BigRevBytes( void *bp, int elsize, int elcount ) {
 }
 
 void	LittleRevBytes( void *bp, int elsize, int elcount ){
-#if SDL_BYTEORDER == SDL_LIL_ENDIAN
+#if !D3_IS_BIG_ENDIAN
 	return;
 #else
 	RevBytesSwap(bp, elsize, elcount);
@@ -504,7 +514,7 @@ void	LittleRevBytes( void *bp, int elsize, int elcount ){
 }
 
 void	LittleBitField( void *bp, int elsize ){
-#if SDL_BYTEORDER == SDL_LIL_ENDIAN
+#if !D3_IS_BIG_ENDIAN
 	return;
 #else
 	RevBitFieldSwap(bp, elsize);
@@ -512,7 +522,7 @@ void	LittleBitField( void *bp, int elsize ){
 }
 
 void	SixtetsForInt( byte *out, int src) {
-#if SDL_BYTEORDER == SDL_LIL_ENDIAN
+#if !D3_IS_BIG_ENDIAN
 	SixtetsForIntLittle(out, src);
 #else
 	SixtetsForIntBig(out, src);
@@ -520,7 +530,7 @@ void	SixtetsForInt( byte *out, int src) {
 }
 
 int		IntForSixtets( byte *in ) {
-#if SDL_BYTEORDER == SDL_LIL_ENDIAN
+#if !D3_IS_BIG_ENDIAN
 	return IntForSixtetsLittle(in);
 #else
 	return IntForSixtetsBig(in);

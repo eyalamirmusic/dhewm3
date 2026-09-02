@@ -818,13 +818,13 @@ if(CORE)
 		target_link_libraries(dhewm3 PRIVATE CURL::libcurl)
 	endif()
 
-	# D3_EACP marks the shared engine sources that still have a platform choice
-	# in them - SDL_Init/SDL_Quit in Common.cpp is the only one so far.
+	# D3_EACP used to mark the shared engine sources that still had a platform
+	# choice in them. There is only one platform layer now, so there is nothing
+	# left to choose and step 5 deleted the last two blocks it guarded.
 	if(HARDLINK_GAME)
 		target_include_directories(dhewm3 PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/${hardlinked_game_dir}")
-		target_compile_definitions(dhewm3 PRIVATE D3_EACP=1)
 	else()
-		target_compile_definitions(dhewm3 PRIVATE __DOOM_DLL__ D3_EACP=1)
+		target_compile_definitions(dhewm3 PRIVATE __DOOM_DLL__)
 	endif()
 
 	# eacp is C++20; the directory this target is declared in is C++11, for the

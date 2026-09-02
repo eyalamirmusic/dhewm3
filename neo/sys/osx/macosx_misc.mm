@@ -69,6 +69,54 @@ void Sys_DoStartProcess( const char *exeName, bool dofork = true ) {
 
 /*
 ==================
+Sys_GetClipboardData
+Sys_FreeClipboardData
+Sys_SetClipboardData
+
+The clipboard, which lived in posix_main.cpp on SDL_GetClipboardText until step
+5. It is here rather than there because NSPasteboard needs Objective-C and this
+is the port's one Objective-C++ file on the Sys_ side; posix_main.cpp is
+deliberately window-system-free, and a pasteboard is a window system's.
+
+Sys_GetClipboardData hands back a Mem_Alloc'd copy, which Sys_FreeClipboardData
+frees. Returning NULL is normal and every caller checks: the pasteboard may hold
+an image, or nothing at all.
+==================
+*/
+char *Sys_GetClipboardData( void ) {
+	NSPasteboard *	pb = [NSPasteboard generalPasteboard];
+	NSString *		text = [pb stringForType:NSPasteboardTypeString];
+
+	if ( text == nil ) {
+		return NULL;
+	}
+
+	const char *	utf8 = [text UTF8String];
+	if ( utf8 == NULL ) {
+		return NULL;
+	}
+
+	size_t	len = strlen( utf8 );
+	char *	data = (char *)Mem_Alloc( len + 1 );
+	memcpy( data, utf8, len + 1 );
+
+	return data;
+}
+
+void Sys_FreeClipboardData( char *data ) {
+	Mem_Free( data );
+}
+
+void Sys_SetClipboardData( const char *string ) {
+	NSPasteboard *	pb = [NSPasteboard generalPasteboard];
+
+	[pb clearContents];
+	[pb setString:[NSString stringWithCString:string encoding:NSUTF8StringEncoding]
+		forType:NSPasteboardTypeString];
+}
+
+/*
+==================
 OSX_GetLocalizedString
 ==================
 */

@@ -49,9 +49,6 @@ If you have questions concerning this license or the applicable additional terms
 
 #include "sys/posix/posix_public.h"
 
-// SDL.h for clipboard:
-#include "sys/sys_sdl.h"
-
 
 #ifdef __APPLE__ // for clock_get_time() in Sys_MillisecondsPrecise()
 #include <mach/clock.h>
@@ -357,30 +354,9 @@ ID_TIME_T Sys_FileTimeStamp(FILE * fp) {
 	return st.st_mtime;
 }
 
-char *Sys_GetClipboardData(void) {
-#if SDL_VERSION_ATLEAST(2, 0, 0)
-	return SDL_GetClipboardText();
-#else
-	Sys_Printf( "TODO: Sys_GetClipboardData\n" );
-	return NULL;
-#endif
-}
-
-void Sys_FreeClipboardData( char* data ) {
-#if SDL_VERSION_ATLEAST(2, 0, 0)
-	SDL_free( data );
-#else
-	assert( 0 && "why is this called, Sys_GetClipboardData() isn't implemented for SDL1.2" );
-#endif
-}
-
-void Sys_SetClipboardData( const char *string ) {
-#if SDL_VERSION_ATLEAST(2, 0, 0)
-	SDL_SetClipboardText( string );
-#else
-	Sys_Printf( "TODO: Sys_SetClipboardData\n" );
-#endif
-}
+// The three Sys_*ClipboardData are in sys/osx/macosx_misc.mm since step 5. They
+// were here on SDL_GetClipboardText; NSPasteboard needs Objective-C, and this
+// file is deliberately window-system-free.
 
 /*
 ================
@@ -424,9 +400,7 @@ int Sys_GetDriveFreeSpace( const char *path ) {
 
 // D3_CpuPause() abstracts a CPU pause instruction, to make busy waits a bit less power-hungry
 // (code taken from Yamagi Quake II)
-#ifdef SDL_CPUPauseInstruction
-  #define D3_CpuPause() SDL_CPUPauseInstruction()
-#elif defined(__GNUC__)
+#if defined(__GNUC__)
   #if (__i386 || __x86_64__)
     #define D3_CpuPause() asm volatile("pause")
   #elif defined(__aarch64__) || (defined(__ARM_ARCH) && __ARM_ARCH >= 7) || defined(__ARM_ARCH_6K__)

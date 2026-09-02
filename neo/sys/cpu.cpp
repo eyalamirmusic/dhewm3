@@ -28,12 +28,6 @@ If you have questions concerning this license or the applicable additional terms
 
 #include <float.h>
 
-#ifdef D3_SDL3
-  #include <SDL3/SDL_cpuinfo.h>
-#else // SDL1.2 or SDL2
-  #include <SDL_cpuinfo.h>
-#endif
-
 // MSVC header intrin.h uses strcmp and errors out when not set
 #define IDSTR_NO_REDIRECT
 
@@ -103,8 +97,10 @@ static inline void CPUid(int index, int *a, int *b, int *c, int *d) {
 #endif
 
 #define c_SSE3		(1 << 0)
-#define d_SSE2		(1 << 26)
+#define d_MMX		(1 << 23)
 #define d_FXSAVE	(1 << 24)
+#define d_SSE		(1 << 25)
+#define d_SSE2		(1 << 26)
 
 static inline bool HasDAZ() {
 	int a, b, c, d;
@@ -198,34 +194,41 @@ void Sys_FPU_SetFTZ(bool enable) {
 /*
 ================
 Sys_GetProcessorId
+
+Which SIMD implementation idSIMD picks. This used to ask SDL_HasMMX / HasSSE /
+HasSSE2 / HasAltiVec; step 5 took SDL out and the answer comes off cpuid, which
+this file already reads for DAZ and SSE3.
+
+Two flags are gone rather than moved. CPUID_3DNOW went first - SDL3 dropped the
+detection because no CPU AMD still sells has 3DNow!. CPUID_ALTIVEC goes here:
+it is PowerPC's, and neither architecture this port builds for is PowerPC. Both
+still exist in sys_public.h and Simd.cpp still tests them, so nothing has to
+change if a PowerPC ever comes back - it would just have to set them.
 ================
 */
 int Sys_GetProcessorId( void ) {
 	int flags = CPUID_GENERIC;
 
-	if (SDL_HasMMX())
-		flags |= CPUID_MMX;
-
-	// SDL3 doesn't support detecting 3DNow, and current CPUs (even from AMD) don't support it either
-#ifndef D3_SDL3
-	if (SDL_Has3DNow())
-		flags |= CPUID_3DNOW;
-#endif
-
-	if (SDL_HasSSE())
-		flags |= CPUID_SSE;
-
-	if (SDL_HasSSE2())
-		flags |= CPUID_SSE2;
-
 #ifndef NO_CPUID
-	// there is no SDL_HasSSE3() in SDL 1.2
-	if (HasSSE3())
-		flags |= CPUID_SSE3;
-#endif
+	int a, b, c, d;
 
-	if (SDL_HasAltiVec())
-		flags |= CPUID_ALTIVEC;
+	CPUid( 0, &a, &b, &c, &d );
+	if ( a >= 1 ) {
+		CPUid( 1, &a, &b, &c, &d );
+
+		if ( d & d_MMX )
+			flags |= CPUID_MMX;
+
+		if ( d & d_SSE )
+			flags |= CPUID_SSE;
+
+		if ( d & d_SSE2 )
+			flags |= CPUID_SSE2;
+
+		if ( c & c_SSE3 )
+			flags |= CPUID_SSE3;
+	}
+#endif
 
 	return flags;
 }
