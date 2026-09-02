@@ -1159,85 +1159,6 @@ void R_ReportImageDuplication_f( const idCmdArgs &args ) {
 /*
 ==============================================================================
 
-						THROUGHPUT BENCHMARKING
-
-==============================================================================
-*/
-
-/*
-================
-R_RenderingFPS
-================
-*/
-static float R_RenderingFPS( const renderView_t *renderView ) {
-	qglFinish();
-
-	int		start = Sys_Milliseconds();
-	static const int SAMPLE_MSEC = 1000;
-	int		end;
-	int		count = 0;
-
-	while( 1 ) {
-		// render
-		renderSystem->BeginFrame( glConfig.vidWidth, glConfig.vidHeight );
-		tr.primaryWorld->RenderScene( renderView );
-		renderSystem->EndFrame( NULL, NULL );
-		qglFinish();
-		count++;
-		end = Sys_Milliseconds();
-		if ( end - start > SAMPLE_MSEC ) {
-			break;
-		}
-	}
-
-	float fps = count * 1000.0 / ( end - start );
-
-	return fps;
-}
-
-/*
-================
-R_Benchmark_f
-================
-*/
-void R_Benchmark_f( const idCmdArgs &args ) {
-	float	fps, msec;
-	renderView_t	view;
-
-	if ( !tr.primaryView ) {
-		common->Printf( "No primaryView for benchmarking\n" );
-		return;
-	}
-	view = tr.primaryRenderView;
-
-	for ( int size = 100 ; size >= 10 ; size -= 10 ) {
-		r_screenFraction.SetInteger( size );
-		fps = R_RenderingFPS( &view );
-		int	kpix = glConfig.vidWidth * glConfig.vidHeight * ( size * 0.01 ) * ( size * 0.01 ) * 0.001;
-		msec = 1000.0 / fps;
-		common->Printf( "kpix: %4i  msec:%5.1f fps:%5.1f\n", kpix, msec, fps );
-	}
-
-	// enable r_singleTriangle 1 while r_screenFraction is still at 10
-	r_singleTriangle.SetBool( 1 );
-	fps = R_RenderingFPS( &view );
-	msec = 1000.0 / fps;
-	common->Printf( "single tri  msec:%5.1f fps:%5.1f\n", msec, fps );
-	r_singleTriangle.SetBool( 0 );
-	r_screenFraction.SetInteger( 100 );
-
-	// enable r_skipRenderContext 1
-	r_skipRenderContext.SetBool( true );
-	fps = R_RenderingFPS( &view );
-	msec = 1000.0 / fps;
-	common->Printf( "no context  msec:%5.1f fps:%5.1f\n", msec, fps );
-	r_skipRenderContext.SetBool( false );
-}
-
-
-/*
-==============================================================================
-
 						SCREEN SHOTS
 
 ==============================================================================
@@ -1559,50 +1480,6 @@ void R_ScreenShot_f( const idCmdArgs &args ) {
 	tr.TakeScreenshot( width, height, checkname, blends, NULL );
 
 	common->Printf( "Wrote %s\n", checkname.c_str() );
-}
-
-/*
-===============
-R_StencilShot
-Save out a screenshot showing the stencil buffer expanded by 16x range
-===============
-*/
-void R_StencilShot( void ) {
-	byte		*buffer;
-	int			i, c;
-
-	int	width = tr.GetScreenWidth();
-	int	height = tr.GetScreenHeight();
-
-	int	pix = width * height;
-
-	c = pix * 3 + 18;
-	buffer = (byte *)Mem_Alloc(c);
-	memset (buffer, 0, 18);
-
-	byte *byteBuffer = (byte *)Mem_Alloc(pix);
-
-	qglReadPixels( 0, 0, width, height, GL_STENCIL_INDEX , GL_UNSIGNED_BYTE, byteBuffer );
-
-	for ( i = 0 ; i < pix ; i++ ) {
-		buffer[18+i*3] =
-		buffer[18+i*3+1] =
-			//		buffer[18+i*3+2] = ( byteBuffer[i] & 15 ) * 16;
-		buffer[18+i*3+2] = byteBuffer[i];
-	}
-
-	// fill in the header (this is vertically flipped, which qglReadPixels emits)
-	buffer[2] = 2;		// uncompressed type
-	buffer[12] = width & 255;
-	buffer[13] = width >> 8;
-	buffer[14] = height & 255;
-	buffer[15] = height >> 8;
-	buffer[16] = 24;	// pixel size
-
-	fileSystem->WriteFile( "screenshots/stencilShot.tga", buffer, c, "fs_savepath" );
-
-	Mem_Free( buffer );
-	Mem_Free( byteBuffer );
 }
 
 /*
@@ -2003,8 +1880,6 @@ R_VidRestart_f
 =================
 */
 void R_VidRestart_f( const idCmdArgs &args ) {
-	int	err;
-
 	// if OpenGL isn't started, do nothing
 	if ( !glConfig.isInitialized ) {
 		return;
@@ -2108,10 +1983,7 @@ void R_VidRestart_f( const idCmdArgs &args ) {
 	R_RegenerateWorld_f( idCmdArgs() );
 
 	// check for problems
-	err = qglGetError();
-	if ( err != GL_NO_ERROR ) {
-		common->Printf( "glGetError() = 0x%x\n", err );
-	}
+	renderBackend->CheckErrors();
 
 	// start sound playing again
 	soundSystem->SetMute( false );
@@ -2212,7 +2084,6 @@ void R_InitCommands( void ) {
 	cmdSystem->AddCommand( "screenshot", R_ScreenShot_f, CMD_FL_RENDERER, "takes a screenshot" );
 	cmdSystem->AddCommand( "envshot", R_EnvShot_f, CMD_FL_RENDERER, "takes an environment shot" );
 	cmdSystem->AddCommand( "makeAmbientMap", R_MakeAmbientMap_f, CMD_FL_RENDERER|CMD_FL_CHEAT, "makes an ambient map" );
-	cmdSystem->AddCommand( "benchmark", R_Benchmark_f, CMD_FL_RENDERER, "benchmark" );
 	cmdSystem->AddCommand( "gfxInfo", GfxInfo_f, CMD_FL_RENDERER, "show graphics info" );
 	cmdSystem->AddCommand( "modulateLights", R_ModulateLights_f, CMD_FL_RENDERER | CMD_FL_CHEAT, "modifies shader parms on all lights" );
 	cmdSystem->AddCommand( "testImage", R_TestImage_f, CMD_FL_RENDERER | CMD_FL_CHEAT, "displays the given image centered on screen", idCmdSystem::ArgCompletion_ImageName );
@@ -2375,9 +2246,6 @@ idRenderSystemLocal::EndLevelLoad
 void idRenderSystemLocal::EndLevelLoad( void ) {
 	renderModelManager->EndLevelLoad();
 	globalImages->EndLevelLoad();
-	if ( r_forceLoadImages.GetBool() ) {
-		RB_ShowImages();
-	}
 	// DG: check if the levels worldspawn has "allow_nospecular" set, which tells us that
 	//     the map author wants "nospecular" parms of lights to be respected by the renderer
 	//     (Vanilla Doom3 didn't, even though some official levels have it set, so to not

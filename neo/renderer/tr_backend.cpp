@@ -150,78 +150,12 @@ static void	RB_SetBuffer( const void *data ) {
 }
 
 /*
-===============
-RB_ShowImages
-
-Draw all the images to the screen, on top of whatever
-was there.  This is used to test for texture thrashing.
-===============
-*/
-void RB_ShowImages( void ) {
-	int		i;
-	idImage	*image;
-	float	x, y, w, h;
-	int		start, end;
-
-	RB_SetGL2D();
-
-	//qglClearColor( 0.2, 0.2, 0.2, 1 );
-	//qglClear( GL_COLOR_BUFFER_BIT );
-
-	qglFinish();
-
-	start = Sys_Milliseconds();
-
-	for ( i = 0 ; i < globalImages->images.Num() ; i++ ) {
-		image = globalImages->images[i];
-
-		if ( image->texnum == idImage::TEXTURE_NOT_LOADED && image->partialImage == NULL ) {
-			continue;
-		}
-
-		w = glConfig.vidWidth / 20;
-		h = glConfig.vidHeight / 15;
-		x = i % 20 * w;
-		y = i / 20 * h;
-
-		// show in proportional size in mode 2
-		if ( r_showImages.GetInteger() == 2 ) {
-			w *= image->uploadWidth / 512.0f;
-			h *= image->uploadHeight / 512.0f;
-		}
-
-		image->Bind();
-		qglBegin (GL_QUADS);
-		qglTexCoord2f( 0, 0 );
-		qglVertex2f( x, y );
-		qglTexCoord2f( 1, 0 );
-		qglVertex2f( x + w, y );
-		qglTexCoord2f( 1, 1 );
-		qglVertex2f( x + w, y + h );
-		qglTexCoord2f( 0, 1 );
-		qglVertex2f( x, y + h );
-		qglEnd();
-	}
-
-	qglFinish();
-
-	end = Sys_Milliseconds();
-	common->Printf( "%i msec to draw all images\n", end - start );
-}
-
-
-/*
 =============
 RB_SwapBuffers
 
 =============
 */
 const void	RB_SwapBuffers( const void *data ) {
-	// texture swapping test
-	if ( r_showImages.GetInteger() != 0 ) {
-		RB_ShowImages();
-	}
-
 	D3::ImGuiHooks::EndFrame();
 
 	renderBackend->SwapBuffers();

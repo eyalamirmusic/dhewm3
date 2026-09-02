@@ -225,7 +225,6 @@ public:
 	void		MakeDefault();	// fill with a grid pattern
 	void		SetImageFilterAndRepeat() const;
 	bool		ShouldImageBePartialCached();
-	void		WritePrecompressedImage();
 	bool		CheckPrecompressedImage( bool fullLoad );
 	void		UploadPrecompressedImage( byte *data, int len );
 	void		ActuallyLoadImage( bool checkForPrecompressed, bool fromBackEnd );
@@ -399,7 +398,6 @@ public:
 	static idCVar		image_lodbias;				// change lod bias on mipmapped images
 	static idCVar		image_useAllFormats;		// allow alpha/intensity/luminance/luminance+alpha
 	static idCVar		image_usePrecompressedTextures;	// use .dds files if present
-	static idCVar		image_writePrecompressedTextures; // write .dds files if necessary
 	static idCVar		image_writeNormalTGA;		// debug tool to write out .tgas of the final normal maps
 	static idCVar		image_writeNormalTGAPalletized;		// debug tool to write out palletized versions of the final normal maps
 	static idCVar		image_writeTGA;				// debug tool to write out .tgas of the non normal maps
