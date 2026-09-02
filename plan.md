@@ -11,18 +11,22 @@ menu on screen through Metal**, **loads a level**, **lights it** and
 `interaction.vfp` and `shadow.vp` are in the EDSL, the stencil shadow volumes
 are counted two-sided in one pass over each volume, and at a pinned camera in
 `demo_mars_city1` the two backends draw **the same 71 draws, 1644 triangles and
-2376 shadow triangles**, volume for volume. 4e is four steps in: the frame is
-composed into an app-owned **render target**, that target is **read back to the
-CPU** — so the eacp build takes the game's own camera shots, writes screenshots,
-and **runs the regression gate**, 297 frames hashed and identical across two
-captures — it is **copied into an image**, so `_currentRender` and `_scratch`
-are filled in and the player-view effects draw the frame they are supposed to,
-and every 3D view now gets **a pass of its own**, so **mirrors and subviews
-work**: the washroom mirror of `demo_mars_city1` reflects the room, which moved
-sixteen of the gate's 297 frames from 3.82 of 255 against the SDL/GL build to
-0.50 and left the other 281 byte-identical. Every comparison from here is a hash
-rather than a screen grab. What is left in 4e is fog, blend lights and the
-texgen variants.**
+2376 shadow triangles**, volume for volume. 4e is seven steps in and its basket
+is empty: the frame is composed into an app-owned **render target**, that target
+is **read back to the CPU** — so the eacp build takes the game's own camera
+shots, writes screenshots, and **runs the regression gate**, 297 frames hashed
+and identical across two captures — it is **copied into an image**, so
+`_currentRender` and `_scratch` are filled in, every 3D view gets **a pass of
+its own**, so **mirrors and subviews work**, and now **the Mars sky and the
+glass are on screen** — eacp grew **cube textures** (gap 5) and the texgen
+variants are three programs on top of them — **the hangar fog is in the frame**
+and the blend lights with it, and **`r_gammaInShader` corrects what it corrects
+on OpenGL** and nothing else. Every comparison is a hash: over the whole
+297-frame tour the eacp build now agrees with the SDL/GL build at a mean of
+**0.83 of 255**, from 1.13 before this round, with every camera stop that moved
+moving towards it. What is left of Phase 2 is the loose over-bright frame from
+4e.3, the `newStage` programs nothing on the gate reaches, and then step 5 — the
+deletion.**
 
 Reference implementation for almost everything on the platform side:
 `~/Code/PureDOOM/examples/EACP` — a complete engine hosted on eacp, with its own
@@ -329,7 +333,10 @@ stopping something worth having: eacp grew `Texture::read` and `Frame::flush`,
 and this build's frames are hashes now rather than screen grabs. **22 is closed
 by step 4e.3**, which needed a pass to survive being interrupted — the copy that
 fills `_currentRender` has to end the pass, and everything drawn after it has to
-be occluded by the depth buffer that pass was writing.
+be occluded by the depth buffer that pass was writing. **And 5 is closed by step
+4e.5**, the one entry on the list that was written before the port began and
+survived to be needed exactly as written: the Mars sky and every pane of glass
+in the demo's first level sample a cube map.
 
 Numbers are never reused, so a hole is an entry that closed.
 
@@ -337,12 +344,69 @@ Numbers are never reused, so a hole is an entry that closed.
 
 4. **BC/DXT compressed texture formats** — all Doom 3 art ships as DXT1/3/5 in the
    pk4s. Without it: decompress at load, ~4× VRAM, much slower level loads.
-5. **Cube textures** — skyboxes and reflections. Two of the three users are
-   gone rather than pending: step 4d.2 deleted the normalization cube map, as
-   this entry predicted it could, and the `_ambient` map that stands in for it
-   on an ambient light with it — that one becoming a uniform, since the whole
-   point of the substitution is that the answer does not vary with the lookup.
-   What is left needs real cube sampling.
+5. ~~**Cube textures** — skyboxes and reflections.~~ — **closed**, and kept
+   because two of its three users were gone before it was and the third needed
+   more than "a texture with six faces".
+
+   Step 4d.2 deleted the normalization cube map, as the entry predicted it
+   could, and the `_ambient` map that stands in for it on an ambient light with
+   it — that one becoming a uniform, since the whole point of the substitution
+   is that the answer does not vary with the lookup. What was left is real cube
+   sampling, and step 4e.5 is what needed it.
+
+   `TextureDescriptor::cube` is six square faces of one size and one format,
+   taken as **one block of pixels in +X, -X, +Y, -Y, +Z, -Z order, each face's
+   row 0 at the top**. That is one convention rather than three: Metal's cube
+   slice order, D3D12's array order under a `TEXTURECUBE` view and OpenGL's
+   `GL_TEXTURE_CUBE_MAP_POSITIVE_X + i` agree on the order *and* on the
+   orientation within a face, which is what lets Doom 3's own cube loader —
+   whose `CF_CAMERA` half rotates and flips six camera images into exactly that
+   arrangement — be uploaded untouched.
+
+   **Both halves of that are pinned with a test, and the second half is the one
+   worth having.** A face in the wrong slot, or flipped inside its own slot,
+   still samples and still looks like a picture: a sky is a sky either way
+   round, and a reflection of the wrong wall is still a reflection. There is no
+   error, no validation message and nothing on screen that says so, and the only
+   place it would ever show up is a comparison against another renderer. So
+   `Tests/GPU/CubeTextureTests.cpp` holds a six-colour cube read along the six
+   axes *and* a 2x2 face whose four corners are four colours, sampled at the
+   four directions that hit its texel centres.
+
+   The shader side is `ShaderBuilder::cubeTexture`, `Uniform<TextureCube>` and
+   `sample(const TextureCube&, const Float3&)`, and **the interesting part is
+   how little of it is new**. The graph records a *kind* per texture slot beside
+   the sampling it already recorded, and that kind is read in exactly four
+   places — the Metal fragment parameter, the Metal kernel parameter, the HLSL
+   render global, the HLSL kernel global — because `t.sample(s, uv)` and
+   `t.Sample(s, uv)` read both shapes on both backends, the coordinate's own
+   width choosing. So `ExprKind::Sample` never asks what shape a texture is, and
+   `RenderPass::setFragmentTexture` binds a cube through the same call on the
+   same slot space. The declaration is the whole of the difference, which is why
+   there is a codegen case on it.
+
+   **What it costs each backend is not the same, and that is the other half of
+   the finding.** Metal has a cube texture descriptor and a slice argument to
+   `replaceRegion`, so the change there is a second descriptor and a loop.
+   D3D12 has **no cube resource dimension at all** — a cube is a six-slice 2D
+   array, and it is the *view* that makes it one, which means the SRV can no
+   longer be created from the null description every 2D texture here takes. A
+   `TextureCube` declaration reading a `Texture2DArray` view is a dimension
+   mismatch: the debug layer says so and a release runtime samples nothing.
+
+   Two shapes are refused rather than half-supported, identically on both
+   backends: a cube that is not square, and a cube asked for as a render target
+   or a kernel output — there being no way here to say which face a pass or a
+   kernel would write. `Texture::update` takes all six faces for the same
+   reason, and the region-shaped `update` and `read` are no-ops on a cube rather
+   than quietly addressing +X.
+
+   In the working tree of eacp at `e2df82a`, **uncommitted** as of this step —
+   the dhewm3 build is pointed at that checkout with `CPM_eacp_SOURCE` until it
+   lands on `main` — with the GPU suite at **261 tests, all passing** against
+   253 before, clean under `MTL_DEBUG_LAYER=1` with `MTL_SHADER_VALIDATION=1`
+   and GPU validation. The D3D12 half is written and unrun, the eacp host being
+   macOS-only (§8) — the same standing gap 22's entry carries.
 6. **Depth bias / polygon offset** — decals z-fight without it, and step 4d.3
    found the second user: a shadow volume's near cap is the occluder's own
    triangles rebuilt through the extrusion, so it lands within an ulp of the
@@ -1865,6 +1929,407 @@ declare one are all in art the demo ships and the maps never place — so there
 would be nothing to check them against. Both pieces they need are here: the
 per-view pass, and the `CopyFramebufferToImage` step 4e.3 built.
 
+#### Step 4e.5 — cube maps, and the texgen variants of the material stage — **done**
+
+`TG_SKYBOX_CUBE`, `TG_WOBBLESKY_CUBE`, `TG_DIFFUSE_CUBE`, `TG_REFLECT_CUBE` in
+both of its forms, and `TG_SCREEN` / `TG_SCREEN2`. Everything
+`RB_PrepareStageTexturing` does except `TG_GLASSWARP`, which is not really a
+texgen — it is a hand-written ARB fragment program that a texgen happens to
+select, so it belongs with the `newStage` skip beside it.
+
+**It needed eacp gap 5 closed first, and that is §5.** What the dhewm3 side of
+it turned out to need is below.
+
+**Three new programs, not one, and the reason is eacp's rather than a
+preference.** A shader's textures are declared by the uniform members it lists —
+all of them, whether `define()` samples them or not — and Metal's validation
+layer rejects a draw with a declared texture left unbound. So a stage program
+that grew a `TextureCube` would declare one on every `TG_EXPLICIT` variant as
+well, and every one of those draws would then have to bind a cube it never
+reads. The four samplings times the alpha test that step 4c compiled are
+therefore untouched, which is also what keeps every gate frame without cube
+content byte-identical:
+
+- **`idEacpCubeProgram`**, in three texgen forms. `TG_SKYBOX_CUBE` and
+  `TG_WOBBLESKY_CUBE` are **one** of them, because a skybox is a wobblesky whose
+  matrix is the identity and `R_LocalPointToGlobal` through an identity 3x3
+  returns the vector it was handed, bit for bit. So the sky pays three dot
+  products a vertex and the port carries one program fewer.
+- **`idEacpBumpyReflectProgram`** — `bumpyEnvironment.vfp`, which is not
+  `environment.vfp` with a normal map bolted on: it works in **global** space,
+  through the three model-matrix rows the vertex program gets as
+  `program.env[6..8]`, where the unbumped one reflects a model-space eye vector
+  about a model-space normal and turns with the object.
+- **`idEacpScreenProgram`** — and `TG_SCREEN` and `TG_SCREEN2` are one program
+  because they are one texgen written out twice: the two branches of
+  `RB_PrepareStageTexturing` are identical line for line.
+
+**The coordinate is computed in the shader and the frontend's buffer is
+ignored, which is worth saying out loud.** `R_SkyboxTexGen` and
+`R_WobbleskyTexGen` still run — they are frontend code this port does not touch —
+and still write a three-component texture coordinate per vertex into the vertex
+cache every frame. Nothing binds it. The same arithmetic is four instructions in
+a vertex shader and costs neither the allocation nor the upload, so
+`surf->dynamicTexCoords` is filled in and dead, and someone looking for the bind
+should know that before they go looking.
+
+The wobble matrix is the one thing that had to come *out* of the frontend, and
+it came out as a function rather than as a copy: `R_WobbleskyTransform` is the
+matrix half of `R_WobbleskyTexGen`, lifted whole, with the generator calling it.
+Its `floatTime` is a parameter because the two callers sit on opposite sides of
+the frontend/backend split. **297/297 on the SDL/GL build**, which is the point
+of doing it that way — see the note on frame 99 below.
+
+**Which form a reflection takes is `GetBumpStage() != NULL`, and the surprise is
+how often that is true.** `idMaterial` adds an implicit `_flat` bumpmap stage to
+any material that has a diffuse or specular stage and no bump of its own
+(`Material.cpp:1678`), so most reflective materials take the *bumpy* path with a
+normal map that is a constant — which is **not** the same picture as the
+unbumped one, the two reflecting in different spaces. Named once each over the
+tour, the demo's first level reaches:
+
+| Program | Materials |
+| --- | --- |
+| `ECT_SKY` | `textures/skies/commoutside` |
+| `ECT_REFLECT` (`environment.vfp`) | `textures/glass/glass1`, `glass2` |
+| bumpy (`bumpyEnvironment.vfp`) | `textures/sfx/chiglass1blue`, `textures/outside/outfactory_new2`, `models/mapobjects/dropship/dropshipglassns`, `models/monsters/zsecurity/zsgogs2`, `models/characters/male_npc/security/gog`, `textures/decals/p_oppressive`, `textures/sfx/shatterglass01` |
+
+`glass1` and `glass2` are the two with no lighting stage at all — a `maskcolor`
+pass and a `cubeMap` pass — so they are the only two that never got an implicit
+bump and the only two the unbumped program draws.
+
+**`bumpyEnvironment.vfp` writes no alpha at all, and what to put there was
+decided by the content rather than by the specification.** `MOV
+result.color.xyz, R0` leaves `w` undefined under ARB_fragment_program, so there
+is no number to copy. What there is instead is what the materials the demo's
+maps place that reach it do with the channel: `chiglass1blue` and `p_oppressive`
+are `blend add`, where the destination alpha becomes `src + dst`, and
+`outfactory_new2` is `blend gl_dst_alpha, gl_one`, where it becomes
+`src × dst + dst`. A source alpha of **zero** leaves the destination's exactly
+as it was under both, so zero is the one value that is invisible on every path
+the content actually takes, and it is what the port writes. (The first draft of
+this step said the `maskalpha` glasses reached this program too. They do not —
+they are the three with no lighting stage, and the unbumped program draws them —
+and the conclusion survived the correction because it never depended on them.)
+
+**The texture matrix is not applied to a cube coordinate, and that is a decision
+rather than an omission.** GL's texture matrix multiplies the whole coordinate,
+and a cube's is a direction: Doom 3's 2x3 mixes s and t into each other and adds
+a translation built for the [0, 1] of an image, which on a direction vector is a
+rotation about z plus an offset that means nothing. Two materials in the demo
+pk4 combine the two — `shaderDemos/cloudySky` and `shaderDemos/skybox`, both
+with `rotate` — and neither of the demo's maps places either, so there is
+nothing to check a faithful reproduction of the mixture against. It is applied
+on the *screen* texgens, where it is well defined and where OpenGL applies it to
+the homogeneous (s, t, q) before the divide.
+
+**Two more things the ARB reflect path does not do, and this does not either.**
+The bump map is sampled at the surface's raw (s, t) rather than through the
+stage's texture matrix — a vertex program bypasses GL's texture matrix outright,
+so `scroll` on a reflect stage has never done anything on `BE_ARB2`. And the
+colour: `environment.vfp` multiplies by `vertex.color` and the bumpy one
+multiplies by nothing, where the three fixed-function cube texgens take the
+ordinary `(modulate, add)` pair. A fragment program *replaces* the texture-env
+combiner, so the second texture unit the fixed-function path binds the white
+image on has no effect on a reflect stage and the stage's constant colour
+reaches the shader only where `SVC_IGNORE` put it there with `glColor4fv`. Which
+is `(0, c)` and `(1, 0)` — the same two uniforms, computed from a different rule.
+
+**A cube arrives as six upload calls and leaves as one texture.**
+`GenerateCubeImage` uploads level 0 of faces 0 through 5 in order and then their
+mip chains; eacp takes a cube as one block of six faces in that same order, so
+the six are gathered and the texture is created on the sixth. A bit per face
+says which have arrived, so a loader that gave up half way through leaves the
+image with no texture rather than with a cube whose missing faces hold the last
+one's pixels. `UploadScratchImage`'s cube animation — six square faces stacked
+into one tall image — needed nothing at all beyond the flag: the bytes it is
+handed are already exactly the layout eacp takes, so where OpenGL makes six
+`glTexSubImage2D` calls this makes one `Texture::update`.
+
+**The cube's clamp moved rather than disappeared.**
+`idRenderBackendGL::SetCubeImageFilterAndRepeat` forces `GL_CLAMP_TO_EDGE`
+whatever the material declared — "no other clamp mode makes sense" across a seam
+— so a cube declared `repeat` samples clamped. Here the address mode is baked
+into a shader, so forcing it is choosing *which compiled variant* the draw goes
+through, and `R_EacpSampling` is where it happens. What it costs is one fewer
+variant rather than one fewer call.
+
+**And a check that nothing else does.** eacp binds a cube and a 2D texture
+through the same call on the same slot, so a shader declaring one and handed the
+other is not a bind error — Metal's sampler reads a texture whose type the
+shader does not expect and D3D12 reads an SRV of the wrong dimension, and
+neither says a word. `Texture::isCube` is the only thing that can tell them
+apart, and `TextureForStage` asks. It is reachable rather than theoretical: a
+material may declare `cubeMap` and no texgen at all, and a `cubeMap` whose six
+files are not all present falls back to the default image, which is 2D.
+
+**Measured.** **115 of 297 gate frames moved** against 4e.4, and they are eight
+of the eighteen camera stops exactly — 2, 5, 7, 9, 10, 11, 12 and 14 — with the
+other ten byte-identical, which is what says a frame with no cube content pays
+nothing for this. Every one of the eight moved *towards* the SDL/GL build, over
+a fresh capture of it at the same 297 frames:
+
+| Stop | Before (mean / worst) | After (mean / worst) |
+| --- | --- | --- |
+| 2 | **4.485** / 115 | **0.430** / 106 |
+| 5 | 0.864 / 136 | 0.843 / 136 |
+| 7 | 1.474 / 218 | 1.473 / 218 |
+| 9 | 0.520 / 147 | 0.515 / 147 |
+| 10 | 0.831 / 147 | 0.742 / 147 |
+| 11 | 0.933 / 147 | 0.853 / 147 |
+| 12 | 2.400 / 113 | 2.400 / 113 |
+| 14 | 1.659 / 202 | 1.396 / 181 |
+| whole tour | **1.134** | **0.891** |
+
+Stop 2 is the one worth looking at: a tenfold move, and the difference is spread
+over the whole lower half of the frame rather than confined to a window, because
+what was missing there is the reflection a glass pane adds over everything
+behind it. Two captures of the new build are identical on all 297 frames. Clean
+under `MTL_DEBUG_LAYER=1` with `MTL_SHADER_VALIDATION=1` and GPU validation, at
+**12 programs and 64 pipelines** against 4e.4's 9 and 57 at the same camera —
+three more programs, which is one per row of the table above, and seven more
+pipelines.
+
+**The two programs no content reaches were compiled anyway rather than assumed
+to work**, by asking for them once from a temporary probe: `ECT_DIFFUSE` and the
+screen program both compile and both build a pipeline. That is the whole of what
+can be verified about them here, and it is worth saying that the *picture* they
+produce is unmeasured — nothing in the demo pk4 declares `texgen normal` or
+`texgen screen` outside a `newStage`, and the two `wobblesky` materials the pk4
+does carry are never placed. What the screen one has instead of a reference is
+the copy step 4e.3 built and that step's own note about `uploadWidth`: the plane
+rows would have to be scaled by it if the image sampled here were ever smaller
+than the frame, and it is not on this backend, because `CopyFramebufferToImage`
+keeps the padded size the shared code expects.
+
+**One thing found that is not this step's.** The gate is **not byte-deterministic
+on the SDL/GL build**: two captures of the same unmodified binary differ on
+frame 99, by two pixels of two out of 255. It matters because the same frame
+moves between a step-4e.2-era GL capture and one taken now, which reads like a
+shared-code change until the second capture shows it moving without one. The
+eacp build has been byte-identical across captures at every step including this
+one. `regression/README.md` carries it now, with the other three things this
+step taught the gate.
+
+#### Step 4e.6 — the fog and the blend lights — **done**
+
+`RB_STD_FogAllLights`, `RB_FogPass`, `RB_T_BasicFog`, `RB_BlendLight` and
+`RB_T_BlendLight` rewritten, as two programs and one walk each. They go between
+the two halves of `DrawShaderPasses`, which is where `RB_STD_DrawView` puts them
+and for the reason its own comment gives: a post-process surface reads
+`_currentRender`, and the fog has to be in the frame before it does.
+
+**They are not interactions and that is the whole reason they are a step of
+their own.** A fog light and a blend light sit in `viewDef->viewLights` beside
+the real ones, and `DrawInteractions` has skipped both with a `continue` since
+4d.2. Neither lights a surface: they *tint* everything inside a volume. So there
+is no bump map, no half-angle vector and no tangent space in either program —
+what there is instead is a coordinate that no vertex carries.
+
+**Every coordinate either program samples at is a plane dotted with the vertex.**
+That is what `glTexGen` with `GL_OBJECT_LINEAR` means, and on OpenGL the planes
+are re-sent whenever `backEnd.currentSpace` changes. Here they are uniforms
+rebuilt at exactly that moment — `R_GlobalPlaneToLocal` per space, which is what
+`FillDepthBuffer` already does with a subview's clip plane and what
+`R_SetDrawInteraction` does with `lightProjectionS/T/Q`. The blend light's
+texture matrix is folded into the projection planes by
+`RB_BakeTextureMatrixIntoTexgen`, the shared function `R_SetDrawInteraction`
+already calls for the same four planes, rather than becoming a matrix in the
+shader: the matrix acts on the *generated* coordinate, so it composes with the
+planes instead of with the vertex.
+
+**Both fog lookup images stay textures, and that is the opposite of what step
+4d.2 decided about the specular ramp.** The reasons are opposite too. That ramp
+was a curve an ARB fragment program could not evaluate — the table was the
+workaround and `max(0, (d − 0.75) × 4)²` was the intent. These two are not:
+`R_FogImage` is `1 − 0.982^d` accumulated over 256 steps, and `R_FogEnterImage`
+is `FogFraction`, a piecewise function of two heights with four cases and a
+deep-water blend. Reproducing either in the shader would be reproducing a
+generator rather than an intent, and keeping them keeps the picture closest to
+the GL build's, which is what every step here is measured against. Neither
+image can vary: both are generated `TF_LINEAR` / `TR_CLAMP`, so the fog program
+has one sampling tuple by construction and needs no variant list. The blend
+light's two images *are* the light material's, so it has one keyed on two
+sampling indices, the way `InteractionDraw`'s is keyed on five.
+
+**The `_fog` image is two-dimensional and only its middle row is ever sampled,
+and the original says so by overwriting its own texgen.** `RB_T_BasicFog`
+computes `fogPlanes[1]` — the view's right axis, which would make the lookup a
+real two-dimensional distance — and then sets the plane it hands `GL_T` to
+`(0, 0, 0, 0.5)` on the next line, with the two lines that would have used the
+plane commented out above it. So the second axis was tried and abandoned, and
+`0.5` written into the shader is the honest translation. `R_FogImage`'s own
+comment agrees: "we calculate distance correctly in two planes, but the third
+will still be projection based."
+
+**A blend light's falloff is read at `t = 0` on OpenGL and at `t = 0.5` here,
+and the two are the same number everywhere the game reaches.** `RB_BlendLight`
+means to set it — it selects texture unit 1 and calls `qglTexCoord2f( 0, 0.5 )`
+— but `glTexCoord` addresses unit 0 whatever `glActiveTexture` last said, and
+`glMultiTexCoord` is the call that takes a unit and dhewm3 never makes it. So
+unit 1 keeps its default coordinate. It changes nothing drawn: every falloff
+image a blend light can name is a ramp along `s` alone and constant down `t`
+(`lights/squarelight1a` and `lights/xfalloff` are 64×8 with all eight rows
+byte-identical), so `0.5` is written here — what the code plainly intends, and
+what the interaction program already reads its own falloff at. The one image
+where they would disagree is the generated `_noFalloff`, whose row 0 is a black
+border, so a blend light falling back to it would draw nothing at all on
+OpenGL — and no `blendLight` material in the demo falls back, all six declaring
+a `lightFalloffImage`.
+
+**`r_skipFogLights` turns off the blend lights too, and that is reproduced
+rather than tidied up.** `RB_STD_FogAllLights` tests it before the loop that
+dispatches to either kind, while `r_skipBlendLights` is tested inside
+`RB_BlendLight` alone — so `r_skipFogLights 1` is "draw neither" and
+`r_skipBlendLights 1` is "draw the fog but not the blend lights", which is not
+the pair of switches the two names suggest. A debug cvar that means something
+different on the two backends is worse than one that is oddly named on both,
+and this one is load-bearing besides: `r_skipFogLights 1` is what makes this
+build draw the picture it drew before this step, which is how the step was
+measured. `RB_BlendLight`'s other quirk is kept for the same reason: it returns
+if `globalInteractions` is empty *without looking at* `localInteractions`, so a
+blend light whose only surfaces are the no-self-shadow ones draws nothing. It is
+nearly unreachable — a blend light material carries `noShadows`, which sends
+every surface to `globalInteractions`.
+
+**`RB_T_BlendLight` has a second vertex path and it is dead.** It falls back to a
+surface's `shadowCache` when there is no `ambientCache`, under a comment saying
+it "gets used for both blend lights and shadow draws" — a leftover from a shadow
+path that no longer calls it. Checked rather than assumed:
+`idInteraction::AddActiveInteraction` sets `lightTris->ambientCache` from the
+surface's own before linking it into either interaction list, and links shadow
+volumes into `globalShadows` and `localShadows` instead. So the second path is
+not written here.
+
+**Measured.** The gate moves **17 of 297 frames** against 4e.4 — frames 0 to
+16, which is the tour's first camera stop exactly and the only one with a fog
+light in view. Two further captures are identical to the first. With
+`r_skipFogLights 1` the new build is **byte-identical to 4e.4 on all 297**,
+which is what says the path that was already there pays nothing for this.
+Those seventeen frames go from **1.90 of 255** against the SDL/GL build to
+**0.88**, where the floor — both builds with the fog skipped — is **0.92**. So
+the fogged frames now agree as well as the unfogged ones do. Clean under
+`MTL_DEBUG_LAYER=1` with `MTL_SHADER_VALIDATION=1` and GPU validation, at **10
+programs and 39 pipelines** at that camera against 9 and 37 with both kinds
+skipped: one more program and two more pipelines, which are `RB_FogPass`'s own
+two draws — the surfaces at `GLS_DEPTHFUNC_EQUAL` over what the depth fill
+wrote, and the light's frustum at `GLS_DEPTHFUNC_LESS` with the cull reversed,
+the frustum never having been in the depth buffer at all.
+
+**No map in the demo places a blend light, so one had to be made — and how is
+part of the result.** The `blendLight` materials in `materials/fogs.mtr` —
+`fogs/glare`, `glare2`, `glare_snd`, `filter`, `pitFog`, `sentest` — are all in
+art the demo ships and never places. `spawn light texture fogs/glare …` is the
+obvious answer and **does not work on this build**: the entity is created (the
+total entity count goes 2056 → 2058 across two spawns) and `Cmd_Spawn_f` is
+plainly reached (an odd argument count prints its usage line), but the light
+never reaches the frame — a white light of `_color "10 10 10"` and
+`light_radius "1000 1000 1000"` on top of the camera moves the picture by 0.3
+of 255, which is the animating NPC beside it. `testPointLight 500` prints
+"Created new point light" and does the same nothing. **This is not this port:
+it reproduces exactly on the SDL/GL build**, and it is written down here because
+it is the reason the measurement below takes another road.
+
+That road is to shadow the pk4's `materials/fogs.mtr` with a copy in which
+`fogs/basicFog` is a `blendLight` rather than a `fogLight`. `fs_savepath`'s game
+directory is first in the engine's search path — the engine prints the order at
+startup — and a render demo resolves a light's material *by name* on playback,
+so the gate's own hangar light becomes a blend light, deterministically, with
+the same content on both builds. **The blend light then moves the same seventeen
+frames by 1.61 of 255 on the eacp build and by 1.61 on the SDL/GL one**, and
+those frames go from **2.24** against the GL build without it to **0.92** with
+it — the floor again, to two decimal places.
+
+The stage's colour had to be written into that material rather than left as
+`colored`, and the reason is worth a line: `light_5254`'s shader parms are
+`(0.1, 0.03, 0)`, which added over the scene is at most three levels of 255 —
+GL's own blend light moved the frame by 0.13 and this backend's by 0.00, both
+of them right and neither of them a measurement. A constant colour makes the
+same light bright enough that the two renderers have something to disagree
+about.
+
+**And it turned up why a live pinned-camera shot is not an instrument here.**
+Two runs of the same build at the same `setviewpos` measured a mean RGB of 30.8
+and 35.3 at the tour's first stop. dhewm3 advances game time from the wall
+clock, so a screenshot lands on a different game tick every run — and this
+camera is looking at a fog light **bound to a mover** (`hanger_fog_mover`, moved
+UP 320 over five seconds by `map_marscity1.script`), so the picture genuinely
+moves. `com_fixedTic 1` runs one tick per frame and makes the sequence a
+function of the command buffer alone: two runs then produce **byte-identical**
+screenshots. Worth knowing before anyone else compares two live shots and
+concludes something about a renderer; the gate's demo playback has never had
+this problem, which is why it is the gate.
+
+**What is not here.** `r_showOverDraw`, `backEnd.viewDef->isXraySubview` and the
+two `r_skip` cvars are honoured, so every switch the shared code has still
+works. The per-light stencil clear that would guarantee no pixel is double
+fogged is not, and neither is it in the original: it sits inside an `#if 0`
+that _D3XP turned off. `RB_STD_LightScale` and `RB_RenderDebugTools`, the two
+other things `RB_STD_DrawView` calls that this backend does not, are named in
+`DrawView`'s comment now rather than silently missing — the first can never
+fire (`backEnd.overBright` is 1 for `BE_EACP`) and the second is the `r_show*`
+visualisations, which have no counterpart yet.
+
+**The merge of 4e.5 and 4e.6, measured once more as one tree.** The two were
+written in parallel against 4e.4 and merged without a conflict, and the merged
+build moves **132 of 297 frames** against 4e.4 — 17 plus 115, the union of the
+two steps' frames and not one more — at **0.833 of 255** over the whole tour
+against the SDL/GL build, where 4e.4 stood at 1.134. Two captures identical,
+clean under both validation layers.
+
+#### Step 4e.7 — gamma in the shader — **done**
+
+`r_gammaInShader`, which step 4d.2 left as "the identity at the default settings,
+and nothing at any other". It is something at the others now, and what it is was
+decided by reading how dhewm3 does it rather than by what the cvar's name
+suggests.
+
+**On OpenGL it reaches the ARB programs and nothing else.** `R_LoadARBProgram`
+splices a `MUL_SAT` and three `POW`s into the *source* of every fragment program
+it loads — `interaction.vfp`, the two environment programs, every `newStage`,
+the soft-particle one unless it says `nodhewm3gammahack` — and `program.env[21]`
+carries `r_brightness` and `1 / r_gamma` into them. A fixed-function stage has
+no source to splice into. So on the SDL/GL build, with `r_gammaInShader 1` and
+`r_gamma 1.5`, the lit world is corrected and the 2D, the glows, the fog and the
+blend lights are not, and that is the picture this build has to match. It does
+the same: the interaction and the two reflection programs derive from an
+`idEacpGammaProgram` that carries the uniform and the correction, and the generic
+stage, the fog and the blend light do not.
+
+**It is a uniform behind a branch, and the branch is the finding.** The
+correction is `pow( saturate( rgb × brightness ), 1 / gamma )`, and at the
+defaults that is `pow( x, 1.0 )` — which neither shading language promises to
+return as exactly `x`. A uniform of `(1, 1, 1, 1)` multiplied out would have
+moved every lit pixel by an ulp, which the gate cannot tell from a regression.
+So the uniform carries a fourth value, 1 when either setting is away from 1 and
+0 otherwise, and the shader branches on it: a branch on a uniform is one every
+fragment of a draw takes the same side of, which is the cheap kind, and at the
+defaults the pow is never asked for. The saturate is kept although an 8-bit
+attachment clamps anyway, because the pow reads the value before the attachment
+does and a negative base is what the original's `MUL_SAT` keeps away from `POW`.
+
+The post-process half of the shader passes gets the identity, as
+`RB_SetProgramEnvironment( isPostProcess )` gives it "to avoid applying them
+twice" — a post-process stage reads a `_currentRender` that was corrected when
+it was drawn. `DrawShaderPasses` keeps the flag for the two reflect draws, which
+are the only corrected programs it can issue.
+
+**Measured.** At the defaults the gate is **297/297 byte-identical** to the
+merged 4e.5 + 4e.6 build, which is what the branch was for. At `r_gamma 1.5`
+and `r_brightness 1.2` — through `GATE_ARGS`, which the gate grew for this —
+both builds move **every one of the 297 frames**, the eacp build by a mean of
+**30.3 of 255** and the SDL/GL build by **29.9**. The two builds at that setting
+agree at **1.67 of 255**, against 0.83 at the defaults, and the doubling is
+uniform across the eighteen stops rather than concentrated in any: an exponent of
+1/1.5 over values scaled by 1.2 turns a difference of one level into a difference
+of two, so a renderer that agreed to within a level before agrees to within two
+after, on every surface it corrects and on none it does not.
+
+**What is not here.** `r_gammaInShader 0` asks for the display's hardware ramp,
+which `GLimp_SetGamma` warns it cannot set; on this host the cvar off means no
+gamma at all rather than gamma somewhere else. The `newStage` programs are still
+skipped, and would take the same base class when they arrive.
+
 ### Shader inventory for Phase 2
 
 Roughly 10–15 EDSL programs, each in the sampling variants §4.3 sizes — 8 worst case
@@ -1893,19 +2358,42 @@ rather than a program beside it, compiled lazily:
   buffer the moment it was drawn. One texture, no transform, six vertices. Step
   4e.3 gave it a second *pipeline* and no second program: `_currentRender` is
   the same quad into an image's texture, and what differs is the attachment.
-- generic material stage, in its texgen variants: normal, reflect, skybox, wobblesky
-- fog
-- light blend
-- 2D / GUI
+- ~~generic material stage, in its texgen variants: normal, reflect, skybox,
+  wobblesky~~ — **done**, step 4e.5, and it is **three programs beside the
+  generic stage rather than variants of it**. eacp declares every texture a
+  shader lists whether `define()` samples it or not, and Metal rejects a draw
+  that leaves a declared texture unbound, so a cube map inside the stage program
+  would have been a cube map declared on every `TG_EXPLICIT` variant too. The
+  three are the cube one (skybox and wobblesky folded into a single texgen —
+  a skybox is a wobblesky whose matrix is the identity — plus diffuse and
+  unbumped reflect, so three texgens times its samplings), `bumpyEnvironment.vfp`
+  as a program of its own, and the screen one, which needs no cube at all and
+  covers both `TG_SCREEN` and `TG_SCREEN2` because they are one texgen written
+  out twice. The demo's first level compiles one variant of each of the first
+  two and never reaches the third.
+- ~~fog~~ — **done**, step 4e.6. One program with one sampling tuple by
+  construction, both of its images being generated `TF_LINEAR` / `TR_CLAMP`, and
+  two pipelines: the surfaces at `EQUAL` and the light's frustum at `LESS`.
+- ~~light blend~~ — **done**, step 4e.6. The light half of the interaction
+  program on its own — projection and falloff, no surface maps — keyed on the
+  two samplings the light material declares.
+- ~~2D / GUI~~ — never a program of its own: step 4c found that the menus, the
+  console and the HUD are the generic material stage over a view with no
+  `viewEntitys`, so the entry above covers it.
 
 The EDSL earns its keep here: one source per shader covering Metal and D3D12, against
 Doom 3's original two hand-written ARB programs per path.
 
-**Four of them exist and the list was the right shape.** What the count missed
-is at both ends: a program the API needs and the engine does not (the blit), and
-a program the engine needs and the API makes unnecessary (the depth fill, which
-turned out to be a variant rather than an entry). The sampling-variant sizing was
-the part that was wrong, and §4.3 says where.
+**All of them exist now, and the list was the right shape at its ends and wrong
+in its middle.** What the count missed at the ends: a program the API needs and
+the engine does not (the blit), and a program the engine needs and the API makes
+unnecessary (the depth fill, which turned out to be a variant rather than an
+entry). What it missed in the middle is that "texgen variants" became three
+programs for a reason eacp's declaration model imposed, and that gamma is not a
+program at all but a base class three of them share (step 4e.7). The
+sampling-variant sizing was the part that was wrong, and §4.3 says where. The
+demo's first level ends the phase at **12 programs and 64 pipelines** at a
+camera with sky and glass in view, 9 and 57 before 4e.5.
 
 ---
 
@@ -2052,11 +2540,35 @@ Phase 2 is the first work that compiles against eacp. In rough order:
        of a pipeline here rather than a per-draw enum, and the mirror clip
        plane, which turned out to be `dot( plane, vertex ) < 0` wearing a
        two-texel texture.
-     - **4e.5. The rest** ← **next**. Fog and blend lights, the texgen variants (screen,
-       reflect, skybox, wobblesky — two of the four want cube maps, gap 5, and
-       the screen one now has the `_currentRender` 4e.3 fills to read), and
-       `r_gammaInShader` (step 4d.2 — the identity at the default settings, and
-       nothing at any other).
+     - ~~**4e.5. Cube maps, and the texgen variants.**~~ — **done**, §6. Gap 5
+       closed in eacp itself — a `TextureDescriptor::cube`, a `TextureCube` in
+       the EDSL, six faces in the one order Metal, D3D12 and OpenGL share, 261
+       GPU tests — and the four cube texgens plus the two screen ones ported
+       onto it as three programs beside the generic stage. The Mars sky and the
+       glass of `demo_mars_city1` are on screen: 115 of 297 frames moved, eight
+       camera stops exactly, every one of them towards the SDL/GL build, and
+       the tour's mean against it went from 1.13 of 255 to 0.89.
+     - ~~**4e.6. Fog and blend lights.**~~ — **done**, §6. `RB_FogPass` and
+       `RB_BlendLight` as two programs whose every coordinate is a plane dotted
+       with the vertex, between the two halves of the shader passes. The
+       hangar fog at the tour's first stop moved 17 frames from 1.90 of 255
+       against the SDL/GL build to 0.88, which is the floor; the blend light,
+       which no demo map places, was made by shadowing `fogs.mtr` and agrees at
+       the floor too. Found on the way: `spawn light` puts no light in the frame
+       on either build, and a live pinned-camera shot needs `com_fixedTic 1`.
+     - ~~**4e.7. `r_gammaInShader`.**~~ — **done**, §6. What it is on OpenGL —
+       a correction spliced into the ARB programs and into nothing
+       fixed-function — reproduced as a base class three programs share, behind
+       a branch on a uniform so that the defaults stay byte-identical (297/297)
+       and `r_gamma 1.5 r_brightness 1.2` moves every frame by the same 30 of
+       255 on both builds.
+     - **4e.8. What is still skipped, and named.** The `newStage` materials —
+       `heatHaze` on `glass1` / `glass2`, `vp1` — which are hand-written ARB
+       program pairs and would be a program per newStage; `TG_GLASSWARP`, which
+       is one of them wearing a texgen; the soft-particle program behind
+       `BE_ARB2`; and `r_showTris` and the other `r_show*` visualisations of
+       `RB_RenderDebugTools`. None of them is on the gate's path. Whether any is
+       worth a step before step 5 is a question for step 5.
      - **The over-bright frame**, which is not a step of 4e but is loose: the
        eacp build renders about two frames of any run three times too bright
        and flatly lit, at a fixed moment in the level, where the SDL/GL build is
