@@ -1337,11 +1337,11 @@ public:
 	softParticleDraw_t		SoftParticleDraw( const idImage *image, int stateBits,
 											  int cullType );
 
-	// Geometry for one draw, in a buffer no frame still in flight is reading.
-	// The reference is good until this frame's pool comes round again, which is
-	// several frames after the draw that bound it was submitted.
-	const eacp::GPU::Buffer &	StreamVertices( const void *data, std::size_t bytes );
-	const eacp::GPU::Buffer &	StreamIndices( const void *data, std::size_t bytes );
+	// Geometry for one draw, as a slice of an arena no frame still in flight is
+	// reading. The range is good until this frame's pool comes round again,
+	// which is several frames after the draw that bound it was submitted.
+	eacp::GPU::BufferRange	StreamVertices( const void *data, std::size_t bytes );
+	eacp::GPU::BufferRange	StreamIndices( const void *data, std::size_t bytes );
 
 	// How many programs and pipelines have been compiled, over all three
 	// caches, for the log line that says what a level's content actually cost.

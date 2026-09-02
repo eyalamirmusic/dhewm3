@@ -2466,19 +2466,21 @@ idEacpRenderProgs::SoftParticleDraw( const idImage *image, int stateBits, int cu
 	idVertexCache hands out plain system-memory pointers on this backend -
 	ARBVertexBufferObjectAvailable is false, so it never generates a buffer
 	object - and a draw has to put those bytes somewhere the GPU can read them.
-	StreamingBuffers is that somewhere, and it is idVertexCache's own shape: a
-	pool per frame that may still be in flight, recycled only once the frame
+	StreamingBuffers is that somewhere, and it is idVertexCache's own shape: an
+	arena per frame that may still be in flight, recycled only once the frame
 	that used it cannot be on the GPU any more.
 
-	Several writes in one frame get several buffers, which is the part that
-	matters here: a 2D frame is hundreds of small draws and every one of them is
-	still queued when the next is written.
+	Several writes in one frame get several slices of one arena, which is the
+	part that matters here: a 3D frame is a thousand draws and more, every one
+	of them still queued when the next is written - and as slices they are one
+	GPU resource a frame rather than one per draw, which is what the seconds of
+	stutter after a level load turned out to be made of.
 ====================
 */
-const GPU::Buffer &idEacpRenderProgs::StreamVertices( const void *data, std::size_t bytes ) {
+GPU::BufferRange idEacpRenderProgs::StreamVertices( const void *data, std::size_t bytes ) {
 	return vertexStream.write( data, bytes );
 }
 
-const GPU::Buffer &idEacpRenderProgs::StreamIndices( const void *data, std::size_t bytes ) {
+GPU::BufferRange idEacpRenderProgs::StreamIndices( const void *data, std::size_t bytes ) {
 	return indexStream.write( data, bytes );
 }

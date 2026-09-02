@@ -81,8 +81,6 @@ function(eacp_track_branch tag)
 	message(STATUS "eacp: tracking '${tag}', now at ${sha}")
 endfunction()
 
-eacp_track_branch("${EACP_GIT_TAG}")
-
 # Re-run the regression gate after an eacp that moved under you, the same as
 # after any other change to what the renderer is built on. Point
 # CPM_eacp_SOURCE at a local checkout to develop against one, or set
@@ -90,7 +88,7 @@ eacp_track_branch("${EACP_GIT_TAG}")
 CPMAddPackage(
 	NAME eacp
 	GITHUB_REPOSITORY eyalamirmusic/eacp
-	GIT_TAG ${EACP_GIT_TAG}
+	GIT_TAG develop
 	OPTIONS
 		# The engine has no use for an embedded browser, and it is the most
 		# expensive module eacp builds.

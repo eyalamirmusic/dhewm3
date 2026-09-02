@@ -598,7 +598,7 @@ private:
 	// setUniforms and bindTextures are the base's.
 	GPU::ShaderProgram *				drawProgram;
 	const GPU::RenderPipeline *			drawPipeline;
-	const GPU::Buffer *					drawVertices;
+	GPU::BufferRange					drawVertices;
 
 	// Clip from model for the space being drawn, rebuilt when the space
 	// changes. GL kept this in the matrix stack.
@@ -676,7 +676,7 @@ idRenderBackendEacp::idRenderBackendEacp() {
 	memset( boundImages, 0, sizeof( boundImages ) );
 	drawProgram = NULL;
 	drawPipeline = NULL;
-	drawVertices = NULL;
+	drawVertices = {};
 	memset( modelViewProjection, 0, sizeof( modelViewProjection ) );
 	depthRangeNear = 0.0f;
 	depthRangeFar = 1.0f;
@@ -1079,7 +1079,7 @@ void idRenderBackendEacp::PresentFrameTarget( void ) {
 
 	draw.program->image = *frameTarget;
 
-	const GPU::Buffer &	vertices = eacpRenderProgs.StreamVertices( quad, sizeof( quad ) );
+	const GPU::BufferRange	vertices = eacpRenderProgs.StreamVertices( quad, sizeof( quad ) );
 
 	GPU::RenderPassDescriptor	descriptor;
 
@@ -1111,7 +1111,7 @@ void idRenderBackendEacp::SetDefaultState( void ) {
 
 	drawProgram = NULL;
 	drawPipeline = NULL;
-	drawVertices = NULL;
+	drawVertices = {};
 }
 
 /*
@@ -1735,7 +1735,7 @@ void idRenderBackendEacp::FillDepthBuffer( drawSurf_t **drawSurfs, int numDrawSu
 
 	drawProgram = NULL;
 	drawPipeline = NULL;
-	drawVertices = NULL;
+	drawVertices = {};
 
 	// The depth this view drew, into an image the shader passes can sample.
 	// Suppressed for a lightgem render, which has a negative viewID and no
@@ -1833,7 +1833,7 @@ void idRenderBackendEacp::FillDepthBufferSurface( const drawSurf_t *surf,
 	// two alpha-tested stages is two draws over one piece of geometry.
 	const idDrawVert *	vertices = (const idDrawVert *)vertexCache.Position( tri->ambientCache );
 
-	drawVertices = &eacpRenderProgs.StreamVertices( vertices,
+	drawVertices = eacpRenderProgs.StreamVertices( vertices,
 													(std::size_t)tri->numVerts * sizeof( idDrawVert ) );
 
 	bool	drawSolid = ( shader->Coverage() == MC_OPAQUE );
@@ -2144,7 +2144,7 @@ void idRenderBackendEacp::CreateDrawInteractions( const drawSurf_t *surf ) {
 		const idDrawVert *	vertices =
 			(const idDrawVert *)vertexCache.Position( surf->geo->ambientCache );
 
-		drawVertices = &eacpRenderProgs.StreamVertices(
+		drawVertices = eacpRenderProgs.StreamVertices(
 			vertices, (std::size_t)surf->geo->numVerts * sizeof( idDrawVert ) );
 
 		RB_CreateSingleDrawInteractions( surf, R_EacpDrawInteraction );
@@ -2152,7 +2152,7 @@ void idRenderBackendEacp::CreateDrawInteractions( const drawSurf_t *surf ) {
 
 	drawProgram = NULL;
 	drawPipeline = NULL;
-	drawVertices = NULL;
+	drawVertices = {};
 }
 
 /*
@@ -2247,7 +2247,7 @@ void idRenderBackendEacp::ClearStencil( void ) {
 	draw.program->modelViewProjection = asFloat4x4( identity );
 	draw.program->localLightOrigin = asFloat4( 0.0f, 0.0f, 0.0f, 0.0f );
 
-	const GPU::Buffer &	vertices =
+	const GPU::BufferRange	vertices =
 		eacpRenderProgs.StreamVertices( corners, sizeof( corners ) );
 
 	pass->setPipeline( *draw.pipeline );
@@ -2261,7 +2261,7 @@ void idRenderBackendEacp::ClearStencil( void ) {
 	// the shadow surfaces set their own.
 	drawProgram = NULL;
 	drawPipeline = NULL;
-	drawVertices = NULL;
+	drawVertices = {};
 }
 
 /*
@@ -2348,7 +2348,7 @@ void idRenderBackendEacp::StencilShadowPass( const drawSurf_t *drawSurfs ) {
 
 	drawProgram = NULL;
 	drawPipeline = NULL;
-	drawVertices = NULL;
+	drawVertices = {};
 }
 
 /*
@@ -2446,7 +2446,7 @@ void idRenderBackendEacp::ShadowSurface( const drawSurf_t *surf ) {
 	// the count.
 	const void *	vertices = vertexCache.Position( tri->shadowCache );
 
-	drawVertices = &eacpRenderProgs.StreamVertices( vertices,
+	drawVertices = eacpRenderProgs.StreamVertices( vertices,
 													(std::size_t)tri->shadowCache->size );
 
 	drawProgram = draw.program;
@@ -2726,7 +2726,7 @@ void idRenderBackendEacp::DrawSurfaceShaderPasses( const drawSurf_t *surf ) {
 	// with four stages is four draws over one piece of geometry.
 	const idDrawVert *	vertices = (const idDrawVert *)vertexCache.Position( tri->ambientCache );
 
-	drawVertices = &eacpRenderProgs.StreamVertices( vertices,
+	drawVertices = eacpRenderProgs.StreamVertices( vertices,
 													(std::size_t)tri->numVerts * sizeof( idDrawVert ) );
 
 	for ( int stage = 0 ; stage < shader->GetNumStages() ; stage++ ) {
@@ -2902,7 +2902,7 @@ void idRenderBackendEacp::DrawSurfaceShaderPasses( const drawSurf_t *surf ) {
 
 	drawProgram = NULL;
 	drawPipeline = NULL;
-	drawVertices = NULL;
+	drawVertices = {};
 }
 
 /*
@@ -3282,7 +3282,7 @@ void idRenderBackendEacp::FogAllLights( void ) {
 
 	drawProgram = NULL;
 	drawPipeline = NULL;
-	drawVertices = NULL;
+	drawVertices = {};
 }
 
 /*
@@ -3467,7 +3467,7 @@ void idRenderBackendEacp::FogChain( const drawSurf_t *chain, const eacpFog_t &fo
 
 	drawProgram = NULL;
 	drawPipeline = NULL;
-	drawVertices = NULL;
+	drawVertices = {};
 }
 
 /*
@@ -3524,7 +3524,7 @@ void idRenderBackendEacp::FogSurface( const drawSurf_t *surf, const eacpFog_t &f
 
 	const idDrawVert *	vertices = (const idDrawVert *)vertexCache.Position( tri->ambientCache );
 
-	drawVertices = &eacpRenderProgs.StreamVertices(
+	drawVertices = eacpRenderProgs.StreamVertices(
 		vertices, (std::size_t)tri->numVerts * sizeof( idDrawVert ) );
 
 	RB_DrawElementsWithCounters( tri );
@@ -3664,7 +3664,7 @@ void idRenderBackendEacp::BlendLightChain( const drawSurf_t *chain,
 
 	drawProgram = NULL;
 	drawPipeline = NULL;
-	drawVertices = NULL;
+	drawVertices = {};
 }
 
 /*
@@ -3731,7 +3731,7 @@ void idRenderBackendEacp::BlendLightSurface( const drawSurf_t *surf,
 
 	const idDrawVert *	vertices = (const idDrawVert *)vertexCache.Position( tri->ambientCache );
 
-	drawVertices = &eacpRenderProgs.StreamVertices(
+	drawVertices = eacpRenderProgs.StreamVertices(
 		vertices, (std::size_t)tri->numVerts * sizeof( idDrawVert ) );
 
 	RB_DrawElementsWithCounters( tri );
@@ -4402,7 +4402,7 @@ last one left bound.
 ======================
 */
 void idRenderBackendEacp::DrawIndexed( const srfTriangles_t *tri, int numIndexes ) {
-	if ( !pass || !drawProgram || !drawPipeline || !drawVertices ) {
+	if ( !pass || !drawProgram || !drawPipeline || !drawVertices.buffer ) {
 		return;
 	}
 
@@ -4428,11 +4428,11 @@ void idRenderBackendEacp::DrawIndexed( const srfTriangles_t *tri, int numIndexes
 		return;
 	}
 
-	const GPU::Buffer &	buffer =
+	const GPU::BufferRange	buffer =
 		eacpRenderProgs.StreamIndices( indexes, (std::size_t)numIndexes * sizeof( glIndex_t ) );
 
 	pass->setPipeline( *drawPipeline );
-	pass->setVertexBuffer( *drawVertices );
+	pass->setVertexBuffer( drawVertices );
 	pass->setUniforms( *drawProgram );
 
 	drawProgram->bindTextures( *pass );
@@ -4979,7 +4979,7 @@ void idRenderBackendEacp::CopyFrameRegion( GPU::RenderPass &into,
 		{ {  1.0f,  1.0f }, { s1, tBottom } },
 	};
 
-	const GPU::Buffer &	vertices = eacpRenderProgs.StreamVertices( quad, sizeof( quad ) );
+	const GPU::BufferRange	vertices = eacpRenderProgs.StreamVertices( quad, sizeof( quad ) );
 
 	into.setViewport( Graphics::Rect( (float)dstX, (float)dstY,
 									  (float)dstWidth, (float)dstHeight ) );
@@ -5135,7 +5135,7 @@ void idRenderBackendEacp::CopyDepthbufferToImage( idImage *image, int x, int y,
 		{ {  1.0f,  1.0f }, { s1, t0 } },
 	};
 
-	const GPU::Buffer &	vertices = eacpRenderProgs.StreamVertices( quad, sizeof( quad ) );
+	const GPU::BufferRange	vertices = eacpRenderProgs.StreamVertices( quad, sizeof( quad ) );
 
 	into.setViewport( Graphics::Rect( (float)x, (float)top,
 									  (float)imageWidth, (float)imageHeight ) );
