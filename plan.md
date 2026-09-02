@@ -11,24 +11,30 @@ menu on screen through Metal**, **loads a level**, **lights it** and
 `interaction.vfp` and `shadow.vp` are in the EDSL, the stencil shadow volumes
 are counted two-sided in one pass over each volume, and at a pinned camera in
 `demo_mars_city1` the two backends draw **the same 71 draws, 1644 triangles and
-2376 shadow triangles**, volume for volume. 4e is seven steps in and its basket
+2376 shadow triangles**, volume for volume. 4e is eight steps in and its basket
 is empty: the frame is composed into an app-owned **render target**, that target
 is **read back to the CPU** — so the eacp build takes the game's own camera
 shots, writes screenshots, and **runs the regression gate**, 297 frames hashed
 and identical across two captures — it is **copied into an image**, so
 `_currentRender` and `_scratch` are filled in, every 3D view gets **a pass of
-its own**, so **mirrors and subviews work**, and now **the Mars sky and the
+its own**, so **mirrors and subviews work**, then **the Mars sky and the
 glass are on screen** — eacp grew **cube textures** (gap 5) and the texgen
 variants are three programs on top of them — **the hangar fog is in the frame**
-and the blend lights with it, and **`r_gammaInShader` corrects what it corrects
-on OpenGL** and nothing else. Every comparison is a hash: over the whole
-297-frame tour the eacp build now agrees with the SDL/GL build at a mean of
-**0.83 of 255**, from 1.13 before this round, with every camera stop that moved
-moving towards it. The over-bright frame 4e.3 carried as a loose defect is closed
+and the blend lights with it, **`r_gammaInShader` corrects what it corrects
+on OpenGL** and nothing else, and now **the heat haze is on the glass**: the
+`newStage` materials, which are the hand-written ARB program pairs a `.mtr` can
+name for itself, are four EDSL programs and the gate had been walking past three
+camera stops of them. Every comparison is a hash: over the whole 297-frame tour
+the eacp build now agrees with the SDL/GL build at a mean of **0.81 of 255**,
+from 1.13 two rounds ago, and at the Security Checkpoint — where the missing
+haze turned out to be **88% of the whole remaining disagreement** — at **0.18**
+against 0.46, which is *below* the floor that stop had with the feature switched
+off on both sides. The over-bright frame 4e.3 carried as a loose defect is closed
 too, and was never the port's: it is the level's dropship headlight, drawn by
 both builds at the same instant, and what was wrong was a reproducer that
-compared two different moments. What is left of Phase 2 is the `newStage`
-programs nothing on the gate reaches, and then step 5 — the deletion.**
+compared two different moments. What is left of Phase 2 is the soft-particle
+program, which needs a new eacp gap opened before it and which the gate cannot
+see either way, and then step 5 — the deletion.**
 
 Reference implementation for almost everything on the platform side:
 `~/Code/PureDOOM/examples/EACP` — a complete engine hosted on eacp, with its own
@@ -338,7 +344,10 @@ fills `_currentRender` has to end the pass, and everything drawn after it has to
 be occluded by the depth buffer that pass was writing. **And 5 is closed by step
 4e.5**, the one entry on the list that was written before the port began and
 survived to be needed exactly as written: the Mars sky and every pane of glass
-in the demo's first level sample a cube map.
+in the demo's first level sample a cube map. 23 and 24 are the same sentence
+still being true two rounds later — both were found by looking at content, and
+24 is the only entry here that stands between this port and a feature it has
+decided to keep.
 
 Numbers are never reused, so a hole is an entry that closed.
 
@@ -626,6 +635,36 @@ Numbers are never reused, so a hole is an entry that closed.
     the edge of its own image. The shape of a fix is `Texture::update` taking
     a chain the caller built, and eacp's own builder becoming the default
     rather than the only way.
+
+24. **A pass's depth attachment cannot be sampled, and there is no depth format
+    to copy it into.** `Texture-Apple.mm:130-144` creates the depth texture a
+    render-target texture attaches with `usage = MTLTextureUsageRenderTarget`
+    and `storageMode = MTLStorageModePrivate` — no `MTLTextureUsageShaderRead`,
+    so Metal refuses to let a shader sample it, whatever
+    `Texture::nativeDepthTexture()` hands out. And there is nothing to blit it
+    into either: `TextureFormat` is `RGBA8Unorm, BGRA8Unorm, R8Unorm, RG8Unorm,
+    RGBA16Float, RGBA32Float` and has no depth member at all.
+
+    **Open, and needed after step 5.** What wants it is the soft-particle
+    program (#3878), the last thing in §8's 4e.8 basket that is worth doing:
+    it fades a particle out where it meets the surface behind it, which means
+    reading the depth buffer, which is what `CopyDepthbufferToImage` is an
+    empty function for on this backend
+    (`RenderBackend_Eacp.cpp:4198-4206`). Roughly half of Doom 3's base
+    particle stages qualify for the softening by geometry — 702 of 1332 over
+    the pk4's 32 `.prt` files — so this is a per-frame quality difference on
+    most of the game's atmosphere rather than an edge case, and it is dhewm3's
+    own improvement rather than id's.
+
+    It is unlike every other gap on this list in one way worth saying: nothing
+    in the gate can see it, before or after. `r_useSoftParticles 0` and even
+    `r_skipParticles 1` move nothing beyond the SDL/GL build's own
+    capture-to-capture noise over the whole 297-frame tour, so this is the one
+    piece of the port that will have to be verified by looking at it.
+
+    The shape of a fix is small on both sides: the depth usage and a depth
+    member on `TextureFormat` in eacp, then `CopyDepthbufferToImage` and one
+    program with two textures here.
 
 ### Checked, and *not* gaps
 
@@ -2359,7 +2398,203 @@ after, on every surface it corrects and on none it does not.
 **What is not here.** `r_gammaInShader 0` asks for the display's hardware ramp,
 which `GLimp_SetGamma` warns it cannot set; on this host the cvar off means no
 gamma at all rather than gamma somewhere else. The `newStage` programs are still
-skipped, and would take the same base class when they arrive.
+skipped, and would take the same base class when they arrive. (They arrived in
+4e.8 and they did.)
+
+#### Step 4e.8 — the `newStage` programs — **done**
+
+The last thing `RB_STD_T_RenderShaderPasses` does that this backend did not. A
+`newStage` is a material naming a hand-written ARB program pair for *itself* —
+`program heatHaze.vfp`, a list of `fragmentMap`s and a list of `vertexParm`s —
+rather than describing a stage the engine knows how to draw, and the eacp
+backend had been skipping them with a silent `continue` since step 4c.
+
+**How much was being skipped was the surprise, and it is why this became a step
+rather than a scope cut.** A census of the demo pk4's 67 `.mtr` files finds
+**6160 materials, 50 of them with a `newStage`**, over four distinct shipped
+programs: `heatHazeWithMaskAndVertex.vfp` (21 materials), `heatHazeWithMask.vfp`
+(15), `colorProcess.vfp` (7) and `heatHaze.vfp` (6), plus one material each for
+`bumpyEnvironment.vfp`, the unshipped `pinch.cg` and the unshipped
+`megaTexture.vfp`. The demo's `materials/` is the full base decl set rather than
+a subset — it carries `hell.mtr`, `monsters.mtr` and `weapons.mtr` for art the
+demo does not ship — so those fifty are what **Doom 3's whole base game**
+declares. 0.8% of the materials, but not obscure ones: all three shipped maps
+put heat-haze glass in their world geometry, and the gate's own tour had been
+walking past three camera stops of it. `r_skipNewAmbient 1` moves **48 of 297**
+frames on the SDL/GL build and moved **0 of 297** on this one, which is the
+whole argument in two numbers.
+
+**The design problem was that a stage could not say which program it wanted.**
+`newShaderStage_t` carried the two handles `R_FindARBProgram` returns, which are
+indexes into `draw_arb2.cpp`'s own table — meaningless here, and zero on any
+backend with no ARB programs to load. Worse, the *parser* decided what a
+`newStage` is on those same two handles, so on a backend that never loads one
+the stage would not be a `newStage` at all: it would fall through to the
+fixed-function path with no image and draw a checkerboard. It happens not to
+today, because `R_LoadARBProgram` allocates its identifier before it discovers
+the extension is missing and so returns something non-zero — which is a thing to
+build on for exactly as long as it takes step 5 to stub that function.
+
+So the material parser keeps the program's **name** beside the handles now
+(`Material.h`), and tests it too. The name-to-program lookup is in the eacp
+backend, which is the shape this port already uses for a texgen: the shared code
+says what the material asked for and the backend says what it draws that with.
+Two lines in `ParseStage`, one in the allocation test, and nine in
+`draw_common.cpp` — the ARB path now skips a stage whose program never loaded
+rather than binding program 0 and enabling the target, which is an error and not
+a no-op. The one material in the pk4 that changes hands is `shaderDemos/pinch`,
+whose `pinch.cg` no pk4 ships and no map places.
+
+**The heat haze is one program with two switches, not three programs.** Read
+side by side, `heatHazeWithMask.vfp` is `heatHaze.vfp` plus a `TEX` on
+`texture[2]` and a `MUL` on the result, and `…AndVertex` is that plus
+`fragment.color`; nothing else differs, line for line. So `idEacpHeatHazeProgram`
+takes two booleans into `define()` and the cache keys on them beside the three
+samplings.
+
+That cost one thing, and it is the same rule step 4e.5 wrote three texgen
+programs for: **eacp declares every texture a program lists, whether `define()`
+samples it or not, and Metal refuses a draw with a declared texture left
+unbound.** Splitting the family on that rule would have made two programs out of
+what is plainly one shader with a switch, so the third slot stays declared, the
+unmasked form binds its own normal map there, and the key it is asked for under
+carries that normal map's sampling. The slot is bound to a texture that had to
+be bound anyway and the key space does not grow.
+
+**The screen coordinate is rebuilt rather than borrowed, and this is where the
+step's first draft was wrong.** The ARB fragment program reads
+`fragment.position` — the window coordinate — and divides by the viewport to
+land in [0, 1]. The EDSL has no fragment-position input, so the same number is
+computed the way a projective texture read always is: the clip position's
+(x, y, w) as a varying, divided in the fragment stage, which is *exact* rather
+than an approximation because a varying is interpolated with w already divided
+out. It looked at first as though `idEacpScreenProgram` — the 4e.5 program that
+has never had a user — was that number already. It is not: `TG_SCREEN`'s planes
+produce the same clip triple but stop at (s/q, t/q), which is [-1, 1], where a
+texture coordinate for `_currentRender` needs [0, 1] and the half-and-shift.
+They are two different mappings of one position, and **the screen program still
+has no user in the demo pk4.**
+
+**Three more things are the original's arithmetic rather than a reading of it.**
+The deform magnitude is scaled by the projected width of a unit at the vertex's
+depth — one row of the modelview and two rows of the projection, dotted with
+(1, 0, z, 1) — so the ripple is a constant size on the screen rather than in the
+world, and the `MAX` under the divide is the guard for a polygon crossing the
+view plane. Those two projection rows are the same whichever depth hack
+`SetSpace` applied, both hacks touching row 2 alone. The normal map's x comes
+out of the alpha channel, because `idImage::GenerateImage` swaps red and alpha on
+every normal map it uploads. And the mask's `KIL` becomes the one
+`setDiscardBelow` the EDSL has, which is the same test: below 0.01 in either of
+the mask's first two channels and the fragment is gone — after which those same
+two channels scale the distortion, so a mask at exactly 0.01 distorts by nothing.
+
+**Alpha is `_currentRender`'s own, and unlike 4e.5's case there is no invisible
+value to pick.** `TEX result.color.xyz` leaves w undefined under
+ARB_fragment_program exactly as `bumpyEnvironment.vfp`'s `MOV result.color.xyz`
+does — but that program's blends made zero the one value that could not change
+the destination, and a heat-haze stage is (ONE, ZERO) and writes whatever it
+writes. So what is carried is the alpha of the pixel the stage is drawing: its
+whole picture is the frame behind it, so its alpha is the frame's too. It
+reaches nothing measured — `glass1` and `glass2` overwrite the channel with a
+`maskcolor` stage on the next line, `vp1` is a single-stage material, and the
+readback the gate hashes is RGB.
+
+**`bumpyEnvironment.vfp` as a `newStage` reuses the 4e.5 program**, which is the
+cheap case the step was allowed to take: `shaderDemos/bumpyReflect` names the
+same pair `RB_PrepareStageTexturing` selects for a reflect texgen on a bumped
+material, so it is the same draw with its cube and its normal map coming off the
+`newStage`'s two `fragmentMap`s instead of off a cube stage and a bump stage.
+`colorProcess.vfp` is a program of its own and the smallest here: the frame read
+straight, desaturated by `(r + g + b) × 0.33` — the original's constant, not a
+third and not weighted for the eye — and mixed towards a hue. Its ARB vertex
+program forwards two constants and does nothing else, so they are uniforms and
+the two lines of arithmetic are folded into the fragment stage rather than
+interpolated across a surface they are constant over.
+
+**Measured.** The gate moves **48 of 297 frames** — 17 to 32, 166 to 181 and 215
+to 230, the three camera stops with heat-haze glass in view and not one frame
+more — and with `r_skipNewAmbient 1` the new build is **byte-identical to the
+old on all 297**, which is what says the switch still means what it means on the
+other build. Two captures agree. Against the SDL/GL build:
+
+| Stop | Before | After | Floor (skipped on both) |
+| --- | --- | --- | --- |
+| 2 — Security Checkpoint | 0.458 | **0.179** | 0.196 |
+| 11 — Marine Command Access | 0.853 | 0.852 | 0.852 |
+| 14 — Marine Headquarters | 1.378 | 1.335 | 1.351 |
+| whole tour | 0.833 | **0.814** | 0.816 |
+
+(Those stops are the 297 frames split eighteen ways, so each is a block of
+sixteen or seventeen and the second takes in one frame of the third — which is
+why the checkpoint's own sixteen read a little lower, 0.134, in the second table
+below.)
+
+**Every stop now agrees at or below the floor it had without the feature**, and
+that is the number worth reading rather than the drop itself. A refraction reads
+a displaced copy of a frame the two renderers already disagree about, so the
+expectation was that it would *amplify* what was there; instead it flattens it,
+the displacement and the bilerp spreading a difference out rather than stacking
+it. At the checkpoint the worst pixel goes from 106 of 255 to 53 and the
+differing bytes from 16.6% of the frame to 8.0%.
+
+**The three programs the tour does not reach were checked against the reference
+build rather than assumed**, by shadowing `materials/glass.mtr` the way step
+4e.6 made a blend light — `fs_savepath`'s game directory is first in the search
+path and a render demo resolves a material by name on playback, so the same
+shadowed content drives both builds through the same 297 frames. With the
+checkpoint's two glasses drawing each program in turn, over frames 17 to 32:
+
+| Program on `glass1` and `glass2` | Moves the SDL/GL picture by | eacp vs SDL/GL |
+| --- | --- | --- |
+| `heatHaze.vfp` — what ships | — | 0.134 |
+| `heatHazeWithMask.vfp` | 0.265 | 0.138 |
+| `heatHazeWithMaskAndVertex.vfp` | 0.401 | 0.152 |
+| `colorProcess.vfp` | 1.273 | **0.098** |
+| `bumpyEnvironment.vfp` | **32.944** | 0.156 |
+| nothing at all | 0.401 | 0.152 |
+
+The middle column is how far that program moves the *reference* build's picture
+against the shipped heat haze, and it is there so that each row is a draw rather
+than a compile that happened not to crash. `bumpyEnvironment` moving it by 33 of
+255 is that material losing `SS_POST_PROCESS` — it names no `_currentRender` —
+and putting a bright cube reflection over the wall.
+
+**The `AndVertex` row is the one to read twice: it draws nothing at all, and
+that is the content rather than the port.** Its two numbers are the last row's,
+to three decimals and to the worst pixel, and the reason is that the two capture
+directories are byte-identical — on *both* builds, over all 297 frames. Its one
+extra line multiplies the mask by the vertex colour before the `KIL`, and **world
+geometry carries no vertex colour**: the `.proc` format has eight floats a
+vertex and none of them is a colour, `R_AllocStaticTriSurfVerts` does not clear
+what it hands out, and the multiply drives every fragment under the 0.01
+threshold. Nor is world geometry unusual here — `R_AutospriteDeform` writes
+position and texture coordinates into a frame-temporary block and no colour
+either, and `Model_md5.cpp` sets none; the two things in this engine that do
+write one are the LWO/ASE loaders and the particle system, and no shipped
+`AndVertex` material lands on either in this level's view.
+
+So what that row verifies is real but narrower than it looks: the variant
+compiles, builds a pipeline, runs clean under the validators, and takes the same
+`KIL` decision as the reference build on every fragment of 297 frames — which is
+precisely the line that separates it from `heatHazeWithMask`, since that program
+on the same surfaces draws and moves the frame by 0.265. Everything after the
+multiply is character for character the masked variant's, and that is the row
+measured at 0.138.
+
+Clean under `MTL_DEBUG_LAYER=1` with `MTL_SHADER_VALIDATION=1` and GPU
+validation — on the tour and on each of the shadowed materials in turn, which is
+the only way the three unreached programs get in front of the validator at all.
+At the checkpoint camera: **12 programs and 41 pipelines** against 11 and 40
+with the stage skipped, so the shipped heat haze is one program and one pipeline
+there.
+
+**What is not here.** `TG_GLASSWARP`, which is a `newStage` wearing a texgen and
+which §8 now cuts for good: no material in the pk4 uses it and its two programs
+are not shipped, so the SDL/GL build cannot draw it either. The soft-particle
+program, which §8 moves to after step 5 and which is blocked on gap 24. And
+`megaTexture.vfp` and `pinch.cg`, which get the one-shot warning an unknown
+program name gets — the rest of the material still draws, so a surface loses its
+refraction rather than disappearing.
 
 #### The over-bright frame — **closed, and it was never the port's**
 
@@ -2524,6 +2759,29 @@ rather than a program beside it, compiled lazily:
 - ~~2D / GUI~~ — never a program of its own: step 4c found that the menus, the
   console and the HUD are the generic material stage over a view with no
   `viewEntitys`, so the entry above covers it.
+- ~~the `newStage` programs — the ARB pairs a material names for itself~~ —
+  **done**, step 4e.8, and **two entries rather than four**. The base content
+  ships four programs and declares fifty materials over them; three of the four
+  are the heat haze, which is one shader with a mask switch and a vertex-colour
+  switch, so `idEacpHeatHazeProgram` is one entry keyed on those two booleans
+  and three samplings. `idEacpColorProcessProgram` is the other. The fifth name
+  a `newStage` in the pk4 can carry is `bumpyEnvironment.vfp`, and it is not a
+  new entry at all: `shaderDemos/bumpyReflect` names the same pair the reflect
+  texgen selects, so it reuses 4e.5's program with its two images coming off the
+  stage's `fragmentMap`s. Both new entries take the gamma base class, every ARB
+  fragment program getting `R_LoadARBProgram`'s injected correction — which in
+  practice is the identity, these materials being post-process.
+- **`TG_GLASSWARP` — a scope cut, and §8 says why.** It is a `newStage` wearing
+  a texgen: a fragment program with three textures selected by a `texgen`
+  keyword rather than by a `program` line. It is not on this list because no
+  material anywhere in the pk4's 6160 declarations uses it and its two programs
+  (`arbVP_glasswarp.txt`, `arbFP_glasswarp.txt`) are not shipped, so the SDL/GL
+  build cannot draw it either and there would be no reference picture to check
+  one against.
+- **the soft-particle program (#3878) — after step 5**, blocked on gap 24. Not
+  counted above, and it would be one entry: two textures, the frame's depth and
+  the particle's own image. It is the only program left in Doom 3 that this
+  backend does not have.
 
 The EDSL earns its keep here: one source per shader covering Metal and D3D12, against
 Doom 3's original two hand-written ARB programs per path.
@@ -2534,10 +2792,19 @@ the engine does not (the blit), and a program the engine needs and the API makes
 unnecessary (the depth fill, which turned out to be a variant rather than an
 entry). What it missed in the middle is that "texgen variants" became three
 programs for a reason eacp's declaration model imposed, and that gamma is not a
-program at all but a base class three of them share (step 4e.7). The
-sampling-variant sizing was the part that was wrong, and §4.3 says where. The
-demo's first level ends the phase at **12 programs and 64 pipelines** at a
-camera with sky and glass in view, 9 and 57 before 4e.5.
+program at all but a base class four of them now share (steps 4e.7 and 4e.8).
+The sampling-variant sizing was the part that was wrong, and §4.3 says where.
+The demo's first level ends the phase at **12 programs and 64 pipelines** at a
+camera with sky and glass in view, 9 and 57 before 4e.5 — and 12 and 41 at the
+Security Checkpoint, where 4e.8 added one of each.
+
+**The one thing the list never had is what the count would have missed
+entirely**, and it is worth recording beside the entries: `newStage` is a
+material naming a program the *engine* does not know about, so the number of
+shaders this port needs was never a property of the renderer alone. Four of the
+fifteen programs in the pk4's `glprogs/` are reachable only that way, and the
+gate walked past three camera stops of one of them for seven steps without
+saying a word.
 
 ---
 
@@ -2706,13 +2973,54 @@ Phase 2 is the first work that compiles against eacp. In rough order:
        a branch on a uniform so that the defaults stay byte-identical (297/297)
        and `r_gamma 1.5 r_brightness 1.2` moves every frame by the same 30 of
        255 on both builds.
-     - **4e.8. What is still skipped, and named.** The `newStage` materials —
-       `heatHaze` on `glass1` / `glass2`, `vp1` — which are hand-written ARB
-       program pairs and would be a program per newStage; `TG_GLASSWARP`, which
-       is one of them wearing a texgen; the soft-particle program behind
-       `BE_ARB2`; and `r_showTris` and the other `r_show*` visualisations of
-       `RB_RenderDebugTools`. None of them is on the gate's path. Whether any is
-       worth a step before step 5 is a question for step 5.
+     - ~~**4e.8. What is still skipped, and named.**~~ — **done for the one of
+       the four that was worth a step, and each of the other three now has a
+       verdict rather than a shrug.** The four were measured before any of them
+       was written, and the measurement is what sorted them: "none of them is on
+       the gate's path" was **wrong** about the first and right about the rest.
+       - **The `newStage` materials — done**, §6. Four programs, fifty
+         materials, and three of the gate's eighteen camera stops. 48 of 297
+         frames moved and the tour went from 0.833 of 255 against the SDL/GL
+         build to 0.814, every stop landing at or below the floor it had with
+         the feature off on both sides.
+       - **`TG_GLASSWARP` — never.** A scope cut, and on evidence rather than
+         on cost. **Zero** of the pk4's 6160 material declarations use it —
+         the whole texgen census is reflect 89, skybox 14, wobblesky 9, normal
+         3, screen 0, glasswarp 0 — and the two programs it binds are not
+         shipped either: the SDL/GL build's own log says
+         `glprogs/arbVP_glasswarp.txt: File not found`. So **the reference
+         build cannot draw it**, and writing it here would be writing a shader
+         with nothing to point at and nothing to check it against. The
+         `_scratch2` image it samples has exactly one writer in the engine,
+         `R_XrayViewBySurface`, which no demo material asks for either. The
+         one-shot warning in `DrawShaderPasses` stays, and has never fired.
+       - **The soft-particle program (#3878) — after step 5**, and gap 24 is
+         raised for it now. It is not a program that can simply be written:
+         it reads the frame's depth, and eacp's depth attachment is created
+         render-target-only with no sampleable format to blit it into. The
+         feature is worth having — 702 of the 1332 base particle stages
+         qualify for the softening by geometry, so it is a per-frame
+         difference on most of Doom 3's atmosphere, and it is dhewm3's own
+         improvement rather than id's, which a port has no business dropping
+         silently. **What it does not have is a gate.** `r_useSoftParticles 0`
+         moves nothing over the 297 frames, and `r_skipParticles 1` — removing
+         the particles altogether — moves one frame, which is the SDL/GL
+         build's own known noise. Five emitters reach the soft branch during
+         the tour and none of them contributes a visible pixel at any of the
+         297 captured instants. So this is the one piece of the port that will
+         have to be verified by looking at it, and it is the reason gap 24's
+         entry says so.
+       - **`r_showTris` and the other `r_show*` — never**, and §7's cut
+         stands. `RB_RenderDebugTools` has one caller, at the tail of
+         `RB_STD_DrawView`, which only the GL backend calls; the file's 345
+         `qgl` calls are compiled into the eacp binary and dead. Nineteen
+         cvars, no content dependence, and `record.cfg` sets none of them.
+         One thing was found that §7 had been carrying on trust for the whole
+         port, though: if a view is ever restored it should be `r_showTris`,
+         and **it needs no eacp gap**. §7 is right that eacp has no polygon
+         fill mode, but it has `PrimitiveTopology::Lines`, so a wireframe is
+         one CPU pass expanding each triangle's three indices into three line
+         pairs plus one pipeline on a program that already exists.
      - ~~**The over-bright frame**, which is not a step of 4e but is loose~~ —
        **closed, and it was never the port's**, §6. The frame is
        `demo_mars_city1`'s dropship headlight sweeping the airlock at 55.6
@@ -2722,14 +3030,37 @@ Phase 2 is the first work that compiles against eacp. In rough order:
        builds drain events at rates seven to one apart, so the reproducer's
        SDL/GL screenshots were forty seconds of level time short of the ship.
        `regression/README.md` says how to pin a live run now.
-5. **Delete** `glimp.cpp`, `events.cpp`, `threads.cpp`, `neo/sys/linux/`, SDL,
-   and fold `dhewm3-eacp` back into `dhewm3`.
+5. **Delete** `glimp.cpp`, `events.cpp`, `neo/sys/linux/`, SDL, and fold
+   `dhewm3-eacp` back into `dhewm3`. **Not `threads.cpp`** — that was this
+   list's own error, carried since Phase 1: step 2a took it off SDL and onto
+   `std::thread` and `std::mutex`, and both targets have shared the result ever
+   since. It is one of the files the port *keeps*.
+
+   One thing 4e.8 leaves for this step to be careful with. `R_FindARBProgram`
+   goes with `draw_arb2.cpp`, and until 4e.8 the material parser decided what a
+   `newStage` *is* on that function's return value — so a stub returning 0 would
+   have silently turned fifty materials back into fixed-function stages with no
+   image. It does not now: `Material.cpp` tests the program's name beside the
+   two handles, and the eacp backend never reads the handles at all. The gate
+   would catch a regression here — 48 frames — but the point is that it no
+   longer can happen.
 
 Off to one side of that order, and needed before the port is finished rather
 than before the next step: **the Windows host**. `dhewm3-eacp` is macOS-only
 from step 2b (§6), because `sys/win32/win_main.cpp` holds Windows' `Sys_*`
 entry points behind its own `WinMain`. Splitting that file the way
 `DOOMController.mm` was split is the whole of it.
+
+**Why 4e.8 went before step 5 rather than after it, in one number.** At the
+tour's second camera stop the two builds disagreed by 0.458 of 255, and the heat
+haze the eacp build was not drawing accounted for **0.401 of that — 88%**. The
+other two stops it shows at were 0.4% and 7%. That share is the argument: the
+last thing standing between the two renderers at the place they differed most
+was a feature one of them simply did not have, and the SDL/GL build is the only
+reference picture this port will ever get. After step 5 there is nothing to
+compare a new program against, so a program with a reference is worth writing
+while the reference still exists — which is also the whole reason `TG_GLASSWARP`
+gets a *never* rather than a *later*: it has no reference now and never had one.
 
 The gate is the whole reason this can be done in that order rather than as one
 jump. It is also worth re-reading `regression/README.md` before trusting it on

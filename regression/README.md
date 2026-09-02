@@ -55,9 +55,9 @@ the numbers are the same: 297 identical across two captures, 297 moved with
 size does not reach these - and **none of the 297 pairs hash the same**, which
 is what two renderers agreeing to the eye and not to the bit looks like.
 
-## What steps 4e.5 to 4e.7 learned about the gate
+## What steps 4e.5 to 4e.8 learned about the gate
 
-Four things, none of them about the renderer - and a fifth, about what `wait`
+Five things, none of them about the renderer - and a sixth, about what `wait`
 buys each build, under "What the tour covers" below.
 
 **`GATE_ARGS` is extra `+set` pairs for the engine**, appended before the
@@ -92,6 +92,30 @@ byte-identical. The demo playback the gate uses never had the problem.
 mean of 0.000 of 255 and a worst pixel of 25 - instrumented shaders and a
 different floating-point schedule, not a bug. Run the validation capture for its
 log and compare hashes only between captures taken the same way.
+
+**A capture with different *content* cannot go through this script, and that is
+deliberate.** Steps 4e.6 and 4e.8 both needed one - a `.mtr` shadowed in
+`fs_savepath`'s game directory, so that the demo's own light becomes a blend
+light or its own glass draws a different `newStage` program - and `run_engine`
+wipes and rebuilds that directory before every run, for the feedback-loop reason
+the next section gives. So the way to take one is by hand, with the same
+arguments the script uses and `regression/capture.cfg` copied in beside the
+shadowed file:
+
+```sh
+mkdir -p "$scratch/demo/demos" "$scratch/demo/materials"
+cp your-edited.mtr "$scratch/demo/materials/"
+cp regression/reference.demo "$scratch/demo/demos/reference.demo"
+cp regression/capture.cfg "$scratch/demo/"
+"$exe" +set fs_basepath "$build/neo" +set fs_savepath "$scratch" \
+       +set fs_configpath "$scratch" +exec capture.cfg
+# frames land in $scratch/demo/demos/reference; wait for reference.roqParam
+```
+
+`fs_savepath`'s game directory is first in the engine's search path, so the
+shadow wins, and demo playback resolves a material *by name* - which is what
+makes the same edited file drive both builds through the same 297 instants. The
+same run works on either binary; give each its own scratch directory.
 
 ## Both paths have to be pinned, not just fs_savepath
 
