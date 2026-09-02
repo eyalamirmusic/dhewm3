@@ -55,9 +55,10 @@ the numbers are the same: 297 identical across two captures, 297 moved with
 size does not reach these - and **none of the 297 pairs hash the same**, which
 is what two renderers agreeing to the eye and not to the bit looks like.
 
-## What step 4e.5 learned about the gate
+## What steps 4e.5 to 4e.7 learned about the gate
 
-Four things, none of them about the renderer.
+Four things, none of them about the renderer - and a fifth, about what `wait`
+buys each build, under "What the tour covers" below.
 
 **`GATE_ARGS` is extra `+set` pairs for the engine**, appended before the
 `+exec`. It exists for a cvar that changes every frame - `r_gamma`, say - which

@@ -24,9 +24,11 @@ and the blend lights with it, and **`r_gammaInShader` corrects what it corrects
 on OpenGL** and nothing else. Every comparison is a hash: over the whole
 297-frame tour the eacp build now agrees with the SDL/GL build at a mean of
 **0.83 of 255**, from 1.13 before this round, with every camera stop that moved
-moving towards it. What is left of Phase 2 is the loose over-bright frame from
-4e.3, the `newStage` programs nothing on the gate reaches, and then step 5 — the
-deletion.**
+moving towards it. The over-bright frame 4e.3 carried as a loose defect is closed
+too, and was never the port's: it is the level's dropship headlight, drawn by
+both builds at the same instant, and what was wrong was a reproducer that
+compared two different moments. What is left of Phase 2 is the `newStage`
+programs nothing on the gate reaches, and then step 5 — the deletion.**
 
 Reference implementation for almost everything on the platform side:
 `~/Code/PureDOOM/examples/EACP` — a complete engine hosted on eacp, with its own
@@ -605,6 +607,25 @@ Numbers are never reused, so a hole is an entry that closed.
     passing** and the GPU half clean under `MTL_DEBUG_LAYER=1` with
     `MTL_SHADER_VALIDATION=1` and GPU validation. The D3D12 half is written and
     unrun, the eacp host being macOS-only (§8).
+
+23. **A texture cannot be given a mip chain; eacp builds its own from level 0.**
+    Deliberate on eacp's side — one filter shared by both backends, so that
+    Metal's `generateMipmaps` and a hand-written D3D12 chain cannot produce two
+    pictures (`MipChain.h`) — and `UploadImageLevel` says as much where it
+    drops every level below the first. What it loses is `R_MipMap`'s
+    `preserveBorder`: a `TR_CLAMP_TO_ZERO` image keeps its zero edge all the
+    way down Doom 3's chain, and eacp's averages it away. Measured on
+    `lights/headlights`, which is `zeroclamp`, while chasing the over-bright
+    frame (§6): the two chains agree to level 4 and diverge below it, Doom 3's
+    reaching zero at 2x2 where eacp's stays at the image's 74.8 of 255 average.
+
+    Nothing measured shows it — dropping the chain of every such image moved
+    no frame the investigation looked at — so this is the gap growing a name
+    rather than becoming urgent, as gap 6 did. Where it would show is a
+    projected light seen at a distance, sampling its low levels, spilling past
+    the edge of its own image. The shape of a fix is `Texture::update` taking
+    a chain the caller built, and eacp's own builder becoming the default
+    rather than the only way.
 
 ### Checked, and *not* gaps
 
@@ -1798,11 +1819,14 @@ downsample and a 4x upscale do to two renderers' edges. Clean under
 programs and 40 pipelines — the capture being one more pipeline on the blit's
 one program.
 
-**And it found a bug it did not cause and has not fixed.** Driving the same
-camera with berserk vision on, the eacp build produces a **~3x over-bright,
-flatly-lit frame for about two frames** at one fixed moment in the level, and
-the correct picture on either side of it. It is worth being precise about,
-because the shape of the evidence is what says it is not this step's:
+**And it found what it took for a bug, which turned out to be the level.** The
+paragraphs below are kept as they were written, because the evidence in them is
+real and what it was missing is the lesson — see "The over-bright frame" after
+step 4e.7 for what the moment is and why the SDL/GL build looked steady. Driving
+the same camera with berserk vision on, the eacp build produces a **~3x
+over-bright, flatly-lit frame for about two frames** at one fixed moment in the
+level, and the correct picture on either side of it. It is worth being precise
+about, because the shape of the evidence is what says it is not this step's:
 
 - The SDL/GL build is flat at 30.2–32.0 over the same twenty-four screenshots;
   the eacp build reads 96.5 and 81.4 at shots 7 and 8 and 26–41 everywhere else.
@@ -1825,6 +1849,13 @@ what was already there, which is what a second view rendered outside the frame's
 pass would do — 4e.2's camshot case, one step along. Not proven, and not
 chased further here: it is a defect of its own with a reproducer, and 4e.3 is
 measurable without fixing it.
+
+*(Chased after 4e.7, and every bullet above survives with a different meaning:
+the identical command counts were the same kind of frame around a scene that
+had gained a light, "older than 4e.3" because the light was always there, and
+"one-off" because a dropship passes once. The SDL/GL build was "steady" because
+its twenty-four screenshots were taken forty seconds of level time earlier than
+the eacp build's, and the paragraph after step 4e.7 says why.)*
 
 **What is not here.** `TG_SCREEN` and `TG_SCREEN2`, the screen-space texgens a
 material samples `_currentRender` *through*, are still skipped with the rest of
@@ -2330,6 +2361,119 @@ which `GLimp_SetGamma` warns it cannot set; on this host the cvar off means no
 gamma at all rather than gamma somewhere else. The `newStage` programs are still
 skipped, and would take the same base class when they arrive.
 
+#### The over-bright frame — **closed, and it was never the port's**
+
+The loose defect §8 has carried since step 4e.3 — "the eacp build renders about
+two frames of any run three times too bright and flatly lit, at a fixed moment
+in the level, where the SDL/GL build is steady" — is `demo_mars_city1`'s own
+dropship. Both builds draw it, at the same instant, to within the agreement they
+already have everywhere else. What was wrong is the way the two were compared,
+and that is the finding worth keeping.
+
+**What the moment is.** `light_5296`, a *projected* light — `light_target`,
+`light_right`, `light_up`, `light_start`, `light_end` — carrying
+`lights/headlights` and bound to `marscity_ship2_1` at the `ship` joint. It is
+the transport's headlight, and it sweeps the airlock as the ship passes at
+**55.6 to 56.5 seconds** of level time, nine tenths of a second, fifty-three
+frames at 60Hz. In the backend it is one more light in a three-light view: the
+view's `viewLights` goes from 3 to 4 and its surface count from 90 to 93, the
+light's own colour is `_color 0.99 1 1` times `r_lightScale`, and it reaches the
+room through the doorway with nothing between. That is what makes the extra
+layer read as flat albedo rather than as a beam — it is a light with no occluder
+in front of it, over every surface in view at once.
+
+**Why the SDL/GL build looked steady, and this is the part to keep.** `wait N`
+counts command-buffer executions, and `idEventLoop::RunEventLoop` runs the
+buffer *once per event it processes* and once more when the queue empties — so N
+is one iteration of the event loop rather than one frame, and the two builds do
+not drain events at the same rate. Measured rather than reasoned about, with
+`com_fixedTic 1` pinning the game clock to one tic per rendered frame and
+`backEnd.viewDef->renderView.time` printed from the shared `RB_DrawView`:
+
+| | `wait 3000`–`3150` reaches |
+| --- | --- |
+| `dhewm3-eacp` | **52.7 s** of level time |
+| `dhewm3` | **7.7 s** of level time |
+
+about 6.85 frames a wait against one. So every pair of screenshots the old
+reproducer compared was a picture of two different moments, and the SDL build's
+twenty-four of them never came within forty seconds of the dropship. The eacp
+build is the slow one here for a reason already in the log: gap 13, its frame is
+driven by the display link at 60Hz, while the SDL build runs uncapped.
+
+**There is a second trap underneath the first, and it is worse.** The flyby only
+happens if the player is left alone until the opening cinematic finishes. Taking
+the camera at 50.5 seconds instead of 52.7 — two seconds early — stops the ship
+arriving at all: `lights` stays at 3 through 62 seconds and the means over the
+same window fall to 26–34. On *either* build. So a reproducer that lands early
+does not draw a dimmer flash, it draws no flash, and a sweep of sixty
+screenshots across forty seconds of level time finds nothing to report. That is
+what the old one did to the SDL build, twice over — once through the wait rate
+and once through the takeover.
+
+**Pinned properly, the two agree.** `com_fixedTic 1`, `wait 3150` on the eacp
+build and `wait 21960` on the SDL one, both taking the camera at 52.7 s, both
+at 640x480:
+
+| t (s) | eacp | SDL/GL | surfs |
+| --- | --- | --- | --- |
+| 55.53 | 30.47 | 28.71 | 90 |
+| 55.60 | 38.37 | 37.17 | 91 |
+| 55.67 | 51.93 | 54.37 | 91 |
+| 55.73 | 71.04 | 76.12 | 92 |
+| 55.87 | 96.12 | 90.75 | 92 |
+| 55.93 | **97.57** | **93.58** | 93 |
+| 56.07 | 86.23 | 81.17 | 92 |
+| 56.13 | 80.86 | 77.52 | 92 |
+| 56.40 | 82.76 | 79.46 | 92 |
+| 56.53 | 33.51 | 32.52 | 90 |
+
+Same window, same shape, same peak, same surface counts frame for frame. The
+mean absolute difference is **2.59 of 255** over the thirty-two frames spanning
+the flash and **1.1** on the frames outside it — which is the same three to four
+percent the port stands at everywhere at this camera, on a picture three times
+as bright rather than a defect of its own.
+
+**What the original evidence really said**, now that the moment has a name. The
+identical `r_debugRenderToTexture` counts on good and bad frames were the
+frontend emitting the same *kind* of frame — one 3D view, one copy, one swap —
+and said nothing about the scene inside it, which had gained a light. It
+reproduced before 4e.3 because the light was always there. And berserk vision
+was never involved: without it the flash peaks at 97.6 and with it at 97.5, and
+the run of twenty-four that found it would have found it either way.
+
+**Four things eliminated on the way, none of which needs re-testing.**
+
+- **The pass plumbing is identical** on the good frames and the bad ones, traced
+  call by call: `SetDrawBuffer`, one `BeginPass` with `clearColor = 1`, one
+  `DrawView` whose `BeginDrawingView` finds `passHasWorldView` false and keeps
+  the pass, `SwapBuffers`, `EndPass`. So 4e.3's hypothesis — the frame composed
+  without its colour clear, 4e.2's camshot case one step along — is dead, and so
+  is any story about `SuspendPass` / `ResumePass`.
+- **`r_shadows 0` does not remove it.** The flash is there with the stencil out
+  of the picture entirely, which is what says it is a light arriving rather than
+  a shadow going missing.
+- **Dropping the mip chain of every `TR_CLAMP_TO_ZERO` image does not either** —
+  the one place `R_MipMap`'s `preserveBorder` would have mattered, since
+  `UploadImageLevel` hands eacp level 0 and lets it build its own chain, and
+  `lights/headlights` is `zeroclamp`. The chains do diverge (Doom 3's goes to
+  zero at 2x2 where eacp's stays at the image's 74.8 of 255 average) and it is
+  worth knowing — it is gap 23 now — but it is not this.
+- Clean under `MTL_DEBUG_LAYER=1` with `MTL_SHADER_VALIDATION=1` and GPU
+  validation across the flash, at 9 programs and 40 pipelines.
+
+**What landed.** No renderer code, and the gate says so: **297 of 297 identical**
+against 4e.4. What changed is the harness's own account of what a `wait` buys —
+`regression/README.md` and `record.cfg`'s header both said "N is roughly 6x the
+number of frames it holds", which is the SDL build's number stated as if it were
+both builds', and which is what made the comparison look sound. They now give
+the measured rate per build, say that a live-game script is not a clock two
+builds share, and give the way to pin one: `com_fixedTic 1`, a count calibrated
+per build, and the render view's own time printed to check where a run landed.
+The gate itself was never exposed to this and that is the argument for it — a
+recorded demo replays the render world frame by frame, so both builds draw the
+same instants whatever their event rate.
+
 ### Shader inventory for Phase 2
 
 Roughly 10–15 EDSL programs, each in the sampling variants §4.3 sizes — 8 worst case
@@ -2569,11 +2713,15 @@ Phase 2 is the first work that compiles against eacp. In rough order:
        `BE_ARB2`; and `r_showTris` and the other `r_show*` visualisations of
        `RB_RenderDebugTools`. None of them is on the gate's path. Whether any is
        worth a step before step 5 is a question for step 5.
-     - **The over-bright frame**, which is not a step of 4e but is loose: the
-       eacp build renders about two frames of any run three times too bright
-       and flatly lit, at a fixed moment in the level, where the SDL/GL build is
-       steady. Found and characterised by 4e.3, older than it, and written up
-       under that step with its reproducer.
+     - ~~**The over-bright frame**, which is not a step of 4e but is loose~~ —
+       **closed, and it was never the port's**, §6. The frame is
+       `demo_mars_city1`'s dropship headlight sweeping the airlock at 55.6
+       seconds of level time, and both builds draw it, at the same instant,
+       within 2.59 of 255 of each other. What was wrong was the comparison:
+       `wait N` is one event-loop iteration rather than one frame, and the two
+       builds drain events at rates seven to one apart, so the reproducer's
+       SDL/GL screenshots were forty seconds of level time short of the ship.
+       `regression/README.md` says how to pin a live run now.
 5. **Delete** `glimp.cpp`, `events.cpp`, `threads.cpp`, `neo/sys/linux/`, SDL,
    and fold `dhewm3-eacp` back into `dhewm3`.
 
