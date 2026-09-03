@@ -124,6 +124,35 @@ tic"). If the limit ever comes back, the one-line reproducer is
 `com_fixedTic` and aborts out of
 `IOGPUMetalCommandBufferStorageGrowKernelCommandBuffer` rather than going black.
 
+**Every capture runs at Doom 3's "ultra" machine spec, and that spec turns
+compressed textures off.** `run_engine` gives each run a fresh game directory, so
+`config.spec` is missing, so `idCommonLocal::Init` sets `sysDetect` and runs
+`SetMachineSpec` + `Com_ExecMachineSpec` - and this machine detects as spec 3,
+whose preset assigns `image_usePrecompressedTextures 0`, `image_useCompression 0`
+and `image_useNormalCompression 0`. So no capture in this directory has ever
+opened a `.dds`, and step 10 - which is entirely about `.dds` files - is 297 of
+297 identical on the gate. That is a correct answer to the question the gate
+asks; it is just not the question you may think you asked.
+
+Those assignments happen *after* the command line's `+set` pairs and before the
+`+exec`, so **`GATE_ARGS` cannot reach them**. Two ways round it, and the second
+is the one step 10 used:
+
+- put the cvar in a cfg. The `+exec` runs after the preset, so a `seta` there
+  wins - which is what the measurement scripts outside this directory do.
+- take the capture by hand with `config.spec` present, which makes `sysDetect`
+  false so the preset never runs at all and the cvar *defaults* apply. That is
+  the recipe in "A capture with different content" below plus one line:
+
+```sh
+	: > "$scratch/demo/config.spec"
+```
+
+  Capture a pair that way, one run per setting, and difference them frame by
+  frame. Demo playback is frame-exact, so two runs of one setting are
+  byte-identical and the floor is 0.000 - which is what makes a reading of
+  1.040 of 255 a measurement rather than an impression.
+
 **The Metal validation layers move the eacp build's frames.** A capture under
 `MTL_SHADER_VALIDATION=1` differs from one without on 99 of 297 frames, by a
 mean of 0.000 of 255 and a worst pixel of 25 - instrumented shaders and a

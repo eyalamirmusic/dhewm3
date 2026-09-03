@@ -81,7 +81,40 @@ found on the way is closed too, and it was older than the step that exposed it:
 a level load under `com_fixedTic 1` put thousands of render passes on the one
 command buffer an eacp frame is, and every frame after it was black — the backend
 submits between screens now, at 297 of 297, and "The black frame under a fixed
-tic" in §6 has the bisect.**
+tic" in §6 has the bisect. Step 10 closed the two oldest-and-newest entries on
+§5's list together, and it is the one step that found the port reading the wrong
+half of its own data: every `.dds` in the pk4 was being skipped, because
+`textureCompressionAvailable` was false and that flag is what shuts
+`CheckPrecompressedImage` before it opens a file, so the `.tga` beside each one
+was decoded and uploaded as RGBA8 at four times the size — and Doom 3's own mip
+chain was thrown away on the way in, eacp rebuilding one from level 0. eacp grew
+four block-compressed formats, `Device::supportsBlockCompression` and
+`TextureDescriptor::mipLevels`, a chain the caller built; the port grew an
+accumulator under the seam, because uploading a level at a time has no end marker
+and an API that fixes a level count at creation needs one. **The bytes on the GPU
+go from 462 to 140 MB, `all images loaded in` from 1.9–2.2 s to 0.4 s of a level
+load that is itself 3.3–4.0 s down to 1.73 s, the steady RSS from 905 to 567 MB,
+the images loaded from a precompressed file from 0 to 1934 of 2135, and the 18
+`Couldn't load image:` warnings to zero** — the nine assets the demo ships no
+`.tga` for do have a `.dds`. The graphics footprint is the number that did *not*
+move: 5082 to 4750 MB for texel bytes that fell 3.3×, which two further probes
+say is neither the bytes nor the texture count, and §6 writes up as a thing to
+measure on its own. The gate moves all 297 frames by **0.346 of 255**, which is
+expected and is arithmetic — `R_MipMap` truncates its 2x2 average where eacp's
+rounds to nearest, so Doom 3's chain is a fraction of a level darker — and the
+`.dds` half moves nothing there at all, because every baseline this port has ever
+captured ran at Doom 3's "ultra" machine spec, whose preset turns compressed
+textures off — as it does for a fresh config on any machine of this class, so
+the numbers are for a configuration that keeps `image_usePrecompressedTextures`
+at its default of 1; replayed with the preset suppressed it reads **1.040 of
+255** over the tour against a 0.000 floor. A read-only review of the two commits
+found the accumulation itself correct on every loader path and two defects around
+it — a **heap over-read on a malformed `.dds`**, under a comment that claimed to
+prevent it, and a **warning printed mid-upload re-entering the image loader
+through `PacifierUpdate`** and taking the pending slot away from the upload that
+printed it — and a third commit closes both, at 297 of 297. The GPU suite goes
+282 → 303 and eacp's half is uncommitted on `develop`, awaiting the user's own
+commit.**
 
 Reference implementation for almost everything on the platform side:
 `~/Code/PureDOOM/examples/EACP` — a complete engine hosted on eacp, with its own
@@ -412,13 +445,106 @@ step 9**, which is the other odd one: every other entry here is something eacp
 did not have and this port went looking for, where 20 was something the port had
 and traded away on purpose in 4e.1 — so closing it is the one time the list moved
 backwards to pick a thing up rather than forwards to reach one.
+**And 4 and 23 are closed by step 10**, together, because they are one idea
+counted twice: a compressed texture cannot have a chain built for it, so the
+format and the supplied chain had to arrive in the same commit or neither would
+have been usable. 4 is the oldest entry on this list — written before the port
+began, from reading the pk4 rather than from running anything — and 23 is one of
+the ones walking real content turned up. Closing them is also what turned up 29,
+by making the format switches exhaustive.
 
-Numbers are never reused, so a hole is an entry that closed.
+Numbers are never reused, so a hole is an entry that closed. **30 is the next
+free number.**
 
 ### Needed, not blocking
 
-4. **BC/DXT compressed texture formats** — all Doom 3 art ships as DXT1/3/5 in the
-   pk4s. Without it: decompress at load, ~4× VRAM, much slower level loads.
+4. ~~**BC/DXT compressed texture formats** — all Doom 3 art ships as DXT1/3/5 in
+   the pk4s.~~ — **closed**, and kept because the entry was right about the cost
+   and wrong about the arithmetic. "Decompress at load" is not what the port was
+   doing: with `glConfig.textureCompressionAvailable` false, `.dds` files were
+   never *opened*, because that flag is what `idImage::CheckPrecompressedImage`
+   tests before it reads a header. The engine decoded the `.tga` beside each one
+   instead, and paid ~4× the memory and **1.9–2.2 s of a 3.3–4.0 s level load**
+   for it.
+
+   **The eacp shape is four members of `TextureFormat`** — `BC1RGBA`,
+   `BC2RGBA`, `BC3RGBA`, `BC7RGBA` — and the important half of it is what eacp
+   does *not* do: it neither compresses nor decompresses, and the blocks reach
+   the device exactly as they came off disk. Compressing would mean choosing an
+   encoder, and every encoder makes a different picture out of the same pixels.
+   So a 4x4 block of texels is one 8- or 16-byte record the sampler decodes on
+   its way out, and everything that used to be `bytesPerPixel` — the pitch, a
+   level's size, a chain's size, a cube face's stride — became
+   `levelBytesPerRow` / `levelRows` / `levelBytes`, which answer for both kinds
+   of format and are the unit every layout in `Texture.h` is now written in.
+
+   **What a compressed texture cannot be is refused rather than
+   half-supported**, in the same words on both backends: a render target or a
+   kernel output, there being no per-texel address for a pass or a kernel to
+   write; `read()` and the region form of `update()`, which would need a decoder
+   at one end or a block-aligned rectangle at the other; and `mipmapped`, which
+   yields exactly one level, a block being not four numbers to take a mean of.
+   `TextureDescriptor::mipLevels` (entry 23) is the only way such a texture gets
+   a chain. And a compressed texture on a device that has no BC formats is
+   **invalid**, which is the answer a refused `sampleCount` already gives —
+   `Device::supportsBlockCompression` is how a caller with a choice to make
+   makes it beforehand rather than by finding out afterwards.
+
+   **Three things the content turned out to decide.** There is **no DXT5 in the
+   demo pk4 at all**: the 3642 `.dds` files are DXT1 1994, DXT3 855, RXGB 750
+   and 43 uncompressed. **RXGB is DXT5 with the normal's x moved into alpha**,
+   which is what Doom 3's own compressor emitted for every normal map, and it is
+   `BC3RGBA` — eacp uploads the bytes untouched and the convention stays the
+   consumer's, which here is the interaction program already reading a bump
+   texel as `.wyz`, so an RXGB `.dds` and a `.tga` normal map `GenerateImage`
+   has swizzled land in the same layout and one shader reads both. And DXT1 with
+   and without punch-through alpha is one format on both APIs, so the two GL
+   names collapse into `BC1RGBA`.
+
+   **The port has no encoder and this step deliberately did not write one.**
+   With the flag on, `SelectInternalFormat` returns a `GL_COMPRESSED_*` format
+   for every diffuse, specular and bump image loaded from its `.tga`, and on
+   OpenGL the driver would have compressed those RGBA bytes at upload. Writing
+   an encoder here would be choosing one, and the scope is small enough that the
+   choice is not worth making blind: counted by instrumenting the correction over
+   a whole level load, **9 images and 12.8 MB of RGBA8 with their mips**. That is
+   not the same set as "the images with no `.dds`", which the first draft of this
+   entry assumed — most of what stays on the `.tga` path is `TD_HIGH_QUALITY`,
+   which `SelectInternalFormat` never compresses whatever the flag says, and the
+   fonts, GUI assets and light projections are all of it. What is left is **the
+   seven `env/*` reflection cubes, 12.3 MB of the 12.8**, and
+   `lights/duolight02grey` and `lights/flashlight5`. **The cubes are structural**
+   rather than a hole in this pk4: `ActuallyLoadImage`'s `cubeFiles != CF_2D`
+   branch never calls `CheckPrecompressedImage` at all — "we don't check for
+   pre-compressed cube images currently" — so a cube takes the `.tga` path
+   whatever the files hold, and the missing `dds/env/` is a consequence rather
+   than the cause. So an encoder here would be aimed at cube maps first, which is
+   also where this entry's own refusals bite hardest.
+
+   So such an upload is stored as RGBA8 with the swizzle of the
+   uncompressed format it stands in for, and **the image's `internalFormat` is
+   corrected** to `GL_RGB8` or `GL_RGBA8` so that `BitsForInternalFormat`,
+   `StorageSize` and `listImages` describe the texture that exists. A backend
+   overruling a front-end decision wants a reason and this is it: on OpenGL a
+   compressed internal format was a *request* rather than a promise, the driver
+   was free to substitute, and `glGetTexLevelParameter` with
+   `GL_TEXTURE_INTERNAL_FORMAT` is how a caller found out what it got. This is
+   that query, answered by the only layer that knows.
+
+   `Tests/GPU/CompressedTextureTests.cpp` is fourteen cases and the thing worth
+   knowing about them is that **every block in the file is assembled by hand,
+   field by field, out of the format's specification**. A block a compressor
+   produced, compared against what that compressor's decoder makes of it, checks
+   nothing; a block whose 16 bytes are written out with the field boundaries in a
+   comment beside them has an expected colour that can be derived on paper, and
+   uploading it at the wrong pitch, into the wrong subresource or as the wrong
+   Metal/DXGI format gives a different one. The one case that reads an
+   *interpolated* colour carries a tolerance, because the hardware decoders round
+   differently — some interpolate in 5:6:5 and some at eight bits.
+
+   Uncommitted in `~/Code/eacp` on `develop` at the time of writing, with the
+   GPU suite at **303, from 282**, and the D3D12 half written and unrun (§8).
+   Step 10 in §6 is the port's half and the numbers.
 5. ~~**Cube textures** — skyboxes and reflections.~~ — **closed**, and kept
    because two of its three users were gone before it was and the third needed
    more than "a texture with six faces".
@@ -789,24 +915,59 @@ Numbers are never reused, so a hole is an entry that closed.
     `MTL_SHADER_VALIDATION=1` and GPU validation. The D3D12 half is written and
     unrun, the eacp host being macOS-only (§8).
 
-23. **A texture cannot be given a mip chain; eacp builds its own from level 0.**
-    Deliberate on eacp's side — one filter shared by both backends, so that
-    Metal's `generateMipmaps` and a hand-written D3D12 chain cannot produce two
-    pictures (`MipChain.h`) — and `UploadImageLevel` says as much where it
-    drops every level below the first. What it loses is `R_MipMap`'s
-    `preserveBorder`: a `TR_CLAMP_TO_ZERO` image keeps its zero edge all the
-    way down Doom 3's chain, and eacp's averages it away. Measured on
+23. ~~**A texture cannot be given a mip chain; eacp builds its own from level
+    0.**~~ — **closed**, and kept because the entry ended by guessing at the
+    shape of the fix and got one word of it wrong, which is the interesting part.
+
+    It was deliberate on eacp's side — one filter shared by both backends, so
+    that Metal's `generateMipmaps` and a hand-written D3D12 chain cannot produce
+    two pictures (`MipChain.h`) — and `UploadImageLevel` said as much where it
+    dropped every level below the first. What it lost was `R_MipMap`'s
+    `preserveBorder`: a `TR_CLAMP_TO_ZERO` image keeps its zero edge all the way
+    down Doom 3's chain, and eacp's averages it away. Measured on
     `lights/headlights`, which is `zeroclamp`, while chasing the over-bright
     frame (§6): the two chains agree to level 4 and diverge below it, Doom 3's
     reaching zero at 2x2 where eacp's stays at the image's 74.8 of 255 average.
+    It lost `image_colorMipLevels` too, which could show nothing at all while
+    the levels it tinted were being thrown away.
 
-    Nothing measured shows it — dropping the chain of every such image moved
-    no frame the investigation looked at — so this is the gap growing a name
-    rather than becoming urgent, as gap 6 did. Where it would show is a
-    projected light seen at a distance, sampling its low levels, spilling past
-    the edge of its own image. The shape of a fix is `Texture::update` taking
-    a chain the caller built, and eacp's own builder becoming the default
-    rather than the only way.
+    **The entry said "`Texture::update` taking a chain the caller built", and it
+    is `TextureDescriptor::mipLevels` instead** — a descriptor field rather than
+    an upload argument, because both APIs fix a texture's level count when the
+    *resource* is created and a chain handed over afterwards would have nowhere
+    to go. `update()` takes such a chain as well, but only because it is the same
+    block of bytes; it cannot be where the count is decided. The rest of the
+    guess was right: N levels tightly packed with level 0 first, level i sized
+    `levelBytes(format, mipExtent(w, i), mipExtent(h, i))` — the layout
+    `MipChain` already produced, so a chain eacp built and a chain a `.dds`
+    carries are one thing — uploaded verbatim with no filter of eacp's anywhere
+    near them, and eacp's own builder still the default.
+
+    **Two callers want it and they are not the same caller.** A compressed
+    texture has no other way to have a chain at all (entry 4), and every `.dds`
+    carries the one its compressor produced. An *uncompressed* one may want a
+    filter eacp does not have, which is this port: Doom 3's preserved zero
+    border. Refused rather than reconciled, each yielding an invalid texture:
+    together with `mipmapped`, which says the opposite thing about who builds the
+    chain; above `mipLevelCount(width, height)`; on a render target or a kernel
+    output, which has no pixels a chain could have come with; and **on a cube**,
+    whose six faces would each carry one and where nothing in eacp can pin which
+    level a direction sampled. A nonzero `bytesPerRow` is refused with it, the
+    layout being tightly packed by definition.
+
+    **The cube refusal is the one thing this costs the port**, and it is worth
+    naming here rather than only in the code: a `TextureDescriptor` carries six
+    faces or a supplied chain, not both, so `GenerateCubeImage`'s own chain is
+    still dropped and eacp still builds one per face from that face's own pixels.
+    Seven images in the demo are cubes, all of them `env/*` reflection maps, and
+    none of them has a `.dds`.
+
+    `Tests/GPU/SuppliedMipChainTests.cpp` is seven cases — the layout arithmetic,
+    the reported level count, a minified draw that reads a level the caller wrote
+    and nothing else could have produced, `update` replacing every level, the
+    stride refusal, the four invalid combinations, and a chain that stops short of
+    1x1 being taken as it is. Uncommitted on `develop` with entry 4's half; step
+    10 in §6 is the port's.
 
 24. ~~**A pass's depth attachment cannot be sampled, and there is no depth format
     to copy it into.**~~ — **closed**, and kept because which of its two proposed
@@ -962,6 +1123,27 @@ Numbers are never reused, so a hole is an entry that closed.
     grows bytes rather than buffers — and `Tests/GPU/StreamedRangeDrawTests.cpp`
     added as four pixel cases that check a slice draws what was written *there*.
     `Apps/GPU/StreamingStress` is the example. Step 8 in §6 is the port's half.
+
+29. **A one- or two-channel render target is created as a four-channel
+    attachment.** `pixelFormatFor` (`Lib/eacp/GPU/Pipeline/RenderPipeline.h`)
+    turns a `TextureFormat` into the `PixelFormat` a pipeline declares it renders
+    into, and `PixelFormat` has no `R8Unorm` or `RG8Unorm` member — so those two
+    fall through to `RGBA8Unorm`, and a pipeline drawing into such a target is
+    compiled against an attachment format the texture does not have.
+
+    **Latent, and found by making a switch exhaustive rather than by rendering
+    anything.** Nothing on either side of this port creates a one- or
+    two-channel render target: the frame target is BGRA8, the depth copy is
+    R32Float, `_currentRender` and `_scratch` are RGBA8. Until step 10 the
+    function ended in `default: return PixelFormat::RGBA8Unorm`, which is a wrong
+    answer wearing a right one; step 10 replaced the default with the cases, so
+    the two byte formats are now *named* as falling through and a format added
+    without an attachment format is a compile error instead. Naming a wrong
+    answer is not fixing it, which is why this entry exists. The fix is two
+    `PixelFormat` members and the two backends' `toMetalFormat` /
+    `toDXGIFormat` cases for them, and it is worth an hour the day something
+    wants an R8 target — a stencil-shadow accumulation buffer or a downsampled
+    luminance chain would be the first.
 
 ### Checked, and *not* gaps
 
@@ -4012,6 +4194,323 @@ on `com_wipeSeconds 10` rather than off a counter on `ShowLoadingGui`'s loop. Th
 fix follows from the measured half either way: a command buffer that is submitted
 between screens cannot accumulate them.
 
+#### Step 10 — compressed textures, and Doom 3's own mip chains: gaps 4 and 23 — **done**
+
+Two entries on §5's list closed in one step, because they are one idea counted
+twice: a block-compressed texture has no way to have a mip chain built for it —
+a 4x4 block is not four numbers to take a mean of — so the format and the
+supplied chain had to arrive together or neither would have been usable. Gap 4 is
+the oldest entry on that list, written before the port began from reading the
+pk4; gap 23 is one of the ones walking real content turned up.
+
+**What the port was doing, and what it cost.** `glConfig.textureCompressionAvailable`
+was `false`, and that flag is what `idImage::CheckPrecompressedImage` tests
+*before* it opens a file — so the engine was not decompressing the `.dds` files,
+it was never looking at them. It decoded the `.tga` beside each one instead,
+expanded every internal format to RGBA8 and uploaded that. And `UploadImageLevel`
+took level 0 and returned for the rest, so Doom 3's own chain was thrown away and
+eacp rebuilt one from level 0. On a `demo_mars_city1` load that is **1.9–2.2 s of
+a 3.3–4.0 s level load** spent in `idImageManager::EndLevelLoad`, and **462 MB**
+of RGBA8 on the GPU where the files hold 83 MB.
+
+**The eacp side is a format list and a descriptor field**, and §5's entries 4 and
+23 carry the design. Four `TextureFormat` members, `bytesPerPixel` replaced
+throughout by `levelBytesPerRow` / `levelRows` / `levelBytes` so that one set of
+functions sizes both kinds of format, `Device::supportsBlockCompression`, and
+`TextureDescriptor::mipLevels` for a chain the caller built. A field on the
+descriptor rather than an argument to `update()` — which is the shape gap 23's
+own entry had guessed — because both APIs fix a level count when the *resource*
+is created, so a chain handed over afterwards has nowhere to go. **303 GPU tests,
+from 282**; the D3D12 half is written and unrun, the eacp host being macOS-only
+(§8).
+
+**The port's side had to grow an accumulator, and that is the part worth
+reading.** The seam uploads one level of one face at a time and has no end
+marker, because `glTexImage2D` never needed one: a texture object already exists,
+and a level arrives into it. A backend that cannot create a texture until it
+knows how many levels are coming has to gather them. So `AllocImage` — the first
+act of each of the three loaders — opens a pending upload, each upload writes its
+level at its own offset in a buffer sized by `mipChainBytes`, and the texture is
+built at the end. It is the cube accumulation this backend already had,
+generalised: the cube was six faces gathered because eacp takes them as one
+block, and this is the same fact one dimension further on.
+
+**The end is a new seam call, `FinishImage`, rather than a second meaning for
+`SetImageFilterAndRepeat`**, and the alternative is worth writing down because it
+looks equivalent from two of the three loaders. `GenerateImage` and
+`UploadPrecompressedImage` do both end in that call. `GenerateCubeImage` makes
+its own `SetCubeImageFilterAndRepeat` call **before** it uploads a single face —
+so a contract that read "the filter call means the upload is over" would have
+been wrong on a third of its callers, and wrong in a way that only shows up as a
+cube with no texture. An explicit name also gives the accumulation's rules one
+comment instead of two, and is a no-op on a backend that creates its texture as
+the first level arrives, which is what the OpenGL one did.
+
+`SetImageMaxLevel` has nothing left to do, and that is a closure rather than an
+omission: what `GL_TEXTURE_MAX_LEVEL` said — "the chain stops here, do not sample
+below it" — is said on eacp by the level count the texture is created with, and
+that count is how many levels the upload actually handed over. A `.dds` whose
+chain stops at 8x8 uploads those levels and gets a texture with exactly them.
+
+**Three commits: two that change the picture, in different ways, and a third
+that a read-only review of the first two asked for.**
+
+**`cacd26d`, the chain.** Verified by eye first, because the gate cannot tell one
+chain from another: `image_colorMipLevels 1` set *before* the map load, a pinned
+2048x1536 shot at `com_fixedTic 1` at camera stop 7, and the tinted levels band
+away down the floor — red, green, red — which cannot appear if eacp is building
+the chain from level 0. Then the gate, which moves **297 of 297 frames**:
+
+| frame | camera stop | mean of 255 | worst pixel | pixels moved | by > 8 |
+| --- | --- | --- | --- | --- | --- |
+| `reference_00104` | stop 7, the busiest of the tour | **0.884** | 34 | 58.3% | 0.98% |
+| `reference_00166` | stop 11 | 0.495 | **76** | 47.0% | 0.39% |
+| `reference_00247` | the quietest frame | 0.026 | | | |
+| **whole tour** | 297 frames | **0.346** | 76 | | |
+
+**The difference image is not edges and not a border**, which is what says this
+is the filter rather than the border rule: it is spread evenly over every
+mipmapped surface with the flat interiors as bright as the trim, and the signed
+per-channel means on the worst frame are −0.83, −0.88, −0.81. That is one fact
+and it is arithmetic: `R_MipMap` averages a 2x2 block with `>>2`, which
+truncates, and eacp's `halveBytes` uses `(sum + 2) / 4`, which rounds to nearest.
+Doom 3's chain is a fraction of a level darker per level, compounding down the
+chain, so the picture is fractionally darker wherever a mip is sampled — which is
+Doom 3's own picture, and the point of the change. `preserveBorder` is in the
+same commit and shows nowhere the tour looks, exactly as gap 23's entry predicted
+it would not.
+
+**`4bb33ea`, the files.** `Init` asks the device rather than asserting, the
+compressed upload maps the GL name to the eacp format and **checks the level's
+byte count against its dimensions** — a disagreement means the file is not the
+shape its header claims and copying anyway reads past the end of the buffer the
+whole file was read into — and `UploadImageLevel` learned the three uncompressed
+`.dds` layouts, of which `GL_BGR_EXT` is the only source in this port that is
+three bytes a pixel. The demo has 5 of the 32-bit form and 38 of the 24-bit one
+and none of the 8-bit one.
+
+**One nuance is carried rather than solved, and the content says it does not
+arise here.** GL had two DXT1 names and both APIs have one.
+`GL_COMPRESSED_RGB_S3TC_DXT1_EXT` — a `.dds` without `DDPF_ALPHAPIXELS` —
+promised alpha 1 whatever the blocks said, where `BC1_RGBA` decodes the
+three-colour mode's fourth index as alpha 0, so a block a compressor emitted in
+that mode for quality would sample transparent here and opaque on OpenGL. **All
+986 of the demo's loaded DXT1 images are `DXT1A`**, the alpha-pixels flag being
+set on every one, so this port never takes the branch. Named because a mod might,
+and because "a DXT1 texture has holes in it" should have somewhere to be looked
+up: the fix would be an `isOpaqueBC1` flag threading a `.a = 1` through every
+shader variant that samples a diffuse map, which is a large change for a
+difference nothing has yet produced.
+
+The uncompressed `.dds` shapes are covered by five images and the small one is
+the interesting one. Four are 32-bit `GL_BGRA_EXT` — `guis/assets/marscity/fullline`
+and `fullpath`, which are the Mars City wall maps, `shotgun2_local` and
+`makealpha( models/items/flashlight/beam1)` — and the fifth,
+`textures/sfx/black_2`, is 4x4 and 24-bit, so **`GL_BGR_EXT` is exercised exactly
+once in the demo**. It is the only source in this port that is three bytes a
+pixel, which is why it is the one the conversion's comment names. The one-byte
+`GL_ALPHA` form has no user here at all; it is written and unexercised, like the
+BC7 mapping beside it.
+
+The measurements, three runs a side, the `before` cfg and driver copied verbatim:
+
+| | before | after |
+| --- | --- | --- |
+| `msec to load game/demo_mars_city1` | 3853 / 4012 / 3352 | **1764 / 1730 / 1732** |
+| `all images loaded in` | 2.1 / 2.2 / 1.9 s | **0.4 / 0.4 / 0.4 s** |
+| `listImages` total | 2135 images, 328.1–328.4 MB | 2135 images, **147.0 MB** |
+| bytes uploaded, every level counted | **462.4 MB** | **140.1 MB** (72.3 blocks + 67.8 RGBA8) |
+| images flagged `P` | 0 of 2135 | **1934** |
+| peak RSS | 3030 / 3044 / 3569 MB | 3273 / 3318 / 3521 MB |
+| steady RSS | 903 / 901 / 908 MB | **564 / 566 / 570 MB** |
+| `footprint` total at t=12 | 5721 MB | **5355 MB** |
+| IOAccelerator (graphics) | 5082 MB, 3056 regions | **4750 MB, 2390 regions** |
+| `Couldn't load image:` | 18 lines, 9 assets | **0** |
+| `compressed texture upload is not implemented` | 0 | 0 |
+| `eacp:` lines | 2 | 3 |
+
+The `-fmt-` histogram moves from RGB5 998 / RGBA8 587 / RGBA4 264 / LA 219 /
+RGB8 58 / I 9 to **DXT1A 986 / DXT3 490 / DXT5 453 / RGBA8 135 / RGB8 64 / I 7**,
+and the `listImages` dump diffs against the before one — ignoring the
+`_cinematic` line the before-report names — as **1928 images changing flag and
+format and no image appearing or disappearing**. The `RGBA4 -> DXT3` and
+`LA -> DXT3` rows are worth a glance: those images were being counted at 16 bits
+and stored at 32, and are now counted and stored at 8.
+
+**Three things the numbers said that the before-measurement had not predicted.**
+
+**The `P` count is 1934, not the 2087 the before-report expected**, and the 153
+are Doom 3's own rules rather than this port's. **133 have a `.dds` the pk4
+records as older than the `.tga` beside it** — `dds/textures/black.dds` is
+2004-07-01 against `textures/black.tga` at 2004-08-04 — and
+`CheckPrecompressedImage` reads that as "the image has changed after being
+precompressed" and takes the `.tga`. 20 are `lights/`, which the same function
+refuses outright above `com_machineSpec 0`, that being id's own "god i love last
+minute hacks" comment. The remaining 25 are the ones the before-report named:
+seven `env/*` cubes, there being no `dds/env/` in the pk4 at all, and eighteen
+demo main-menu images.
+
+**All 18 `Couldn't load image:` warnings are gone**, and that is the same fact
+from the other side. The nine BFG and plasmagun assets the demo pk4 ships no
+`.tga` for do have a `.dds`, so with the flag on they load: nine images that were
+`_default` at 16x16 are real textures now. It is the whole of the warning diff
+between the before and after logs.
+
+**The graphics footprint barely moved, and it is not the textures.** Texel bytes
+fell 3.3× and IOAccelerator (graphics) fell 6.5%, 5082 → 4750 MB, three runs of
+three identical to the megabyte on each side. Two probes say what it is not.
+Forcing every image down to 64x64 — `listImages` 147.0 → 61.8 MB, regions 2390 →
+1425 — leaves it at **4672 MB**, so it tracks neither the bytes nor, much, the
+texture count. Loading the same map twice adds **515 MB** rather than doubling
+it, so it is a high-water mark rather than a per-load leak. The boot baseline is
+unchanged at 33 MB in 159 regions for 176 images, where it *is* proportional to
+the pixels. So about **4.6 GB of GPU-side memory is established by the first
+level load and is not texel data**; the shape of the suspect is step 8's arena,
+which appends rather than replaces and sees the whole load inside one frame, but
+that is a guess and this is a thing to measure on its own rather than to assert.
+It is not numbered as an eacp gap on a guess.
+
+**The gate is 297 of 297 identical between the first two commits, and why is the
+thing to read before trusting the gate again.** `gate.sh` gives every run a fresh game
+directory, so `config.spec` is missing, so `idCommonLocal::Init` runs
+`SetMachineSpec` and `Com_ExecMachineSpec` — and this machine detects as spec 3,
+"ultra", whose preset sets `image_usePrecompressedTextures 0` and
+`image_useCompression 0`. **Every baseline this port has ever captured was taken
+with compressed textures switched off by Doom 3's own configuration**, so the
+second commit is genuinely a no-op there and the whole of step 10's gate move is
+the first commit's 0.346. `regression/README.md` says so now.
+
+**And it is not only the gate.** Ultra is what `SetMachineSpec` gives any machine
+of this class on its first run, and it is what the archived config on this one
+holds — `com_machineSpec 3`, `image_usePrecompressedTextures 0`,
+`image_useCompression 0` — so the game as played here has never opened a `.dds`
+either, on this build or on the SDL/GL one before it. Every number in the table
+above is for a configuration that leaves the two cvars at their defaults of 1:
+any spec below ultra, or the cvars set by hand, which is what the measurement
+cfg does. The trade was id's, in 2004, for a card with memory to spare —
+uncompressed art at the cost of the load — and whether it is still the right
+trade on a machine where the compressed load takes 1.7 s and the picture moves
+1.04 of 255 is a decision about a default rather than a step of this port. §8
+carries it as an open question rather than an answer.
+
+So the `.dds` picture is measured the way step 9 measured multisampling: the
+reference demo replayed twice at the same 297 instants, with an empty
+`config.spec` placed in the game directory so the preset never runs, once at
+`image_usePrecompressedTextures 0` and once at 1.
+
+| frame | camera stop | mean of 255 | worst pixel | pixels moved | by > 8 |
+| --- | --- | --- | --- | --- | --- |
+| `reference_00033` | stop 3 | **2.085** | 134 | 84.5% | 5.98% |
+| `reference_00215` | stop 14 | 1.246 | **251** | 74.3% | 2.35% |
+| `reference_00264` | stop 17, the quietest frame | 0.167 | | | |
+| **whole tour** | 297 frames | **1.040** | 251 | | |
+
+Two runs of the same configuration are byte-identical, so the floor is **0.000**
+and the 1.040 is all signal. The amplified difference is what DXT looks like:
+panel edges, specular highlights and a faint 4x4 grain through the mid-tones,
+with flat interiors black. A recapture of the gate itself, `step10-dds2`, is 297
+of 297 against `step10-dds`, so the new baseline is deterministic.
+
+**A level load under `MTL_DEBUG_LAYER=1` with `MTL_SHADER_VALIDATION=1` prints
+nothing but the two "Validation Enabled" lines**, which is the check that matters
+most here: Metal wants a compressed `replaceRegion` either aligned to the 4x4
+block grid or reaching the edge of the level, and a release runtime says nothing
+when it is neither.
+
+**`7d488f5`, the review's commit, and the two things it found are both about what
+happens around the accumulation rather than in it.** The state machine itself
+came through a read-only review correct on every loader path — offsets, ordering,
+the cube sweep, short chains, `GetDownsize`'s renumbering, the bump convention,
+the scratch and cinematic paths, `vid_restart`.
+
+The first is a **heap over-read this branch introduced**, and it is under a
+comment that claimed to prevent it. `UploadCompressedImageLevel` checks its
+`numBytes` against `levelBytes(format, w, h)` and the comment said that was the
+bounds guard; it is not, and it cannot be, because the loader computes `numBytes`
+from the level's *own dimensions* with the same block arithmetic `levelBytes`
+uses — for every format either can name the two agree by construction and the
+branch is dead. What leaves the buffer is the **source pointer**:
+`UploadPrecompressedImage` walks `imagedata += size` for as many levels as the
+header's `dwMipMapCount` claims and never compares it with `data + len`, so a
+`.dds` announcing eleven levels with one in the payload hands the backend a
+pointer past the end of the `R_StaticAlloc` the file was read into. That was
+inert for as long as the backend only *measured* the pointer — before `4bb33ea`
+this function never touched `data` — and became a read the moment it started
+copying from it. The bound belongs in the loader, that being the only layer that
+knows `len`, and it stops rather than skips: the levels above are already
+uploaded and `numMipmaps` is corrected so the "chain stops short" block describes
+what arrived. The backend's check stays as a cheap invariant against a future
+loader that sizes a level some other way, with a comment that no longer claims to
+be anything else.
+
+The second is **re-entrancy through a print**, and it is the assumption in the
+pending slot's own comment — "image loading is one image at a time" — being not
+quite true. `common->Warning` reaches `idCommonLocal::VPrintf`, which calls
+`session->PacifierUpdate()`, which during a map change runs a whole
+`UpdateScreen()` every 100 ms. That draws GUIs, so it can `Bind()` an unloaded
+image into `ActuallyLoadImage → GenerateImage → AllocImage`; and it runs
+`RB_ExecuteBackEndCommands`, whose first act is `CompleteBackgroundImageLoads()
+→ UploadPrecompressedImage → AllocImage` under `image_useCache 1` — which only
+became reachable at all when this step turned `textureCompressionAvailable` on,
+since `ShouldImageBePartialCached` is gated on it. Either overwrites
+`pendingImage` and `pendingPixels`, and the outer upload then drops its remaining
+levels and finishes with no texture, silently. So the four prints that can happen
+with the slot open **defer**: the message is stored and printed by `FinishImage`
+after the texture is built, or by `AllocImage` *before* it claims the slot — that
+order being the point, since a re-entrant load has to find the slot free, run to
+completion and give it back. `FinishImage` also says so now when an image closes
+with no texture, which had four causes and no voice, one of them a real defect: a
+mip-less `.dds` above `image_downSizeLimit` has its only level skipped as
+oversized and uploads nothing.
+
+The rest of the review's list is comments that had gone stale and small
+tightenings: two exits of `UploadPrecompressedImage` that ran after `AllocImage`
+and skipped `FinishImage`, `AllocImage` nulling `backendTexture` instead of
+releasing it (a leak whenever an image that already had one reaches it, which a
+background cache load on a `reloadImages`-recreated image does), one warning flag
+gating two unrelated warnings, and `R_EacpBlockFormat`'s `default` returning BC7
+— where a GL name added without a mapping would have been uploaded as BC7 blocks
+and nothing could have noticed, a BC7 and a DXT3 block both being sixteen bytes.
+It also caught the encoder's scope being wrong wherever it was stated, which §5's
+entry 4 now carries as a measured **9 images and 12.8 MB** rather than a guess.
+
+**Nothing in it changes what well-formed content does**: the same log — 0
+"compressed texture upload is not implemented", 0 `Couldn't load image:`, three
+`eacp:` lines, a warning summary identical to `4bb33ea`'s, 147.0 MB in
+`listImages` — and the gate **297 of 297 identical to `step10-final`**, the
+baseline taken after eacp's own review fixes landed in its working tree.
+
+**The by-eye checks, since three things this step touches have no gate.** The
+`image_colorMipLevels` shot above is the first. The seven `env/*` cubes still
+load — same names, same dimensions, zero `Couldn't load cube image` warnings, and
+their format line moves `RGB5 -> RGB8`, which is the honest-`internalFormat`
+correction visible in the one place it is easiest to check — and the sheen on the
+bulkheads at the tour's last stop is one of them on screen. The demo main menu draws
+correctly through `disconnect`: the logo, the Mars globe, the star field and the
+eighteen `guis/assets/mainmenu/demo/*` frames behind the buttons. The menu is not
+an instrument (§6, step 9) so there is no number beside it, and none is wanted —
+what is being checked is that images with no `.dds` still take the `.tga` path.
+
+**Where eacp's half stands.** Uncommitted, in the `~/Code/eacp` working tree on
+`develop`, awaiting the user's own commit as steps 7, 8 and 9 did before it: 11
+files changed plus `Tests/GPU/CompressedTextureTests.cpp` and
+`Tests/GPU/SuppliedMipChainTests.cpp`, the GPU suite at 303 from 282. One thing
+was found there and is not a bug: `pixelFormatFor` mapped the one- and
+two-channel byte formats to a four-channel attachment through a `default:` label,
+which making the switch exhaustive turned from an invisible wrong answer into a
+named one. §5's gap 29.
+
+**The build tree had to be repointed, and it is the same trap step 9 wrote up.**
+`cmake-build-release` held no `CPM_eacp_SOURCE` — CLion had reconfigured it since
+step 9 and it was building CPM's own clone of `develop` under `_deps/eacp-src`,
+at `7ce3c05`, which does not have this step's eacp change. The override is back,
+and the first thing done with it was a capture on the *unmodified* port against
+the eacp working tree: **297 of 297 identical to `fixedtic2`**, which is what
+says the eacp half costs the existing path nothing and makes every number above
+attributable to the port's own commits. (`CPM_imgui-eacp_SOURCE` is not needed
+any more: imgui-eacp's step-8 change is committed, both checkouts are at
+`0d51b3c`, and it builds either way.)
+
 ### Shader inventory for Phase 2
 
 Roughly 10–15 EDSL programs, each in the sampling variants §4.3 sizes — 8 worst case
@@ -4474,6 +4973,50 @@ commit. The one defect it turned up on the way — a live in-game frame black un
 under a fixed tic": a level load was putting thousands of render passes on the
 one command buffer an eacp frame is, which the arena made reachable rather than
 caused, and the backend now submits the screen before each present on its own.
+
+~~**The `.dds` files, and Doom 3's own mip chains.**~~ — **done**, step 10 in §6,
+and §5's gaps 4 and 23 with it. Gap 4 is the oldest entry on that list, and this
+is the only place on this page where the port turned out to be reading the *wrong
+half of the pk4*: `textureCompressionAvailable` was false, which shuts
+`CheckPrecompressedImage` before it opens a file, so the `.dds` beside all but a
+handful of the tour map's images was never looked at and the `.tga` was decoded
+and uploaded as RGBA8 instead. Gap 23 had to close in the same step, a compressed
+texture having no way to have a chain built for it. eacp grew four BC formats,
+`Device::supportsBlockCompression` and `TextureDescriptor::mipLevels`; the port
+grew an accumulator, because a seam that uploads a level at a time has no end
+marker and an API that fixes a level count at creation needs one — `FinishImage`,
+named rather than folded into `SetImageFilterAndRepeat`, which
+`GenerateCubeImage` calls *before* its first upload. **Image loading goes from
+1.9–2.2 s of a 3.3–4.0 s level load to 0.4 s of a 1.73–1.76 s one**, the bytes on
+the GPU from 462 to 140 MB, the steady RSS from 905 to 567 MB, and the 18
+`Couldn't load image:` warnings to zero — the nine assets the demo ships no
+`.tga` for do have a `.dds`. The gate moves 297 of 297 by **0.346 of 255**, all
+of it the first commit's, because `R_MipMap` truncates where eacp's filter rounds
+to nearest; the second commit is byte-identical on the gate for a reason worth
+knowing, which is that every baseline this port has ever captured ran at machine
+spec "ultra", whose preset turns compressed textures *off*. Measured instead by
+replaying the demo with the preset suppressed: **1.040 of 255** over the tour
+against a 0.000 floor. A third commit is the read-only review's: a heap over-read
+on a malformed `.dds`, a warning printed mid-upload that could re-enter the image
+loader and take the pending slot from the upload that printed it, and the stale
+comments around both — 297 of 297 either way. eacp's half is uncommitted on
+`develop`, awaiting the user's own commit, and one thing it turned up is §5's
+gap 29.
+
+**Two things step 10 leaves open, and neither is a step yet.** The first is a
+measurement: a `demo_mars_city1` load leaves about **4.6 GB** of IOAccelerator
+memory behind that is neither the texel bytes (which fell 3.3× and moved it 6.5%)
+nor the texture count (every image forced to 64x64 moved it 8%), and that a
+second load of the same map raises by 515 MB rather than doubling — a high-water
+mark the first load establishes. The suspect is step 8's arena seeing the whole
+load inside one frame, and a suspect is not a finding; it wants an instrument
+of its own before it gets a gap number. The second is a default: ultra, which
+`SetMachineSpec` hands this machine and the archived config here holds, turns
+the `.dds` path off, so everything step 10 bought is off unless the two cvars
+are set by hand. Whether a 2004 trade of load time for uncompressed art still
+holds on a machine where the compressed load is 1.7 s and the picture moves
+1.04 of 255 is the user's call about a default, not a port step, and it is
+written here so that it is made rather than inherited.
 
 **Why 4e.8 went before step 5 rather than after it, in one number.** At the
 tour's second camera stop the two builds disagreed by 0.458 of 255, and the heat
