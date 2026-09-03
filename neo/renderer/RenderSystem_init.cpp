@@ -503,27 +503,11 @@ void R_InitOpenGL( void ) {
 		R_SetColorMappings();
 	}
 
-#ifdef _WIN32
-	static bool glCheck = false;
-	if ( !glCheck && win32.osversion.dwMajorVersion == 6 ) {
-		glCheck = true;
-		if ( !idStr::Icmp( glConfig.vendor_string, "Microsoft" ) && idStr::FindText( glConfig.renderer_string, "OpenGL-D3D" ) != -1 ) {
-			if ( cvarSystem->GetCVarBool( "r_fullscreen" ) ) {
-				cmdSystem->BufferCommandText( CMD_EXEC_NOW, "vid_restart partial windowed\n" );
-				Sys_GrabMouseCursor( false );
-			}
-			int ret = MessageBox( NULL, "Please install OpenGL drivers from your graphics hardware vendor to run " GAME_NAME ".\nYour OpenGL functionality is limited.",
-				"Insufficient OpenGL capabilities", MB_OKCANCEL | MB_ICONWARNING | MB_TASKMODAL );
-			if ( ret == IDCANCEL ) {
-				cmdSystem->BufferCommandText( CMD_EXEC_APPEND, "quit\n" );
-				cmdSystem->ExecuteCommandBuffer();
-			}
-			if ( cvarSystem->GetCVarBool( "r_fullscreen" ) ) {
-				cmdSystem->BufferCommandText( CMD_EXEC_APPEND, "vid_restart\n" );
-			}
-		}
-	}
-#endif
+	// A Windows-only "please install OpenGL drivers from your graphics hardware
+	// vendor" message box stood here, for Vista's Microsoft-supplied
+	// OpenGL-over-D3D wrapper. It was reached through win32.osversion, which
+	// went with the rest of Win32Vars_t, and it asks about a renderer this
+	// build does not have.
 }
 
 /*

@@ -377,7 +377,13 @@ idHashTable<Type>::GetSpread
 */
 template< class Type >
 int idHashTable<Type>::GetSpread( void ) const {
-	int i, average, error, e;
+	// numItems was never declared. The bug survived because this function is
+	// dead - the only two calls to it in the tree are commented out in
+	// cm/CollisionModel_load.cpp - and because the two compilers that ever saw
+	// it disagree: gcc and clang skip the whole definition on the #if above,
+	// and MSVC's delayed template parsing never looks inside an uninstantiated
+	// template. clang-cl is neither, and parses it.
+	int i, average, error, e, numItems;
 	hashnode_s	*node;
 
 	// if no items in hash

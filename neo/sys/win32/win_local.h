@@ -29,56 +29,27 @@ If you have questions concerning this license or the applicable additional terms
 #ifndef __WIN_LOCAL_H__
 #define __WIN_LOCAL_H__
 
-#if defined(_MFC_VER) && !defined(_D3SDK) && !defined(GAME_DLL)
-#define _ATL_CSTRING_EXPLICIT_CONSTRUCTORS	// prevent auto literal to string conversion
-#include "tools/comafx/StdAfx.h"
-#endif
+/*
+What every sys/win32/ file needs before it can say anything: the Windows
+headers, in the order winsock2 has to come first in, and the two engine headers
+they are all written against.
+
+It used to declare rather more - Sys_CreateConsole/Sys_DestroyConsole and
+Conbuf_AppendText for the early console window, Win_GetScanTable/Win_MapKey for
+the DirectInput layer, Win_SetErrorText, and the Win32Vars_t that held the
+window handle, the module handle and the OS version. eacp owns the window and
+the input on this host, so none of the three files below has a use for any of
+it; win_main.cpp says which of them went and why.
+*/
 
 #define WIN32_LEAN_AND_MEAN
 #include <winsock2.h>
+#include <windows.h>
 #include <mmsystem.h>
 #include <mmreg.h>
 #include <objbase.h>
 
 #include "framework/CVarSystem.h"
 #include "sys/sys_public.h"
-
-#define	WINDOW_STYLE	(WS_OVERLAPPED|WS_BORDER|WS_CAPTION|WS_VISIBLE | WS_THICKFRAME)
-
-void	Sys_CreateConsole( void );
-void	Sys_DestroyConsole( void );
-
-void	Win_SetErrorText( const char *text );
-
-const unsigned char *Win_GetScanTable( void );
-int		Win_MapKey (int key);
-
-void Conbuf_AppendText( const char *msg );
-
-struct Win32Vars_t {
-	HWND			hWnd;
-	HINSTANCE		hInstance;
-
-	OSVERSIONINFOEX	osversion;
-
-#ifdef ID_ALLOW_TOOLS
-	HDC				hDC; // handle to device
-	HGLRC			hGLRC; // handle to GL rendering context
-	PIXELFORMATDESCRIPTOR pfd; // for ChoosePixelFormat
-	const int* piAttribIList; // for wglChoosePixelFormatARB, if available, set in GLimp_Init()
-
-	// the following are set in GLimp_Init()
-	BOOL(WINAPI *wglChoosePixelFormatARB) (HDC hdc, const int* piAttribIList,
-		 const FLOAT* pfAttribFList, UINT nMaxFormats, int* piFormats, UINT* nNumFormats);
-	BOOL(WINAPI *wglGetPixelFormatAttribivARB) (HDC hdc, int iPixelFormat,
-		 int iLayerPlane, UINT nAttributes, const int* piAttributes, int* piValues);
-#endif
-
-	static idCVar	win_outputDebugString;
-	static idCVar	win_outputEditString;
-	static idCVar	win_viewlog;
-};
-
-extern Win32Vars_t	win32;
 
 #endif /* !__WIN_LOCAL_H__ */

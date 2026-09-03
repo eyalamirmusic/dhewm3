@@ -2609,15 +2609,11 @@ idSessionLocal::UpdateScreen
 */
 void idSessionLocal::UpdateScreen( bool outOfSequence ) {
 	D3P_ScopedCPUSample(Session_UpdateScreen);
-#ifdef _WIN32
 
-	if ( com_editors ) {
-		if ( !Sys_IsWindowVisible() ) {
-			return;
-		}
-	}
-#endif
-
+	// An "is the game window even on screen?" early-out lived here, for the
+	// Windows editors: they hid it while they had it, and drawing into a hidden
+	// window was wasted work. It went with Sys_IsWindowVisible, which was the
+	// only thing that ever answered it.
 	if ( insideUpdateScreen ) {
 		return;
 //		common->FatalError( "idSessionLocal::UpdateScreen: recursively called" );

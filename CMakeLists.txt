@@ -1,7 +1,6 @@
 # dhewm3 - a Doom 3 source port, on the eacp platform layer.
 #
-# This fork supports macOS. The Windows host is named in plan.md and not
-# written yet.
+# This fork supports macOS and Windows.
 # The actual buildsystem lives in neo/, this file just wires it up so that
 # `cmake -B build` works from the repository root.
 

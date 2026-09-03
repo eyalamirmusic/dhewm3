@@ -1,6 +1,6 @@
 # dhewm3 - a Doom 3 source port, on the eacp platform layer.
 #
-# Supported target: macOS.
+# Supported targets: macOS and Windows.
 # Everything is driven from the repository root, see ../CMakeLists.txt.
 
 # dhewm3 used to be configured by pointing CMake at neo/ directly. That still half-works
@@ -10,18 +10,20 @@ if(CMAKE_CURRENT_SOURCE_DIR STREQUAL CMAKE_SOURCE_DIR)
 	message(FATAL_ERROR "Configure from the repository root, not from neo/, e.g. `cmake -B build`")
 endif()
 
-# Step 5 deleted the SDL host, and with it the only Windows host this tree ever
-# had. What Windows needs instead - the sys/win32/win_main.cpp split, the same
-# shape as the sys/osx/DOOMController.mm one that produced sys/eacp/Platform.mm -
-# is a pass of its own, named in plan.md and not written. sys/win32/ is still in
-# the tree for it.
-if(NOT APPLE)
-	message(FATAL_ERROR "This fork of dhewm3 currently only supports macOS; the eacp host for Windows is not written yet (see plan.md).")
+# Two hosts, one platform layer. eacp owns the window, the input, the GPU and the
+# main loop on both of them; what differs is the Sys_ layer underneath - the
+# paths, the DLLs, the clock, the console output - which is sys/posix/ plus
+# sys/eacp/Platform.mm on macOS and sys/win32/ on Windows. See plan.md, Phase 2
+# step 11.
+if(NOT APPLE AND NOT WIN32)
+	message(FATAL_ERROR "This fork of dhewm3 supports macOS and Windows; there is no eacp host for this platform.")
 endif()
 
-# sys/osx/ and sys/eacp/ contain Objective-C(++) sources
-enable_language(OBJC)
-enable_language(OBJCXX)
+if(APPLE)
+	# sys/osx/ and sys/eacp/ contain Objective-C(++) sources
+	enable_language(OBJC)
+	enable_language(OBJCXX)
+endif()
 
 include(CheckCXXCompilerFlag)
 
@@ -60,25 +62,9 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 # Dependencies
 # --------------------------------------------------------------------------- #
 
-if(APPLE)
-	# Homebrew keeps openal-soft keg-only (macOS ships its own, deprecated, OpenAL),
-	# so it isn't in CMake's default search path - add it if it's installed.
-	find_program(BREW_EXECUTABLE brew)
-	if(BREW_EXECUTABLE)
-		execute_process(COMMAND "${BREW_EXECUTABLE}" --prefix openal-soft
-		                OUTPUT_VARIABLE brew_openal_prefix
-		                OUTPUT_STRIP_TRAILING_WHITESPACE
-		                ERROR_QUIET)
-		if(brew_openal_prefix)
-			list(APPEND CMAKE_PREFIX_PATH "${brew_openal_prefix}")
-		endif()
-	endif()
-endif()
-
-# Note: this deliberately requires openal-soft's CMake config package. macOS also
-# ships an OpenAL.framework, but it's deprecated and puts its headers in OpenAL/
-# instead of the AL/ that dhewm3 (and every other openal-soft user) includes.
-find_package(OpenAL REQUIRED CONFIG)
+# Homebrew's on macOS, fetched and built on Windows - ../CMake/OpenALSoft.cmake
+# says why the two differ. Either way this defines OpenAL::OpenAL.
+include(OpenALSoft)
 
 find_package(CURL)
 if(CURL_FOUND)
@@ -153,6 +139,16 @@ if(MSVC)
 	)
 	# TypeInfo.cpp does "#define private public"
 	add_compile_definitions(_ALLOW_KEYWORD_MACROS)
+
+	# Doom 3's event system casts every handler to eventCallback_t, which is
+	# `void (idClass::*)()`, and calls it back through that type. MSVC sizes a
+	# pointer-to-member from the inheritance graph of the class it points into,
+	# so idActor's and idClass's are not the same width and the cast is an
+	# error rather than a warning. /vmg gives every member pointer the general
+	# representation, which is the one that makes the cast mean what the code
+	# has always assumed it means. (Itanium-ABI compilers - the macOS host's -
+	# have one representation and never had the question.)
+	add_compile_options(/vmg)
 
 	set(CMAKE_C_FLAGS_DEBUG				"-D_DEBUG /Od /Zi /MDd")
 	set(CMAKE_C_FLAGS_RELEASE			"/Ox /Oy /MD")
@@ -240,9 +236,14 @@ if(APPLE)
 	add_compile_definitions(MACOS_X=1)
 else()
 	set(os "windows")
+	# Windows 10 and up. Doom 3 asked for 0x0501 (XP) and upstream dhewm3 kept
+	# it; eacp is a D3D12 library and compiles against a far newer SDK than that
+	# in the same translation units, so the two have to agree on the higher one.
 	add_compile_definitions(
-		WINVER=0x0501
-		_WIN32_WINNT=0x0501
+		WINVER=0x0A00
+		_WIN32_WINNT=0x0A00
+		WIN32_LEAN_AND_MEAN
+		NOMINMAX
 	)
 endif()
 
@@ -744,32 +745,51 @@ set(src_renderbackend
 	renderer/RenderProgs_Eacp.h
 	renderer/RenderProgs_Eacp.cpp)
 
+# The eacp host: the window, the view that drives the frame, the input layer and
+# the ImGui platform backend. Every file here is portable C++ - the one that was
+# not is Platform.mm, and the Windows half of it is sys/win32/win_main.cpp.
 set(src_sys
 	sys/eacp/App.h
 	sys/eacp/Main.cpp
 	sys/eacp/View.h
 	sys/eacp/View.cpp
 	sys/eacp/Platform.h
-	sys/eacp/Platform.mm
 	sys/eacp/GLimp.cpp
 	sys/eacp/Input.h
 	sys/eacp/Input.cpp
 	sys/eacp/ImGuiBackend.h
 	sys/eacp/ImGuiBackend.cpp
 
-	# Window-system-free, and shared with the SDL/GL host until step 5 deleted
-	# it: the threading is on the standard library, the rest is POSIX and Cocoa.
+	# Window-system-free, and shared by both hosts: the threading is on the
+	# standard library and the CPU feature detection on the compiler's own
+	# intrinsics.
 	sys/cpu.cpp
 	sys/threads.cpp
 	sys/sys_local.cpp
-	sys/posix/posix_net.cpp
-	sys/posix/posix_main.cpp
-	sys/osx/macosx_misc.mm
 
 	sys/platform.h
 	sys/sys_local.h
 	sys/sys_public.h
 )
+
+# And the Sys_ layer under it, which is the one thing that is per-host. Both
+# sides are the same 30-odd entry points: paths, directory listings, DLLs, the
+# clock, the console output, the clipboard and the sockets.
+if(APPLE)
+	list(APPEND src_sys
+		sys/eacp/Platform.mm
+		sys/posix/posix_net.cpp
+		sys/posix/posix_main.cpp
+		sys/osx/macosx_misc.mm
+	)
+else()
+	list(APPEND src_sys
+		sys/win32/win_local.h
+		sys/win32/win_main.cpp
+		sys/win32/win_shared.cpp
+		sys/win32/win_net.cpp
+	)
+endif()
 
 # --------------------------------------------------------------------------- #
 # Targets
@@ -797,7 +817,15 @@ endif()
 # deleted the first the day the second passed that gate (plan.md, Phase 2 step
 # 5), and this is what is left.
 if(CORE)
-	add_executable(dhewm3 MACOSX_BUNDLE ${src_core} ${src_sys} ${src_renderbackend})
+	# MACOSX_BUNDLE is the macOS half of what eacp_set_gui_subsystem() does for
+	# Windows below: an app that owns a window rather than a console.
+	if(APPLE)
+		set(exe_kind MACOSX_BUNDLE)
+	else()
+		set(exe_kind "")
+	endif()
+
+	add_executable(dhewm3 ${exe_kind} ${src_core} ${src_sys} ${src_renderbackend})
 	source_group(TREE ${CMAKE_CURRENT_SOURCE_DIR} PREFIX neo FILES ${src_core} ${src_sys} ${src_renderbackend})
 
 	target_include_directories(dhewm3 PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/libs/imgui")
@@ -808,7 +836,17 @@ if(CORE)
 	# and this line is the proof: a surviving reference would not link.
 	# imgui-eacp brings imgui::imgui and eacp-sprites with it, which is where
 	# <imgui.h> and the whole GPU stack come from on this target.
-	target_link_libraries(dhewm3 PRIVATE idlib eacp-gpu imgui-eacp OpenAL::OpenAL "-framework Cocoa")
+	target_link_libraries(dhewm3 PRIVATE idlib eacp-gpu imgui-eacp OpenAL::OpenAL)
+
+	if(APPLE)
+		target_link_libraries(dhewm3 PRIVATE "-framework Cocoa")
+	else()
+		# What sys/win32/ needs and eacp does not already bring: the sockets and
+		# the adapter table for win_net.cpp, the shell for Sys_GetPath's
+		# SHGetFolderPathW and idSysLocal::OpenURL, timeBeginPeriod, and the
+		# symbol lookup the crash handler walks a stack with.
+		target_link_libraries(dhewm3 PRIVATE ws2_32 iphlpapi shell32 ole32 winmm dbghelp)
+	endif()
 
 	if(CURL_FOUND)
 		target_link_libraries(dhewm3 PRIVATE CURL::libcurl)
@@ -833,11 +871,13 @@ if(CORE)
 	# nothing else.
 	set_target_properties(dhewm3 PROPERTIES CXX_STANDARD 20)
 
-	set(bundle_id "org.dhewm3.Dhewm3")
-	set_target_properties(dhewm3 PROPERTIES
-		MACOSX_BUNDLE_BUNDLE_NAME "dhewm3"
-		MACOSX_BUNDLE_GUI_IDENTIFIER ${bundle_id}
-		XCODE_ATTRIBUTE_PRODUCT_BUNDLE_IDENTIFIER ${bundle_id})
+	if(APPLE)
+		set(bundle_id "org.dhewm3.Dhewm3")
+		set_target_properties(dhewm3 PROPERTIES
+			MACOSX_BUNDLE_BUNDLE_NAME "dhewm3"
+			MACOSX_BUNDLE_GUI_IDENTIFIER ${bundle_id}
+			XCODE_ATTRIBUTE_PRODUCT_BUNDLE_IDENTIFIER ${bundle_id})
+	endif()
 
 	# eacp's own: a GUI (non-console) subsystem and the embedded AppInfo the
 	# library reads its name and version out of.
@@ -852,8 +892,21 @@ if(CORE)
 	# frame-for-frame against a baseline taken without it should not quietly
 	# differ in how it is optimized. The plist is the part we came for, and
 	# CMake/Eacp.cmake is what fills EACP_MACOS_PLIST in.
-	set_target_properties(dhewm3 PROPERTIES
-		MACOSX_BUNDLE_INFO_PLIST "${EACP_MACOS_PLIST}")
+	if(APPLE)
+		set_target_properties(dhewm3 PROPERTIES
+			MACOSX_BUNDLE_INFO_PLIST "${EACP_MACOS_PLIST}")
+	endif()
+
+	# openal-soft is fetched and built on Windows (../CMake/OpenALSoft.cmake), so
+	# its DLL is somewhere under _deps rather than on the loader's search path.
+	# Put it next to the executable, which is also where the game libraries and
+	# the demo data land.
+	if(WIN32 AND TARGET OpenAL)
+		add_custom_command(TARGET dhewm3 POST_BUILD
+			COMMAND ${CMAKE_COMMAND} -E copy_if_different
+				"$<TARGET_FILE:OpenAL>" "$<TARGET_FILE_DIR:dhewm3>"
+			VERBATIM)
+	endif()
 endif()
 
 # The game code is built as a shared library that the executable loads at runtime,
@@ -864,9 +917,13 @@ function(add_game_library name sourcedir)
 	target_link_libraries(${name} PRIVATE idlib)
 	target_include_directories(${name} PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/${sourcedir}")
 	target_compile_definitions(${name} PRIVATE GAME_DLL)
-	set_target_properties(${name} PROPERTIES
-		PREFIX ""
-		INSTALL_NAME_DIR "@executable_path")
+	# PREFIX "" so the files are base.dylib / base.dll rather than libbase.*,
+	# which is the name idFileSystemLocal hands Sys_DLL_Load. INSTALL_NAME_DIR is
+	# Mach-O's; a Windows DLL is found next to the .exe with no help.
+	set_target_properties(${name} PROPERTIES PREFIX "")
+	if(APPLE)
+		set_target_properties(${name} PROPERTIES INSTALL_NAME_DIR "@executable_path")
+	endif()
 endfunction()
 
 if(BASE AND NOT HARDLINK_GAME)

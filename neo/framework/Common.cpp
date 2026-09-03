@@ -129,12 +129,6 @@ bool			com_editorActive;		//  true if an editor has focus
 
 bool			com_debuggerSupported;	// only set to true when the updateDebugger function is set. see GetAdditionalFunction()
 
-#ifdef _WIN32
-HWND			com_hwndMsg = NULL;
-bool			com_outputMsg = false;
-unsigned int	com_msgID = -1;
-#endif
-
 #ifdef __DOOM_DLL__
 idGame *		game = NULL;
 idGameEdit *	gameEdit = NULL;
@@ -368,36 +362,11 @@ void idCommonLocal::EndRedirect( void ) {
 	rd_flush = NULL;
 }
 
-#ifdef _WIN32
-
-/*
-==================
-EnumWindowsProc
-==================
-*/
-BOOL CALLBACK EnumWindowsProc( HWND hwnd, LPARAM lParam ) {
-	char buff[1024];
-
-	::GetWindowText( hwnd, buff, sizeof( buff ) );
-	if ( idStr::Icmpn( buff, EDITOR_WINDOWTEXT, strlen( EDITOR_WINDOWTEXT ) ) == 0 ) {
-		com_hwndMsg = hwnd;
-		return FALSE;
-	}
-	return TRUE;
-}
-
-/*
-==================
-FindEditor
-==================
-*/
-bool FindEditor( void ) {
-	com_hwndMsg = NULL;
-	EnumWindows( EnumWindowsProc, 0 );
-	return !( com_hwndMsg == NULL );
-}
-
-#endif
+// EnumWindowsProc and FindEditor were here, and with them the other end of the
+// DMAP_MSGID window message idCommonLocal::DPrintf used to post: a running
+// DOOMEdit was found by its window title and dmap's output was forwarded to it.
+// Radiant is not built by this fork on either host, so nothing was ever on the
+// other end - the removal is the same one that took Sys_ShowWindow with it.
 
 /*
 ==================
@@ -488,24 +457,6 @@ void idCommonLocal::VPrintf( const char *fmt, va_list args ) {
 		session->PacifierUpdate();
 	}
 
-#ifdef _WIN32
-
-	if ( com_outputMsg ) {
-		if ( com_msgID == -1 ) {
-			com_msgID = ::RegisterWindowMessage( DMAP_MSGID );
-			if ( !FindEditor() ) {
-				com_outputMsg = false;
-			} else {
-				Sys_ShowWindow( false );
-			}
-		}
-		if ( com_hwndMsg ) {
-			ATOM atom = ::GlobalAddAtom( msg );
-			::PostMessage( com_hwndMsg, com_msgID, 0, static_cast<LPARAM>(atom) );
-		}
-	}
-
-#endif
 }
 
 /*
@@ -2845,10 +2796,6 @@ int idCommonLocal::AsyncThread(void* arg)
 	return 0;
 }
 
-#ifdef _WIN32
-#include "../sys/win32/win_local.h" // for Conbuf_AppendText()
-#endif // _WIN32
-
 static bool checkForHelp(int argc, char **argv)
 {
 	const char* helpArgs[] = { "--help", "-h", "-help", "-?", "/?" };
@@ -2861,13 +2808,11 @@ static bool checkForHelp(int argc, char **argv)
 		{
 			if (idStr::Icmp(arg, helpArgs[h]) == 0)
 			{
-#ifdef _WIN32
-				// write it to the Windows-only console window
-				#define WriteString(s) Conbuf_AppendText(s)
-#else // not windows
-				// write it to stdout
+				// Both hosts write it to stdout, which on Windows is
+				// dhewm3log.txt (sys/win32/win_main.cpp): the console window
+				// this used to append to was the early console, and there is
+				// not one on either host any more.
 				#define WriteString(s) fputs(s, stdout);
-#endif // _WIN32
 				WriteString(ENGINE_VERSION " - http://dhewm3.org\n");
 				WriteString("Commandline arguments:\n");
 				WriteString("-h or --help: Show this help\n");

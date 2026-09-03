@@ -269,8 +269,9 @@ void			Sys_GrabMouseCursor( bool grabIt );
 class idUserInterface;
 void			Sys_SetInteractiveIngameGuiActive( bool active, idUserInterface* ui );
 
-void			Sys_ShowWindow( bool show );
-bool			Sys_IsWindowVisible( void );
+// Sys_ShowWindow and Sys_IsWindowVisible were here. Both were the Windows
+// editors' - an external DOOMEdit hid the game window while it had it - and
+// neither host has a window it owns to hide: eacp does.
 void			Sys_ShowConsole( int visLevel, bool quitOnClose );
 
 

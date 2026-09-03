@@ -1,8 +1,8 @@
 # ABOUT
 
-_dhewm 3_ is a _Doom 3_ GPL source port. **This fork targets macOS only**, and renders
-through Metal rather than OpenGL. See [plan.md](./plan.md) for what that means and what
-is still missing; the Windows host is scheduled but not written.
+_dhewm 3_ is a _Doom 3_ GPL source port. **This fork targets macOS and Windows**, and
+renders through Metal and Direct3D 12 rather than OpenGL. See [plan.md](./plan.md) for
+what that means and what is still missing.
 
 The goal of _dhewm 3_ is bring _DOOM 3_ to all suitable platforms.
 
@@ -30,15 +30,26 @@ Compared to the original _DOOM 3_, the changes of _dhewm 3_ worth mentioning are
 
 - 64-bit port
 - [eacp](https://github.com/eyalamirmusic/eacp) for low-level OS support and input handling,
-  and Metal for rendering. Upstream dhewm3 uses SDL and OpenGL; this fork deleted both.
+  and Metal / Direct3D 12 for rendering. Upstream dhewm3 uses SDL and OpenGL; this fork
+  deleted both. There is one renderer, not two: the shaders are written once against
+  eacp's shader graph and it emits MSL or HLSL.
 - OpenAL for audio output, all OS-specific audio backends are gone
 - OpenAL EFX for EAX reverb effects (read: EAX-like sound effects on all platforms/hardware)
 - Better support for widescreen (and arbitrary display resolutions)
 - A build system based on CMake
 
-Two of upstream's features are compiled but do nothing on this fork, because both
-were SDL's: **gamepad support**, and the **settings menu** (`F10`) - Dear ImGui has no
-backend for the eacp host yet, and `dhewm3Settings` says so rather than opening.
+One of upstream's features is compiled but does nothing on this fork, because it was
+SDL's: **gamepad support**.
+
+Neither host has an **early console window** or reads a **terminal**. Upstream's Windows
+build had `win_syscon.cpp`, a window that showed the log before the renderer came up;
+upstream's POSIX build read the tty it was started from, with tab completion and
+history. The macOS host lost the second when it stopped being a terminal program, and
+the Windows host has neither: `Sys_ShowConsole` is a no-op and `Sys_ConsoleInput`
+returns nothing on both. The game's own console, on the tilde key, is unaffected; a
+fatal error puts up a message box on Windows so that it is not silent. The log is
+`Documents/My Games/dhewm3/dhewm3log.txt` on Windows and
+`Library/Application Support/dhewm3/dhewm3log.txt` on macOS.
 
 See [Changelog.md](./Changelog.md) for a more complete changelog.
 
@@ -66,12 +77,14 @@ See [Configuration.md](./Configuration.md) for dhewm3-specific configuration.
 
 ## Compiling
 
-This fork supports **macOS** only. The build system is [CMake](http://cmake.org/) 3.21
-or newer.
+This fork supports **macOS** and **Windows**. The build system is
+[CMake](http://cmake.org/) 3.21 or newer.
 
 Required libraries are not part of the tree:
 
-- [OpenAL Soft](https://openal-soft.org/) (Apple's and Creative's OpenAL are made of fail)
+- [OpenAL Soft](https://openal-soft.org/) (Apple's and Creative's OpenAL are made of fail).
+  Installed on macOS; on Windows CMake fetches and builds it, unless it finds an
+  installed one first.
 - libcurl (optional, required for server downloads)
 
 [eacp](https://github.com/eyalamirmusic/eacp) is fetched by CMake (CPM) rather than
@@ -141,10 +154,46 @@ that contains `base/` with `pak000.pk4` to `pak008.pk4`.*
 
 ### Windows
 
-There is no Windows build. Upstream dhewm3 has one and this fork used to; step 5 of
-[plan.md](./plan.md) deleted the SDL host it was built on, and CMake fails with a
-message saying so rather than configuring something that cannot link. The Windows eacp
-host is a scheduled step, and `neo/sys/win32/` is kept in the tree for it.
+Direct3D 12, so Windows 10 or newer, on x86_64 or arm64. What you need is a C++20
+compiler and CMake; there are no dependencies to install, because the two things the
+build cannot find on Windows - eacp and OpenAL Soft - it fetches and builds itself.
+MSVC and clang-cl are both fine, and the two-liner above is the whole of it:
+
+```
+cmake -B build
+cmake --build build --parallel
+```
+
+`build/neo/dhewm3.exe`, with `base.dll`, `d3xp.dll` and `OpenAL32.dll` beside it. Run it
+from anywhere:
+
+```
+build\neo\dhewm3.exe +set fs_basepath C:\path\to\your\doom3
+```
+
+It finds the game data on its own if you do not say: next to the executable first, then
+a retail install's registry entry, then Steam's. `FETCH_DEMO_DATA` needs a POSIX `sh` to
+unpack the demo installer, which comes with Git for Windows - if the demo is silently
+skipped at configure time, that is why, and the build says so.
+
+The one place the two hosts differ that you might notice is `sys/win32/`: it is the
+Sys_ layer, the same thirty-odd entry points `sys/posix/posix_main.cpp` answers for
+macOS. Everything above it - the window, the input, the frame, the renderer - is shared,
+which is the point of the eacp host.
+
+If the game dies a few seconds into a level with `eacp: no pipeline for state ...`
+filling the log, the D3D12 device was removed and the log says why just above it. That
+is a graphics driver giving up rather than the game asking for something impossible, and
+the way to tell for certain is to run the same binary on Microsoft's software rasterizer:
+
+```
+set EACP_D3D12_WARP=1
+```
+
+WARP is the D3D12 reference implementation and is far too slow to play on, but it is
+right - so anything that misbehaves on a GPU and behaves there is the driver. Virtual
+GPUs (Parallels, VMware, some remote-desktop stacks) are where this actually comes up;
+see [plan.md](./plan.md), Phase 2 step 11.
 
 ## Contributing
 

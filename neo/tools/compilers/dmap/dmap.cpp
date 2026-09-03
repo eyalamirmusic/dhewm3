@@ -279,9 +279,11 @@ void Dmap( const idCmdArgs &args ) {
 			noAAS = true;
 			common->Printf( "noAAS = true\n" );
 		} else if ( !idStr::Icmp( s, "editorOutput" ) ) {
-#ifdef _WIN32
-			com_outputMsg = true;
-#endif
+			// Accepted and ignored, which is what it already was on the macOS
+			// host. It turned on the DMAP_MSGID window messages a running
+			// DOOMEdit listened for, and that went with the rest of the
+			// editor IPC in framework/Common.cpp - no fork of this tree
+			// builds Radiant.
 		} else {
 			break;
 		}
@@ -372,12 +374,8 @@ void Dmap( const idCmdArgs &args ) {
 	// clear the map plane list
 	dmapGlobals.mapPlanes.Clear();
 
-#ifdef _WIN32
-	if ( com_outputMsg && com_hwndMsg != NULL ) {
-		unsigned int msg = ::RegisterWindowMessage( DMAP_DONE );
-		::PostMessage( com_hwndMsg, msg, 0, 0 );
-	}
-#endif
+	// The DMAP_DONE window message that told DOOMEdit the compile had finished
+	// was posted here. Same removal as "editorOutput" above.
 }
 
 /*

@@ -13,9 +13,23 @@ if(NOT FETCH_DEMO_DATA OR NOT CORE)
 	return()
 endif()
 
-# makeself needs a POSIX shell. Always there on macOS; on Windows it comes with
-# Git for Windows, so warn and skip rather than breaking the build outright.
+# makeself needs a POSIX shell. Always on the PATH on macOS; on Windows it comes
+# with Git for Windows, which does *not* put it there - `git` is on the PATH from
+# Git/cmd/ and the POSIX tools sit in Git/usr/bin/ and Git/bin/ beside it. So ask
+# CMake where git is and look next to it, and only then give up.
 find_program(SH_PROGRAM sh)
+
+if(NOT SH_PROGRAM AND WIN32)
+	find_package(Git QUIET)
+	if(GIT_EXECUTABLE)
+		get_filename_component(git_bin "${GIT_EXECUTABLE}" DIRECTORY)
+		get_filename_component(git_root "${git_bin}" DIRECTORY)
+		find_program(SH_PROGRAM sh
+			HINTS "${git_root}/usr/bin" "${git_root}/bin"
+			NO_DEFAULT_PATH)
+	endif()
+endif()
+
 if(NOT SH_PROGRAM)
 	message(WARNING
 		"FETCH_DEMO_DATA is ON, but no `sh` was found to unpack the demo installer "

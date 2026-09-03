@@ -4,9 +4,9 @@ Moving dhewm3 off SDL2 + OpenGL and onto [eacp](https://github.com/eyalamirmusic
 app lifecycle and message loop first, GPU rendering (Metal / D3D12) as the real work.
 
 **Status: Phase 0 is done and merged. Phase 1 has landed its gate and its seam.
-Phase 2 is complete apart from the Windows host. There is one executable, named
-`dhewm3`, it renders through Metal by way of eacp, and it links neither SDL nor
-OpenGL — `otool -L` is the check and CI runs it. Step 5, the deletion, took
+Phase 2 is complete. There is one executable, named `dhewm3`, it renders through
+Metal on macOS and Direct3D 12 on Windows by way of eacp, and it links neither
+SDL nor OpenGL — `otool -L` is the check and CI runs it. Step 5, the deletion, took
 **28,945 lines out across twelve code commits and a thirteenth for the
 documents**, and the gate was **297 of 297 identical on every one of them**. What
 went: the SDL/GL executable and everything only it compiled, the ARB2 path, the
@@ -114,7 +114,27 @@ prevent it, and a **warning printed mid-upload re-entering the image loader
 through `PacifierUpdate`** and taking the pending slot away from the upload that
 printed it — and a third commit closes both, at 297 of 297. The GPU suite goes
 282 → 303 and eacp's half is uncommitted on `develop`, awaiting the user's own
-commit.**
+commit. Step 11 is the last thing §8 had open: **the port runs on Windows**, on
+Direct3D 12, from the same `sys/eacp/` host the macOS build uses — `win_main.cpp`
+is the Sys_ layer and nothing above it is per-platform. The two-liner configures
+and builds with no dependency to install, because CMake fetches OpenAL Soft the
+way it already fetched eacp; the engine boots, finds its game data, opens a
+window, plays sound through OpenAL EFX, puts the main menu on screen, loads
+`demo_mars_city1` and lights it. It needed one eacp change to get a picture at
+all — §5's gap 19, four texture slots where Doom 3's interaction program wants
+five — and the fix was not the obvious one: the ceiling was never the slots, it
+was that each slot reserved a block of static samplers, so HLSL's sixteen
+sampler registers ran out at four textures. One sampler per *sampling
+configuration* instead, shared by every texture declared that way, and the slot
+count costs no registers at all: **maxTextureSlots 4 → 8, and 303 of 303 GPU
+tests**. What is **not** measured is the gate, because the gate has no Windows
+baseline and cannot have one that means anything yet: this machine is Windows on
+Arm in a VM, and its virtual GPU fails 12 of eacp's own 303 GPU tests — stencil,
+cube, block compression, multisample depth resolve — and takes the D3D12 device
+down with `DXGI_ERROR_DRIVER_INTERNAL_ERROR` about three seconds into a loaded
+level. The same binary on the WARP software rasterizer runs that level
+indefinitely, and eacp's suite is **303 of 303** there, which is what makes that
+sentence a statement about the driver rather than about this port.**
 
 Reference implementation for almost everything on the platform side:
 `~/Code/PureDOOM/examples/EACP` — a complete engine hosted on eacp, with its own
@@ -724,8 +744,38 @@ free number.**
     a reflection rather than the wall behind it. So `clear = false` is not only
     honest on this path, it is load-bearing.
 
-19. **A shader can bind four textures on D3D12, and Doom 3's interaction program
-    needs five.** `Lib/eacp/GPU/Windows/D3D12Types.h:25` is
+19. ~~**A shader can bind four textures on D3D12, and Doom 3's interaction
+    program needs five.**~~ — **closed**, §6 step 11, and it is the one gap on
+    this page whose *cause* was not what its own entry said. Raising
+    `maxTextureSlots` was never the hard part and the buffer registers above it
+    were never the constraint: what actually capped the count was the **static
+    samplers**. The emitter gave each texture slot a block of
+    `samplingConfigurations` (4) of them, at `s(slot * 4 + configuration)`, so
+    four slots filled `s0..s15` and HLSL has exactly sixteen sampler registers —
+    a fifth texture asked for `s19` and `ps_5_0` refused to compile the program
+    at all. That is what the port hit the first time a Windows build reached the
+    interaction shader.
+
+    **The fix takes the sampler off the slot.** A sampler is a sampling
+    configuration and nothing else, so there are four static samplers in the
+    root signature, at `s0..s3`, and every texture that declared that sampling
+    reads the one its configuration names — `samplerConfig<k>` rather than
+    `sampler<slot>`. Two textures sampled the same way share a sampler, which is
+    what a sampler is for. `maxTextureSlots` is 8 now and could be far more: a
+    slot is a single-descriptor table, one root DWORD, and it costs no sampler
+    register at all. Metal is untouched and deliberately so — MSL passes a
+    sampler as a function argument rather than binding it to a register, so it
+    still declares one per texture, and the two backends' declarations now
+    differ in exactly that one place, with a test on each side of it. **303 of
+    303 GPU tests**, one of them new: two samplings across three textures give
+    two samplers, which pins "per configuration used" against both the thing it
+    replaced and the thing it could collapse into.
+
+    *(For the record, what the entry below predicted the fix would be — "raising
+    the constant moves `bufferRegisterBase` with it" — is true and was the easy
+    half. It is left as written.)*
+
+    `Lib/eacp/GPU/Windows/D3D12Types.h:25` was
     `constexpr int maxTextureSlots = 4`, and the render root signature is built
     out of it: one single-descriptor table per slot, with the storage-buffer
     registers starting immediately above at `RenderPass::bufferRegisterBase`,
@@ -1237,7 +1287,7 @@ nineteen pixels of at most two levels, and the two binaries agree to the byte
 on every capture that did not. `regression/README.md` records the numbers and
 what to do with a single moved frame.
 
-### Phase 2 — cut the platform layer and the backend together ← **done, apart from the Windows host**
+### Phase 2 — cut the platform layer and the backend together ← **done**
 
 Both at once, on one branch:
 
@@ -4511,6 +4561,158 @@ attributable to the port's own commits. (`CPM_imgui-eacp_SOURCE` is not needed
 any more: imgui-eacp's step-8 change is committed, both checkouts are at
 `0d51b3c`, and it builds either way.)
 
+#### Step 11 — the Windows host: `sys/win32/` under eacp — **done**
+
+The last thing §8 had open, and the smallest of the four remaining steps by a
+wide margin — because the four before it had already done the work. eacp owns
+the window, the input, the main loop and the GPU on both platforms; the renderer
+is written once against eacp's shader graph, which emits MSL or HLSL; the only
+thing that was ever per-platform below the engine is the **Sys_ layer**, and
+that is the whole of what this step wrote.
+
+**What the buildsystem needed was smaller than step 5 left it looking.**
+`neo/CMakeLists.txt` had a `FATAL_ERROR` naming this step; what replaced it is a
+platform gate, `enable_language(OBJC/OBJCXX)` moved under `if(APPLE)`, the
+`src_sys` list split at its last four files, and the link line's
+`-framework Cocoa` traded for `ws2_32 iphlpapi shell32 ole32 winmm dbghelp`.
+Everything above `src_sys` — 359 translation units of renderer, framework,
+collision, sound, UI and idlib — moved with no change at all, which is the
+claim step 5 made about the seam and this is the first time anything tested it.
+
+**Two dependencies, one of which had to be fetched.** OpenAL Soft is Homebrew's
+on macOS and there is no Homebrew on Windows, so `CMake/OpenALSoft.cmake` finds
+an installed one and otherwise builds it through CPM, the way the tree already
+fetches eacp and the demo data. So the Windows build is the same two lines the
+macOS one is, with nothing to install first — the `.dll` is copied next to the
+executable at build time. `find_package(CURL)` finds nothing and the engine says
+so and carries on, which is what it does on a Mac without it.
+
+**`win_main.cpp` went from being the host to being the layer.** It was 1,589
+lines: a `WinMain`, an `SDL_main`, a second `while (1) common->Frame()`, an early
+console window with its own message pump, seventeen `qwgl*` pointers behind
+`ID_ALLOW_TOOLS`, and the `Sys_*` functions mixed in among them. What is left is
+the same thirty-odd entry points `sys/posix/posix_main.cpp` answers — paths,
+directory listings, the game DLLs, the clock, the clipboard, the console output,
+and the two ways out of the process — and the loop is `Apps::run` in
+`sys/eacp/Main.cpp`, which is where the macOS host's has been since step 2b.
+`win_shared.cpp` (5 functions) and `win_net.cpp` (30, the exact analogue of
+`posix_net.cpp`) moved over untouched, exactly as §8 predicted. `win_local.h`
+lost `Win32Vars_t` entirely: the window handle, the module handle and the OS
+version all belonged to a host this file no longer is.
+
+**One function had to be written rather than moved, and §8 named it.**
+`Sys_VPrintf` had no Windows definition at all — upstream's `Sys_Printf`,
+`Sys_DebugPrintf` and `Sys_DebugVPrintf` each formatted their own copy, and the
+one that idlib and the console actually call was simply absent. It is the sink
+now and the other three go through it, which is the shape `posix_main.cpp` has.
+`Sys_ConsoleInput` had to be written too and is a `return NULL`: there is no
+terminal to read, this being a windowed process.
+
+**Three things went rather than moved, and the third one is the interesting
+one.** The early console window (`win_syscon.cpp`) is gone — `Sys_ShowConsole` is
+a no-op, as it has been on the POSIX side since the day that file was written,
+and `Sys_Error` puts up a message box instead, because a `/SUBSYSTEM:WINDOWS`
+process whose stdout is a file would otherwise vanish on a fatal error with
+nothing said. The `qwgl` pointers, `Win_ChoosePixelFormat` and
+`Win_GetWindowScalingFactor` were all behind `ID_ALLOW_TOOLS`, which this
+buildsystem defines nowhere, and all were OpenGL's or MFC's. And `setHighDPIMode`
+is not needed: eacp's own event loop calls `SetProcessDpiAwarenessContext` before
+a window exists, which is earlier than this file could.
+
+**Four things in shared code turned out to be dead Radiant plumbing, and
+compiling for Windows is what found them.** `Sys_ShowWindow` and
+`Sys_IsWindowVisible` had no definition on the macOS build and no need for one:
+both call sites are `#ifdef _WIN32` and both are the *editors'* — an external
+DOOMEdit hid the game window while it had it. With `_WIN32` defined they became
+link errors, and the honest fix is that they go: `EnumWindowsProc`/`FindEditor`,
+the `com_outputMsg` block in `idCommonLocal::DPrintf` that posted `DMAP_MSGID`
+window messages at a running editor, `dmap`'s `editorOutput` argument and its
+`DMAP_DONE` reply, and the `Sys_IsWindowVisible` early-out in
+`idSessionLocal::UpdateScreen`. Nothing was ever on the other end — `FindEditor`
+enumerates windows for a title no fork of this tree builds. A Vista-era
+"please install OpenGL drivers from your graphics hardware vendor" message box in
+`RenderSystem_init.cpp` went with them, reached through the `win32.osversion`
+that no longer exists and asking about a renderer this build does not have.
+
+**Two compiler facts, both worth writing down.**
+
+  - **`/vmg`.** Doom 3's event system casts every handler to `eventCallback_t`,
+    which is `void (idClass::*)()`, and calls it back through that type. MSVC
+    sizes a pointer-to-member from the inheritance graph of the class it points
+    into, so `idActor`'s and `idClass`'s are not the same width and the cast is
+    an *error*, hundreds of them, in every game translation unit. `/vmg` gives
+    every member pointer the general representation. Itanium-ABI compilers — the
+    macOS host's — have one representation and never had the question.
+  - **`idHashTable<Type>::GetSpread` does not compile**, and never did. It uses a
+    `numItems` that is nowhere declared. The bug survived twenty years because
+    the function is dead (its only two calls, in `CollisionModel_load.cpp`, are
+    commented out) and because the two compilers that ever saw it disagree: gcc
+    and clang skip the whole definition on a `#if !defined(__GNUC__)` above it,
+    and MSVC's delayed template parsing never looks inside an uninstantiated
+    template. clang-cl is neither.
+
+**The Windows host has a crash handler now, and it is the counterpart of
+`Posix_InitSignalHandlers`.** It has to catch three different deaths, because
+Windows does not route them through one place the way a signal does: a
+structured exception, `std::terminate` (which is where C++/WinRT's
+`check_hresult` ends up, and eacp is C++/WinRT underneath), and **the CRT's
+invalid-parameter handler**, whose default is `__fastfail` — invisible to
+everything above it, since it does not raise, so the process dies with
+`STATUS_STACK_BUFFER_OVERRUN` and no explanation whatsoever. That third one is
+why this was written and it paid for itself in one run: the level-load crash
+below was a bare `0xC0000409` with nothing else to go on, and the first
+backtrace it printed named `D3D12Core.dll` and turned the question from "what is
+wrong with the port" into "why is the device gone".
+
+**What is verified, and what is not.**
+
+Verified by running it: the engine boots, finds its game data by all three
+routes `Sys_GetPath` knows (next to the executable, the retail registry key,
+Steam's), writes its log to `Documents/My Games/dhewm3`, opens a window, brings
+up OpenAL Soft 1.24.3 with EFX and 256 hardware voices, loads and runs the game
+DLL, compiles the script, **draws the main menu**, and **loads
+`demo_mars_city1` and lights it**. The version banner reads
+`dhewm3 1.5.5.1305 windows-arm64`.
+
+**Not verified: the regression gate**, and it cannot be yet. The gate compares a
+build against a recorded baseline, every baseline this port has was captured on
+macOS, and a cross-platform hash comparison is not what it measures. A Windows
+baseline recorded on *this* machine would be worthless for the reason in the next
+paragraph.
+
+**This machine is a VM, and its GPU is why the level dies.** dhewm3 loads
+`demo_mars_city1` and then, about three seconds in, the D3D12 device goes:
+`GetDeviceRemovedReason` says `DXGI_ERROR_DRIVER_INTERNAL_ERROR` (0x887A0020) and
+every texture and pipeline created afterwards fails, which is what the cascade of
+`eacp: no pipeline for state ...` warnings in the log is. It is not this port and
+it is not eacp, and the discriminator is WARP — Microsoft's software rasterizer,
+which is the D3D12 reference implementation:
+
+| | Parallels virtual GPU | WARP |
+| --- | --- | --- |
+| eacp's own GPU suite | 291 of 303 | **303 of 303** |
+| `demo_mars_city1` | device removed after ~3 s | runs indefinitely |
+
+The twelve eacp tests this GPU fails are stencil, cube textures, block
+compression, multisample depth resolve, viewport and face culling — which is a
+fair description of what a Doom 3 frame is made of. `EACP_D3D12_WARP=1` forces
+the software adapter and is how both rows of that table were taken; it is worth
+having permanently for exactly this question, which is otherwise expensive to
+answer.
+
+So **the picture on real Windows hardware is unmeasured**, and that is the honest
+statement of where this step ends. What it is not is unknown: the same source
+draws the same frame through the same shader graph on a rasterizer that agrees
+with the specification on all 303 counts.
+
+**eacp's half, all of it uncommitted on `develop` and awaiting the user's own
+commit**: gap 19's sampler change (four files), the descriptor heap raised from
+1024 to 65536 with the exhaustion logged instead of silently handing back an
+invalid slot — 1024 is *fewer descriptors than Doom 3's first level has
+textures*, so this was a ceiling an app reached by loading its content — the
+device-removed reason logged once rather than recovered from in silence, and
+`EACP_D3D12_WARP`.
+
 ### Shader inventory for Phase 2
 
 Roughly 10–15 EDSL programs, each in the sampling variants §4.3 sizes — 8 worst case
@@ -4884,17 +5086,18 @@ Phase 2 is the first work that compiles against eacp. In rough order:
    the program's name beside the two handles, and the eacp backend never reads
    the handles at all. C6 landed the stub at 297/297, `fragmentPrograms` and all.
 
-One thing is open, and it is the Windows host. The two that stood beside it are
-struck through below, with the steps that closed them, and two more
-struck-through entries sit with them that were never on this list at all — step 8
-was found by running the build rather than by planning for it, and step 9 took
-back something 4e.1 had traded away on purpose.
+Nothing on this list is open. The Windows host was the last of them and step 11
+closed it; the entries below are struck through with the steps that closed them,
+and two of them were never on this list at all — step 8 was found by running the
+build rather than by planning for it, and step 9 took back something 4e.1 had
+traded away on purpose.
 
-**The Windows host.** The port is macOS-only from step 2b (§6), and step 5 made
-that the buildsystem's position rather than an accident: `neo/CMakeLists.txt`
-fails with a message naming this work rather than configuring a target that
-cannot link. `neo/sys/win32/` is kept in the tree for it. What step 5 leaves it,
-in short:
+~~**The Windows host.**~~ — **done**, §6 step 11. The four bullets below are
+what step 5 left it, written before the work; every one of them held, which is
+the most that can be said for a prediction. The one thing they did not see is
+that compiling shared code for Windows would find four pieces of dead Radiant
+plumbing in it, because those were invisible from a build where `_WIN32` was
+never defined. What step 5 left it, in short:
 
 - **`ID_ALLOW_TOOLS` is defined nowhere in this buildsystem** — not in any
   `CMakeLists.txt`, not in `neo/config.h.in`. It guards nine blocks of

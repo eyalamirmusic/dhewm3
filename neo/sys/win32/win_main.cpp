@@ -26,169 +26,192 @@ If you have questions concerning this license or the applicable additional terms
 ===========================================================================
 */
 
+/*
+===========================================================================
+
+The Windows Sys_ layer, on the eacp host.
+
+This file used to be the host as well as the layer: a WinMain, a second
+`while (1) common->Frame()`, an early console window with its own message pump,
+seventeen wgl entry points for the MFC tools, and the Sys_ functions mixed in
+among them. eacp owns the loop now (sys/eacp/Main.cpp -> Apps::run, and
+sys/eacp/View.cpp for the frame inside it), so what is left here is the layer -
+the same 30-odd entry points sys/posix/posix_main.cpp answers for the macOS
+host, written against Win32 instead:
+
+  paths and directory listings, the game DLLs, the clock, the clipboard, the
+  console output and the two ways out of the process.
+
+Three things went rather than moved, and are worth naming because they are
+absences rather than omissions:
+
+  - **The early console window.** win_syscon.cpp was a window that showed the
+    log before the renderer came up and stayed for Sys_Error to write into.
+    posix_main.cpp's Sys_ShowConsole is a no-op and always was; this one is too,
+    and Sys_Error says what it has to say in a message box, because a
+    /SUBSYSTEM:WINDOWS process has no console to have printed it to.
+  - **The wgl pointers, Win_ChoosePixelFormat and Win_GetWindowScalingFactor.**
+    All three were behind ID_ALLOW_TOOLS, which this buildsystem defines
+    nowhere, and all three were OpenGL's or MFC's. There is no OpenGL on this
+    build.
+  - **setHighDPIMode.** eacp's own event loop calls
+    SetProcessDpiAwarenessContext before a window exists, which is earlier than
+    this file could.
+
+===========================================================================
+*/
+
 #include "sys/platform.h"
-#include "idlib/CmdArgs.h"
-#include "framework/async/AsyncNetwork.h"
+#include "idlib/Str.h"
+#include "idlib/containers/StrList.h"
+#include "framework/Common.h"
+#include "framework/CmdSystem.h"
+#include "framework/FileSystem.h"
 #include "framework/Licensee.h"
-#include "framework/UsercmdGen.h"
-#include "renderer/tr_local.h"
-#include "sys/win32/rc/CreateResourceIDs.h"
 #include "sys/sys_local.h"
 
+#include "sys/eacp/Platform.h"
 #include "sys/win32/win_local.h"
+
+// idlib/Str.h turns these four into macros - a compile error waiting in any
+// standard or platform header included after it. posix_main.cpp does the same
+// undef for the same reason; this file calls idStr::vsnPrintf explicitly where
+// it wants idlib's.
+#undef strcmp
+#undef strncmp
+#undef snprintf
+#undef vsnprintf
 
 #include <errno.h>
 #include <float.h>
 #include <fcntl.h>
 #include <direct.h>
 #include <io.h>
-#include <conio.h>
+#include <time.h>
 #include <shellapi.h>
 #include <shlobj.h>
-
-#ifndef __MRC__
+#include <dbghelp.h>
+#include <exception>
 #include <sys/types.h>
 #include <sys/stat.h>
-#endif
 
-#include "tools/edit_public.h"
+// Was Win32Vars_t::win_outputDebugString, a static of a struct whose other
+// members were the window handle, the module handle and the OS version - all
+// three of which belonged to a host this file no longer is.
+static idCVar win_outputDebugString( "win_outputDebugString", "0", CVAR_SYSTEM | CVAR_BOOL,
+	"also send console output to the debugger's output window (OutputDebugString)" );
 
-#undef strcmp // get rid of "#define strcmp idStr::Cmp", it conflicts with SDL headers
+enum {
+	MAXPRINTMSG = 4096
+};
 
-// This file is still the SDL host's WinMain, and it is the reason there is no
-// Windows target yet (plan.md section 8). The include here was sys/sys_sdl.h,
-// which went with the rest of SDL in step 5; the Windows eacp host will replace
-// the entry points below rather than restore it.
-#include <SDL3/SDL.h>
+/*
+===============
+low level output
 
-#ifdef D3_SDL3
-  #define SDL_MAIN_HANDLED // dhewm3 implements WinMain() itself
-  #include <SDL3/SDL_main.h>
-#else // SDL1.2 or SDL2
-  #include <SDL_main.h>
-#endif
+Sys_VPrintf is the one every other printf here goes through, which is the shape
+posix_main.cpp has and the shape this file did not: upstream's Sys_Printf,
+Sys_DebugPrintf and Sys_DebugVPrintf each formatted and wrote their own copy,
+and Sys_VPrintf - which idlib and the console both call - had no Windows
+definition at all.
 
+stdout is dhewm3log.txt from Win_EarlyInit onwards, so this is the log as much
+as it is the console.
+===============
+*/
 
-idCVar Win32Vars_t::win_outputDebugString( "win_outputDebugString", "0", CVAR_SYSTEM | CVAR_BOOL, "" );
-idCVar Win32Vars_t::win_outputEditString( "win_outputEditString", "1", CVAR_SYSTEM | CVAR_BOOL, "" );
-idCVar Win32Vars_t::win_viewlog( "win_viewlog", "0", CVAR_SYSTEM | CVAR_INTEGER, "" );
+void Sys_VPrintf( const char *msg, va_list arg ) {
+	char text[MAXPRINTMSG];
 
-Win32Vars_t	win32;
+	idStr::vsnPrintf( text, sizeof( text ) - 1, msg, arg );
+	text[sizeof( text ) - 1] = '\0';
 
-#ifdef ID_ALLOW_TOOLS
-/* These are required for tools (DG: taken from SteelStorm2) */
+	fputs( text, stdout );
 
-static HMODULE hOpenGL_DLL;
+	if ( win_outputDebugString.GetBool() ) {
+		OutputDebugString( text );
+	}
+}
 
-typedef BOOL(WINAPI * PWGLSWAPBUFFERS)(HDC);
+void Sys_Printf( const char *msg, ... ) {
+	va_list argptr;
 
-PWGLSWAPBUFFERS			qwglSwapBuffers;
+	va_start( argptr, msg );
+	Sys_VPrintf( msg, argptr );
+	va_end( argptr );
+}
 
-typedef BOOL(WINAPI * PWGLCOPYCONTEXT)(HGLRC, HGLRC, UINT);
-typedef HGLRC(WINAPI * PWGLCREATECONTEXT)(HDC);
-typedef HGLRC(WINAPI * PWGLCREATELAYERCONTEXT)(HDC, int);
-typedef BOOL(WINAPI * PWGLDELETECONTEXT)(HGLRC);
-typedef HGLRC(WINAPI * PWGLGETCURRENTCONTEXT)(VOID);
-typedef HDC(WINAPI * PWGLGETCURRENTDC)(VOID);
-typedef PROC(WINAPI * PWGLGETPROCADDRESS)(LPCSTR);
-typedef BOOL(WINAPI * PWGLMAKECURRENT)(HDC, HGLRC);
-typedef BOOL(WINAPI * PWGLSHARELISTS)(HGLRC, HGLRC);
-typedef BOOL(WINAPI * PWGLUSEFONTBITMAPS)(HDC, DWORD, DWORD, DWORD);
+void Sys_DebugPrintf( const char *fmt, ... ) {
+	va_list argptr;
 
+	va_start( argptr, fmt );
+	Sys_VPrintf( fmt, argptr );
+	va_end( argptr );
+}
 
-PWGLCOPYCONTEXT			qwglCopyContext;
-PWGLCREATECONTEXT		qwglCreateContext;
-PWGLCREATELAYERCONTEXT	qwglCreateLayerContext;
-PWGLDELETECONTEXT		qwglDeleteContext;
-PWGLGETCURRENTCONTEXT	qwglGetCurrentContext;
-PWGLGETCURRENTDC		qwglGetCurrentDC;
-PWGLGETPROCADDRESS		qwglGetProcAddress;
-PWGLMAKECURRENT			qwglMakeCurrent;
-PWGLSHARELISTS			qwglShareLists;
-PWGLUSEFONTBITMAPS		qwglUseFontBitmaps;
+void Sys_DebugVPrintf( const char *fmt, va_list arg ) {
+	Sys_VPrintf( fmt, arg );
+}
 
-typedef BOOL(WINAPI * PWGLUSEFONTOUTLINES)(HDC, DWORD, DWORD, DWORD, FLOAT,
-	FLOAT, int, LPGLYPHMETRICSFLOAT);
-typedef BOOL(WINAPI * PWGLDESCRIBELAYERPLANE)(HDC, int, int, UINT,
-	LPLAYERPLANEDESCRIPTOR);
-typedef int  (WINAPI * PWGLSETLAYERPALETTEENTRIES)(HDC, int, int, int,
-	CONST COLORREF *);
-typedef int  (WINAPI * PWGLGETLAYERPALETTEENTRIES)(HDC, int, int, int,
-	COLORREF *);
-typedef BOOL(WINAPI * PWGLREALIZELAYERPALETTE)(HDC, int, BOOL);
-typedef BOOL(WINAPI * PWGLSWAPLAYERBUFFERS)(HDC, UINT);
+/*
+==============
+Sys_ShowConsole
 
-PWGLUSEFONTOUTLINES			qwglUseFontOutlines;
-PWGLDESCRIBELAYERPLANE		qwglDescribeLayerPlane;
-PWGLSETLAYERPALETTEENTRIES	qwglSetLayerPaletteEntries;
-PWGLGETLAYERPALETTEENTRIES	qwglGetLayerPaletteEntries;
-PWGLREALIZELAYERPALETTE		qwglRealizeLayerPalette;
-PWGLSWAPLAYERBUFFERS		qwglSwapLayerBuffers;
+There is no console window to show. posix_main.cpp is the precedent - it has
+answered the same nothing since the day it was written - and every caller
+treats it as advisory.
+==============
+*/
+void Sys_ShowConsole( int visLevel, bool quitOnClose ) {
+}
 
-#endif /* End stuff required for tools */
+/*
+==============
+Sys_ConsoleInput
 
-static bool hadError = false;
-static char errorText[4096];
+The other half of the console that is not here. posix_main.cpp reads the
+terminal the game was started from - tab completion, history, the lot - and a
+windowed process started from Explorer has no terminal to read. The game's own
+console, the one on the tilde key, is a different thing entirely and is
+unaffected.
+
+A dedicated server would want this back, and would want a console window with
+it; neither host has one to give it today.
+==============
+*/
+char *Sys_ConsoleInput( void ) {
+	return NULL;
+}
 
 /*
 =============
 Sys_Error
 
-Show the early console as an error dialog
+The message box is not decoration. This is a windowed (/SUBSYSTEM:WINDOWS)
+process whose stdout is a file, so a fatal error printed and exited would look
+from the outside like the game vanishing on startup for no reason.
 =============
 */
 void Sys_Error( const char *error, ... ) {
-	va_list		argptr;
-	char		text[4096];
-	MSG        msg;
-
-	if ( !Sys_IsMainThread() ) {
-		// to avoid deadlocks we mustn't call Conbuf_AppendText() etc if not in main thread!
-		va_start(argptr, error);
-		vsprintf(errorText, error, argptr);
-		va_end(argptr);
-
-		printf("%s", errorText);
-		OutputDebugString( errorText );
-
-		hadError = true;
-		return;
-	}
+	va_list	argptr;
+	char	text[MAXPRINTMSG];
 
 	va_start( argptr, error );
-	vsprintf( text, error, argptr );
-	va_end( argptr);
+	idStr::vsnPrintf( text, sizeof( text ) - 1, error, argptr );
+	va_end( argptr );
+	text[sizeof( text ) - 1] = '\0';
 
-	if ( !hadError ) {
-		// if we had an error in another thread, printf() and OutputDebugString() has already been called for this
-		printf( "%s", text );
-		OutputDebugString( text );
-	}
-
-	Conbuf_AppendText( text );
-	Conbuf_AppendText( "\n" );
-
-	Win_SetErrorText( text );
-	Sys_ShowConsole( 1, true );
+	Sys_Printf( "Sys_Error: %s\n", text );
+	fflush( stdout );
 
 	timeEndPeriod( 1 );
 
-	Sys_ShutdownInput();
+	MessageBox( NULL, text, GAME_NAME " - fatal error",
+	            MB_OK | MB_ICONERROR | MB_TASKMODAL | MB_SETFOREGROUND );
 
-	GLimp_Shutdown();
-
-	// wait for the user to quit
-	while ( 1 ) {
-		if ( !GetMessage( &msg, NULL, 0, 0 ) ) {
-			common->Quit();
-		}
-		TranslateMessage( &msg );
-		DispatchMessage( &msg );
-	}
-
-	Sys_DestroyConsole();
-
-	exit (1);
+	// exit() rather than ExitProcess(), so the atexit() that closes the log
+	// still runs. Same reason Posix_Exit ends in exit().
+	exit( EXIT_FAILURE );
 }
 
 /*
@@ -197,118 +220,8 @@ Sys_Quit
 ==============
 */
 void Sys_Quit( void ) {
-#ifdef ID_ALLOW_TOOLS
-	// Free OpenGL DLL.
-	if (hOpenGL_DLL)
-	{
-		FreeLibrary(hOpenGL_DLL);
-	}
-#endif
-
 	timeEndPeriod( 1 );
-	Sys_ShutdownInput();
-	Sys_DestroyConsole();
-	ExitProcess( 0 );
-}
-
-
-/*
-==============
-Sys_Printf
-==============
-*/
-
-enum {
-	MAXPRINTMSG = 4096,
-	MAXNUMBUFFEREDLINES = 16
-};
-
-static char bufferedPrintfLines[MAXNUMBUFFEREDLINES][MAXPRINTMSG];
-static int curNumBufferedPrintfLines = 0;
-static CRITICAL_SECTION printfCritSect;
-
-void Sys_Printf( const char *fmt, ... ) {
-	char		msg[MAXPRINTMSG];
-
-	va_list argptr;
-	va_start(argptr, fmt);
-	int len = idStr::vsnPrintf( msg, MAXPRINTMSG-1, fmt, argptr );
-	va_end(argptr);
-	msg[sizeof(msg)-1] = '\0';
-
-	printf("%s", msg);
-
-	if ( win32.win_outputDebugString.GetBool() ) {
-		OutputDebugString( msg );
-	}
-	if ( win32.win_outputEditString.GetBool() ) {
-		if ( Sys_IsMainThread() ) {
-			Conbuf_AppendText( msg );
-		} else {
-			EnterCriticalSection( &printfCritSect );
-			int idx = curNumBufferedPrintfLines++;
-			if ( idx < MAXNUMBUFFEREDLINES ) {
-				if ( len >= MAXPRINTMSG )
-					len = MAXPRINTMSG - 1;
-				memcpy( bufferedPrintfLines[idx], msg, len + 1 );
-			}
-			LeaveCriticalSection( &printfCritSect );
-		}
-	}
-}
-
-/*
-==============
-Sys_DebugPrintf
-==============
-*/
-#define MAXPRINTMSG 4096
-void Sys_DebugPrintf( const char *fmt, ... ) {
-	char msg[MAXPRINTMSG];
-
-	va_list argptr;
-	va_start( argptr, fmt );
-	idStr::vsnPrintf( msg, MAXPRINTMSG-1, fmt, argptr );
-	msg[ sizeof(msg)-1 ] = '\0';
-	va_end( argptr );
-
-	printf("%s", msg);
-
-	OutputDebugString( msg );
-}
-
-/*
-==============
-Sys_DebugVPrintf
-==============
-*/
-void Sys_DebugVPrintf( const char *fmt, va_list arg ) {
-	char msg[MAXPRINTMSG];
-
-	idStr::vsnPrintf( msg, MAXPRINTMSG-1, fmt, arg );
-	msg[ sizeof(msg)-1 ] = '\0';
-
-	printf("%s", msg);
-
-	OutputDebugString( msg );
-}
-
-/*
-==============
-Sys_ShowWindow
-==============
-*/
-void Sys_ShowWindow( bool show ) {
-	::ShowWindow( win32.hWnd, show ? SW_SHOW : SW_HIDE );
-}
-
-/*
-==============
-Sys_IsWindowVisible
-==============
-*/
-bool Sys_IsWindowVisible( void ) {
-	return ( ::IsWindowVisible( win32.hWnd ) != 0 );
+	exit( EXIT_SUCCESS );
 }
 
 /*
@@ -317,7 +230,7 @@ Sys_Mkdir
 ==============
 */
 void Sys_Mkdir( const char *path ) {
-	_mkdir (path);
+	_mkdir( path );
 }
 
 /*
@@ -399,23 +312,21 @@ Based on (with kind permission) Yamagi Quake II's Sys_GetHomeDir()
 Returns the number of characters written to dst
 ==============
  */
-extern "C" { // DG: I need this in SDL_win32_main.c
-	int Win_GetHomeDir(char *dst, size_t size)
-	{
-		int len;
-		WCHAR profile[MAX_OSPATH];
+static int Win_GetHomeDir(char *dst, size_t size)
+{
+	int len;
+	WCHAR profile[MAX_OSPATH];
 
-		/* Get the path to "My Documents" directory */
-		SHGetFolderPathW(NULL, CSIDL_PERSONAL, NULL, 0, profile);
+	/* Get the path to "My Documents" directory */
+	SHGetFolderPathW(NULL, CSIDL_PERSONAL, NULL, 0, profile);
 
-		len = WPath2A(dst, size, profile);
-		if (len == 0)
-			return 0;
+	len = WPath2A(dst, size, profile);
+	if (len == 0)
+		return 0;
 
-		idStr::Append(dst, size, "/My Games/dhewm3");
+	idStr::Append(dst, size, "/My Games/dhewm3");
 
-		return len;
-	}
+	return len;
 }
 
 static int GetRegistryPath(char *dst, size_t size, const WCHAR *subkey, const WCHAR *name) {
@@ -557,7 +468,6 @@ int Sys_ListFiles( const char *directory, const char *extension, idStrList &list
 	return list.Num();
 }
 
-
 /*
 ================
 Sys_GetClipboardData
@@ -664,7 +574,7 @@ uintptr_t Sys_DLL_Load( const char *dllName ) {
 			// "[193 (0xC1)] is not a valid Win32 application"
 			// probably going to be common. Lets try to be less cryptic.
 			common->Warning( "LoadLibrary( \"%s\" ) Failed ! [%i (0x%X)]\tprobably the DLL is of the wrong architecture, "
-			                 "like x64 instead of x86 (this build of dhewm3 expects %s)",
+			                 "like x86_64 instead of arm64 (this build of dhewm3 expects %s)",
 			                 dllName, e, e, D3_ARCH );
 			return 0;
 		}
@@ -761,35 +671,18 @@ void Sys_Init( void ) {
 	// NT gets 18ms resolution
 	timeBeginPeriod( 1 );
 
-	// get WM_TIMER messages pumped every millisecond
-//	SetTimer( NULL, 0, 100, NULL );
-
-#ifdef DEBUG
-	cmdSystem->AddCommand( "createResourceIDs", CreateResourceIDs_f, CMD_FL_TOOL, "assigns resource IDs in _resouce.h files" );
-#endif
-#if 0
-	cmdSystem->AddCommand( "setAsyncSound", Sys_SetAsyncSound_f, CMD_FL_SYSTEM, "set the async sound option" );
-#endif
 	{
 		idStr savepath;
 		Sys_GetPath( PATH_SAVE, savepath );
 		common->Printf( "Logging console output to %s/dhewm3log.txt\n", savepath.c_str() );
 	}
 
-	//
-	// Windows version
-	//
-	win32.osversion.dwOSVersionInfoSize = sizeof( win32.osversion );
-
-	if ( !GetVersionEx( (LPOSVERSIONINFO)&win32.osversion ) )
-		Sys_Error( "Couldn't get OS info" );
-
-	if ( win32.osversion.dwMajorVersion < 4 ) {
-		Sys_Error( GAME_NAME " requires Windows version 4 (NT) or greater" );
-	}
-	if ( win32.osversion.dwPlatformId == VER_PLATFORM_WIN32s ) {
-		Sys_Error( GAME_NAME " doesn't run on Win32s" );
-	}
+	// The Windows version check that stood here - GetVersionEx, "requires
+	// Windows version 4 (NT) or greater", "doesn't run on Win32s" - is gone
+	// along with the win32.osversion it filled in. GetVersionEx has reported
+	// 6.2 for every unmanifested process since Windows 8.1, so it could not
+	// have answered the question honestly; and the real floor for this build is
+	// whatever D3D12 needs, which is far above anything it was testing for.
 
 	common->Printf( "%d MB System Memory\n", Sys_GetSystemRam() );
 }
@@ -800,245 +693,18 @@ Sys_Shutdown
 ================
 */
 void Sys_Shutdown( void ) {
-#ifdef ID_ALLOW_TOOLS
-	qwglCopyContext = NULL;
-	qwglCreateContext = NULL;
-	qwglCreateLayerContext = NULL;
-	qwglDeleteContext = NULL;
-	qwglDescribeLayerPlane = NULL;
-	qwglGetCurrentContext = NULL;
-	qwglGetCurrentDC = NULL;
-	qwglGetLayerPaletteEntries = NULL;
-	qwglGetProcAddress = NULL;
-	qwglMakeCurrent = NULL;
-	qwglRealizeLayerPalette = NULL;
-	qwglSetLayerPaletteEntries = NULL;
-	qwglShareLists = NULL;
-	qwglSwapLayerBuffers = NULL;
-	qwglUseFontBitmaps = NULL;
-	qwglUseFontOutlines = NULL;
-	qwglSwapBuffers = NULL;
-#endif // ID_ALLOW_TOOLS
-
 	CoUninitialize();
 }
-
-//=======================================================================
-
-//#define SET_THREAD_AFFINITY
-
-
-/*
-====================
-Win_Frame
-====================
-*/
-void Win_Frame( void ) {
-	// if "viewlog" has been modified, show or hide the log console
-	if ( win32.win_viewlog.IsModified() ) {
-		if ( !com_skipRenderer.GetBool() && idAsyncNetwork::serverDedicated.GetInteger() != 1 ) {
-			Sys_ShowConsole( win32.win_viewlog.GetInteger(), false );
-		}
-		win32.win_viewlog.ClearModified();
-	}
-
-	if ( curNumBufferedPrintfLines > 0 ) {
-		// if Sys_Printf() had been called in another thread, add those lines to the windows console now
-		EnterCriticalSection( &printfCritSect );
-		int n = Min( curNumBufferedPrintfLines, (int)MAXNUMBUFFEREDLINES );
-		for ( int i = 0; i < n; ++i ) {
-			Conbuf_AppendText( bufferedPrintfLines[i] );
-		}
-		curNumBufferedPrintfLines = 0;
-		LeaveCriticalSection( &printfCritSect );
-	}
-
-	if ( hadError ) {
-		// if Sys_Error() had been called in another thread, handle it now
-		Sys_Error( "%s", errorText );
-	}
-}
-
-// the MFC tools use Win_GetWindowScalingFactor() for High-DPI support
-#ifdef ID_ALLOW_TOOLS
-
-typedef enum D3_MONITOR_DPI_TYPE {
-	D3_MDT_EFFECTIVE_DPI = 0,
-	D3_MDT_ANGULAR_DPI = 1,
-	D3_MDT_RAW_DPI = 2,
-	D3_MDT_DEFAULT = D3_MDT_EFFECTIVE_DPI
-} D3_MONITOR_DPI_TYPE;
-
-// https://docs.microsoft.com/en-us/windows/win32/api/shellscalingapi/nf-shellscalingapi-getdpiformonitor
-// GetDpiForMonitor() - Win8.1+, shellscalingapi.h, Shcore.dll
-static HRESULT (STDAPICALLTYPE *D3_GetDpiForMonitor)(HMONITOR hmonitor, D3_MONITOR_DPI_TYPE dpiType, UINT *dpiX, UINT *dpiY) = NULL;
-
-// https://docs.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-getdpiforwindow
-// GetDpiForWindow() - Win10 1607+, winuser.h/Windows.h, User32.dll
-static UINT(WINAPI *D3_GetDpiForWindow)(HWND hwnd) = NULL;
-
-float Win_GetWindowScalingFactor(HWND window)
-{
-	// the best way - supported by Win10 1607 and newer
-	if ( D3_GetDpiForWindow != NULL ) {
-		UINT dpi = D3_GetDpiForWindow(window);
-		return static_cast<float>(dpi) / 96.0f;
-	}
-
-	// probably second best, supported by Win8.1 and newer
-	if ( D3_GetDpiForMonitor != NULL ) {
-		HMONITOR monitor = MonitorFromWindow(window, MONITOR_DEFAULTTOPRIMARY);
-		UINT dpiX = 96, dpiY;
-		D3_GetDpiForMonitor(monitor, D3_MDT_EFFECTIVE_DPI, &dpiX, &dpiY);
-		return static_cast<float>(dpiX) / 96.0f;
-	}
-
-	// on older versions of windows, DPI was system-wide (not per monitor)
-	// and changing DPI required logging out and in again (AFAIK), so we only need to get it once
-	static float scaling_factor = -1.0f;
-	if ( scaling_factor == -1.0f ) {
-		HDC hdc = GetDC(window);
-		if (hdc == NULL) {
-			return 1.0f;
-		}
-		// "Number of pixels per logical inch along the screen width. In a system with multiple display monitors, this value is the same for all monitors."
-		int ppi = GetDeviceCaps(hdc, LOGPIXELSX);
-		scaling_factor = static_cast<float>(ppi) / 96.0f;
-	}
-	return scaling_factor;
-}
-
-#endif // ID_ALLOW_TOOLS
-
-// code that tells windows we're High DPI aware so it doesn't scale our windows
-// taken from Yamagi Quake II
-
-typedef enum D3_PROCESS_DPI_AWARENESS {
-	D3_PROCESS_DPI_UNAWARE = 0,
-	D3_PROCESS_SYSTEM_DPI_AWARE = 1,
-	D3_PROCESS_PER_MONITOR_DPI_AWARE = 2
-} D3_PROCESS_DPI_AWARENESS;
-
-static void setHighDPIMode(void)
-{
-	/* For Vista, Win7 and Win8 */
-	BOOL(WINAPI *SetProcessDPIAware)(void) = NULL;
-
-	/* Win8.1 and later */
-	HRESULT(WINAPI *SetProcessDpiAwareness)(D3_PROCESS_DPI_AWARENESS dpiAwareness) = NULL;
-
-	HINSTANCE userDLL = LoadLibrary("USER32.DLL");
-
-	if (userDLL)
-	{
-		SetProcessDPIAware = (BOOL(WINAPI *)(void)) GetProcAddress(userDLL, "SetProcessDPIAware");
-	}
-
-	HINSTANCE shcoreDLL = LoadLibrary("SHCORE.DLL");
-
-	if (shcoreDLL)
-	{
-		SetProcessDpiAwareness = (HRESULT(WINAPI *)(D3_PROCESS_DPI_AWARENESS))
-									GetProcAddress(shcoreDLL, "SetProcessDpiAwareness");
-	}
-
-	if (SetProcessDpiAwareness) {
-		SetProcessDpiAwareness(D3_PROCESS_PER_MONITOR_DPI_AWARE);
-	}
-	else if (SetProcessDPIAware) {
-		SetProcessDPIAware();
-	}
-
-#ifdef ID_ALLOW_TOOLS // also init function pointers for Win_GetWindowScalingFactor() here
-	if (userDLL) {
-		D3_GetDpiForWindow = (UINT(WINAPI *)(HWND))GetProcAddress(userDLL, "GetDpiForWindow");
-	}
-	if (shcoreDLL) {
-		D3_GetDpiForMonitor = (HRESULT (STDAPICALLTYPE *)(HMONITOR, D3_MONITOR_DPI_TYPE, UINT *, UINT *))
-		                          GetProcAddress(shcoreDLL, "GetDpiForMonitor");
-	}
-#endif // ID_ALLOW_TOOLS
-}
-
-#ifdef ID_ALLOW_TOOLS
-static void loadWGLpointers() {
-	if (hOpenGL_DLL == NULL)
-	{
-		// Load OpenGL DLL.
-		hOpenGL_DLL = LoadLibrary("opengl32.dll");
-		if (hOpenGL_DLL == NULL) {
-			Sys_Error(GAME_NAME " Cannot Load opengl32.dll - Disabling TOOLS");
-			return;
-		}
-	}
-	// opengl32.dll found... grab the addresses.
-
-	qwglGetProcAddress = (PWGLGETPROCADDRESS)GetProcAddress(hOpenGL_DLL, "wglGetProcAddress");
-
-	// Context controls
-	qwglCopyContext = (PWGLCOPYCONTEXT)GetProcAddress(hOpenGL_DLL, "wglCopyContext");
-	qwglCreateContext = (PWGLCREATECONTEXT)GetProcAddress(hOpenGL_DLL, "wglCreateContext");
-	qwglCreateLayerContext = (PWGLCREATELAYERCONTEXT)GetProcAddress(hOpenGL_DLL, "wglCreateLayerContext");
-	qwglDeleteContext = (PWGLDELETECONTEXT)GetProcAddress(hOpenGL_DLL, "wglDeleteContext");
-	qwglGetCurrentContext = (PWGLGETCURRENTCONTEXT)GetProcAddress(hOpenGL_DLL, "wglGetCurrentContext");
-	qwglGetCurrentDC = (PWGLGETCURRENTDC)GetProcAddress(hOpenGL_DLL, "wglGetCurrentDC");
-	qwglMakeCurrent = (PWGLMAKECURRENT)GetProcAddress(hOpenGL_DLL, "wglMakeCurrent");
-	qwglShareLists = (PWGLSHARELISTS)GetProcAddress(hOpenGL_DLL, "wglShareLists");
-
-	// Fonts
-	qwglUseFontBitmaps = (PWGLUSEFONTBITMAPS)GetProcAddress(hOpenGL_DLL, "wglUseFontBitmapsA");
-	qwglUseFontOutlines = (PWGLUSEFONTOUTLINES)GetProcAddress(hOpenGL_DLL, "wglUseFontOutlinesA");
-
-	// Layers.
-	qwglDescribeLayerPlane = (PWGLDESCRIBELAYERPLANE)GetProcAddress(hOpenGL_DLL, "wglDescribeLayerPlane");
-	qwglSwapLayerBuffers = (PWGLSWAPLAYERBUFFERS)GetProcAddress(hOpenGL_DLL, "wglSwapLayerBuffers");
-
-	// Palette controls
-	qwglGetLayerPaletteEntries = (PWGLGETLAYERPALETTEENTRIES)GetProcAddress(hOpenGL_DLL, "wglGetLayerPaletteEntries");
-	qwglRealizeLayerPalette = (PWGLREALIZELAYERPALETTE)GetProcAddress(hOpenGL_DLL, "wglRealizeLayerPalette");
-	qwglSetLayerPaletteEntries = (PWGLSETLAYERPALETTEENTRIES)GetProcAddress(hOpenGL_DLL, "wglSetLayerPaletteEntries");
-
-
-	// These by default exist in windows
-	qwglSwapBuffers = SwapBuffers;
-}
-
-// calls wglChoosePixelFormatARB() or ChoosePixelFormat() matching the main window from SDL
-int Win_ChoosePixelFormat(HDC hdc)
-{
-	if (win32.wglChoosePixelFormatARB != NULL && win32.piAttribIList != NULL) {
-		int formats[4];
-		UINT numFormats = 0;
-		if (win32.wglChoosePixelFormatARB(hdc, win32.piAttribIList, NULL, 4, formats, &numFormats) && numFormats > 0) {
-			return formats[0];
-		}
-		static bool haveWarned = false;
-		if(!haveWarned) {
-			common->Warning("wglChoosePixelFormatARB() failed, falling back to ChoosePixelFormat()!\n");
-			haveWarned = true;
-		}
-	}
-	// fallback to normal ChoosePixelFormats() - doesn't support MSAA!
-	return ChoosePixelFormat(hdc, &win32.pfd);
-}
-#endif
-
 
 // ---------- Time Stuff -------------
 
 // D3_CpuPause() abstracts a CPU pause instruction, to make busy waits a bit less power-hungry
 // (code taken from Yamagi Quake II)
-#ifdef SDL_CPUPauseInstruction
-  #define D3_CpuPause() SDL_CPUPauseInstruction()
-#elif defined(__GNUC__)
+#if defined(__GNUC__)
   #if (__i386 || __x86_64__)
     #define D3_CpuPause() asm volatile("pause")
   #elif defined(__aarch64__) || (defined(__ARM_ARCH) && __ARM_ARCH >= 7) || defined(__ARM_ARCH_6K__)
     #define D3_CpuPause() asm volatile("yield")
-  #elif defined(__powerpc__) || defined(__powerpc64__)
-    #define D3_CpuPause() asm volatile("or 27,27,27")
-  #elif defined(__riscv) && __riscv_xlen == 64
-    #define D3_CpuPause() asm volatile(".insn i 0x0F, 0, x0, x0, 0x010");
   #endif
 #elif defined(_MSC_VER)
   #if defined(_M_IX86) || defined(_M_X64)
@@ -1050,14 +716,12 @@ int Win_ChoosePixelFormat(HDC hdc)
 
 #ifndef D3_CpuPause
   #warning "No D3_CpuPause implementation for this platform/architecture! Will busy-wait sometimes!"
-  // TODO: something that prevents the loop from being optimized away?
-  //#define D3_CpuPause()
 #endif
 
-static double perfCountToMS = 0.0; // set in initTime()
+static double perfCountToMS = 0.0; // set in Win_InitTime()
 static LARGE_INTEGER firstCount = { 0 };
 
-static size_t pauseLoopsPer5usec = 100; // set in initTime()
+static size_t pauseLoopsPer5usec = 100; // set in Win_InitTime()
 
 static void Win_InitTime() {
 	LARGE_INTEGER freq = { 0 };
@@ -1148,11 +812,19 @@ void Sys_SleepUntilPrecise( double targetTimeMS ) {
 	} while ( msec >= 0.01 );
 }
 
+/*
+========================================================================
 
-// stdout/stderr redirection, originally from SDL_win32_main.c
+stdout/stderr redirection, originally from SDL_win32_main.c
 
-/* The standard output files */
-#define STDOUT_FILE	TEXT("dhewm3log.txt") /* DG: renamed this */
+This is what makes Sys_VPrintf above a log rather than a write to a handle
+nobody holds. It goes to Documents/My Games/dhewm3 rather than next to the
+executable, which may well not be writable.
+
+========================================================================
+*/
+
+#define STDOUT_FILE	TEXT("dhewm3log.txt")
 #define STDERR_FILE	TEXT("stderr.txt")
 
 /* Set a variable to tell if the stdio redirect has been enabled. */
@@ -1160,7 +832,6 @@ static int stdioRedirectEnabled = 0;
 static char stdoutPath[MAX_PATH];
 static char stderrPath[MAX_PATH];
 #define DIR_SEPERATOR TEXT("/")
-
 
 /* Remove the output files if there was no output written */
 static void cleanup_output(void) {
@@ -1240,22 +911,13 @@ static void redirect_output(void)
 
 	FILE *newfp;
 
-#if 0 /* DG: don't do this anymore. */
-	DWORD pathlen;
-	pathlen = GetModuleFileName(NULL, path, SDL_arraysize(path));
-	while ( pathlen > 0 && path[pathlen] != '\\' ) {
-		--pathlen;
-	}
-	path[pathlen] = '\0';
-#endif
-
-	SDL_strlcpy( stdoutPath, path, SDL_arraysize(stdoutPath) );
-	SDL_strlcat( stdoutPath, DIR_SEPERATOR STDOUT_FILE, SDL_arraysize(stdoutPath) );
+	idStr::Copynz( stdoutPath, path, sizeof(stdoutPath) );
+	idStr::Append( stdoutPath, sizeof(stdoutPath), DIR_SEPERATOR STDOUT_FILE );
 
 	{ /* DG: rename old stdout log */
 		char stdoutPathBK[MAX_PATH];
-		SDL_strlcpy( stdoutPathBK, path, SDL_arraysize(stdoutPath) );
-		SDL_strlcat( stdoutPathBK, DIR_SEPERATOR TEXT("dhewm3log-old.txt"), SDL_arraysize(stdoutPath) );
+		idStr::Copynz( stdoutPathBK, path, sizeof(stdoutPathBK) );
+		idStr::Append( stdoutPathBK, sizeof(stdoutPathBK), DIR_SEPERATOR TEXT("dhewm3log-old.txt") );
 		rename( stdoutPath, stdoutPathBK );
 	} /* DG end */
 
@@ -1279,8 +941,8 @@ static void redirect_output(void)
 #endif
 	}
 
-	SDL_strlcpy( stderrPath, path, SDL_arraysize(stderrPath) );
-	SDL_strlcat( stderrPath, DIR_SEPERATOR STDERR_FILE, SDL_arraysize(stderrPath) );
+	idStr::Copynz( stderrPath, path, sizeof(stderrPath) );
+	idStr::Append( stderrPath, sizeof(stderrPath), DIR_SEPERATOR STDERR_FILE );
 
 	newfp = freopen(stderrPath, TEXT("w"), stderr);
 	if ( newfp == NULL ) {	/* This happens on NT */
@@ -1305,17 +967,192 @@ static void redirect_output(void)
 	stdioRedirectEnabled = 1;
 }
 
-// end of stdout/stderr redirection code from old SDL
+/*
+========================================================================
+
+The crash handler, which is what posix_main.cpp's Posix_InitSignalHandlers is
+for on the other host: something went wrong in a way the engine cannot report,
+so say where before the process goes.
+
+It has to catch three different ways of dying, because Windows does not route
+them through one place the way a signal does:
+
+  - **A structured exception** - an access violation, a divide by zero, an
+    illegal instruction. SetUnhandledExceptionFilter sees these.
+  - **std::terminate**, which is where an uncaught C++ exception ends up. eacp
+    is C++/WinRT underneath, whose check_hresult throws, so a D3D12 call that
+    fails in a place nothing catches arrives here rather than at the filter.
+  - **The CRT's invalid parameter handler**, which is what fputs to a closed
+    FILE, a bad printf conversion or a fclose of a handle already closed reach.
+    Its default is __fastfail, and __fastfail is invisible to everything above:
+    it does not raise, so the filter never runs and the process dies with
+    STATUS_STACK_BUFFER_OVERRUN (0xC0000409) and no explanation at all. That is
+    the one this was written for.
+
+The backtrace is CaptureStackBackTrace rather than StackWalk64, and the choice
+is worth a line: all three of these run on the failing thread with its frames
+still on the stack, so walking up from here walks through them, and it costs no
+CONTEXT plumbing and no per-architecture machine types. Symbol names need a PDB
+- the Release configuration does not build one, so a Release crash gives module
+names and offsets, which still says which library it was in.
+
+========================================================================
+*/
+
+static void CrashPrintf( const char *fmt, ... ) {
+	char	text[MAXPRINTMSG];
+	va_list	argptr;
+
+	va_start( argptr, fmt );
+	idStr::vsnPrintf( text, sizeof( text ) - 1, fmt, argptr );
+	va_end( argptr );
+	text[sizeof( text ) - 1] = '\0';
+
+	// Not Sys_Printf: this runs when the process is already broken, and one of
+	// the ways it gets here is stdout itself being unusable. Both sinks are
+	// tried, and the debugger's cannot fail.
+	OutputDebugString( text );
+	fputs( text, stdout );
+	fflush( stdout );
+}
+
+static void CrashBacktrace( const char *what ) {
+	static LONG	entered = 0;
+
+	// Once. A handler that faults inside itself would otherwise recurse until
+	// the stack runs out, and the second report would be about the handler.
+	if ( InterlockedExchange( &entered, 1 ) != 0 ) {
+		return;
+	}
+
+	CrashPrintf( "\n=== %s ===\n", what );
+
+	void *	frames[62];
+	USHORT	count = CaptureStackBackTrace( 0, 62, frames, NULL );
+
+	HANDLE	process = GetCurrentProcess();
+
+	SymSetOptions( SYMOPT_DEFERRED_LOADS | SYMOPT_LOAD_LINES | SYMOPT_UNDNAME );
+	SymInitialize( process, NULL, TRUE );
+
+	// SYMBOL_INFO carries the name past the end of the struct, so it is sized
+	// rather than declared.
+	char			buffer[sizeof( SYMBOL_INFO ) + MAX_SYM_NAME];
+	SYMBOL_INFO *	symbol = (SYMBOL_INFO *)buffer;
+
+	memset( buffer, 0, sizeof( buffer ) );
+	symbol->SizeOfStruct = sizeof( SYMBOL_INFO );
+	symbol->MaxNameLen = MAX_SYM_NAME;
+
+	for ( USHORT i = 0; i < count; ++i ) {
+		DWORD64	address = (DWORD64)frames[i];
+		DWORD64	displacement = 0;
+
+		if ( SymFromAddr( process, address, &displacement, symbol ) ) {
+			IMAGEHLP_LINE64	line = {};
+			DWORD			lineDisplacement = 0;
+
+			line.SizeOfStruct = sizeof( line );
+
+			if ( SymGetLineFromAddr64( process, address, &lineDisplacement, &line ) ) {
+				CrashPrintf( "  #%-2d %s  (%s:%lu)\n", i, symbol->Name,
+				             line.FileName, line.LineNumber );
+			} else {
+				CrashPrintf( "  #%-2d %s + 0x%llx\n", i, symbol->Name, displacement );
+			}
+
+			continue;
+		}
+
+		// No PDB, which is the Release configuration's normal case. The module
+		// and the offset into it are still worth having.
+		char		moduleName[MAX_PATH] = "?";
+		HMODULE		module = NULL;
+
+		if ( GetModuleHandleEx( GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS
+		                        | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+		                        (LPCSTR)frames[i], &module ) ) {
+			GetModuleFileName( module, moduleName, sizeof( moduleName ) );
+			CrashPrintf( "  #%-2d %s + 0x%llx\n", i, moduleName,
+			             address - (DWORD64)module );
+			continue;
+		}
+
+		CrashPrintf( "  #%-2d 0x%llx\n", i, address );
+	}
+
+	CrashPrintf( "=== end of backtrace ===\n" );
+}
+
+static LONG WINAPI Win_ExceptionFilter( EXCEPTION_POINTERS *pointers ) {
+	const EXCEPTION_RECORD *	record = pointers->ExceptionRecord;
+
+	CrashBacktrace( va( "unhandled exception 0x%08lx at 0x%p",
+	                    record->ExceptionCode, record->ExceptionAddress ) );
+
+	return EXCEPTION_EXECUTE_HANDLER;	// die, but having said why
+}
+
+static void Win_TerminateHandler() {
+	// What the exception was, if there is one in flight - which there is for
+	// every way of reaching std::terminate that this cares about.
+	const char *	what = "std::terminate";
+
+	if ( std::current_exception() ) {
+		try {
+			std::rethrow_exception( std::current_exception() );
+		} catch ( const std::exception &e ) {
+			what = va( "std::terminate: %s", e.what() );
+		} catch ( ... ) {
+			what = "std::terminate: a non-std exception";
+		}
+	}
+
+	CrashBacktrace( what );
+	_exit( 3 );
+}
+
+static void Win_InvalidParameterHandler( const wchar_t *expression, const wchar_t *function,
+                                         const wchar_t *file, unsigned int line, uintptr_t ) {
+	// The four arguments are only filled in by the debug CRT; the release one
+	// passes null for all of them, which is exactly when this is hardest to
+	// read without the backtrace below.
+	CrashBacktrace( va( "CRT invalid parameter in %ls (%ls:%u): %ls",
+	                    function ? function : L"?",
+	                    file ? file : L"?", line,
+	                    expression ? expression : L"?" ) );
+	_exit( 3 );
+}
+
+static void Win_InstallCrashHandlers() {
+	SetUnhandledExceptionFilter( Win_ExceptionFilter );
+	std::set_terminate( Win_TerminateHandler );
+	_set_invalid_parameter_handler( Win_InvalidParameterHandler );
+
+	// abort() otherwise puts up a dialog nobody is there to dismiss, and this
+	// is a windowed process that may be running under a script.
+	_set_abort_behavior( 0, _WRITE_ABORT_MSG | _CALL_REPORTFAULT );
+}
 
 /*
 ==================
-The pseudo-main function called from real main (either in SDL_win32_main.c or WinMain() below)
-NOTE: Currently argv[] are ANSI strings, not UTF-8 strings as usual in SDL2 and SDL3!
+Win_EarlyInit
+
+Everything that has to be true before eacp opens a window, which is everything
+the first printed line and the first read clock depend on. sys/eacp/Main.cpp
+calls this where the macOS host calls Sys_InitPaths + Posix_InitSignalHandlers,
+and for the same reason: Posix_InitSignalHandlers opens that host's log and
+starts its clock too.
+
+There is no Windows Sys_InitPaths beside it, because there is nothing to
+resolve: Sys_GetPath answers from GetModuleFileName and the registry every time
+it is asked, and unlike the macOS host this one does not have to make any
+directory current for its own game data to be findable.
 ==================
 */
-int SDL_main(int argc, char *argv[]) {
-	// as the very first thing, redirect stdout to dhewm3log.txt (and stderr to stderr.txt)
-	// so we can log
+void Win_EarlyInit( void ) {
+	// as the very first thing, redirect stdout to dhewm3log.txt (and stderr to
+	// stderr.txt) so we can log
 	redirect_output();
 	atexit(cleanup_output);
 
@@ -1329,132 +1166,17 @@ int SDL_main(int argc, char *argv[]) {
 		printf("Opened this log at %s\n", timeStr);
 	}
 
-	InitializeCriticalSection( &printfCritSect );
-
+	// the base time for Sys_MillisecondsPrecise() should be set very early
 	Win_InitTime();
 
-#ifdef ID_DEDICATED
-	MSG msg;
-#else
-	// tell windows we're high dpi aware, otherwise display scaling screws up the game
-	setHighDPIMode();
-#endif
-
 	Sys_SetPhysicalWorkMemory( 192 << 20, 1024 << 20 );
-
-	win32.hInstance = GetModuleHandle(NULL);
-
-	// done before Com/Sys_Init since we need this for error output
-	Sys_CreateConsole();
 
 	// no abort/retry/fail errors
 	SetErrorMode( SEM_FAILCRITICALERRORS );
 
-#ifdef DEBUG
-	// disable the painfully slow MS heap check every 1024 allocs
-	_CrtSetDbgFlag( 0 );
-#endif
-
-#ifdef ID_ALLOW_TOOLS
-	loadWGLpointers();
-#endif
-
-	if ( argc > 1 ) {
-		common->Init( argc-1, &argv[1] );
-	} else {
-		common->Init( 0, NULL );
-	}
-
-	// hide or show the early console as necessary
-	if ( win32.win_viewlog.GetInteger() || com_skipRenderer.GetBool() || idAsyncNetwork::serverDedicated.GetInteger() ) {
-		Sys_ShowConsole( 1, true );
-	} else {
-		Sys_ShowConsole( 0, false );
-	}
-
-#ifdef SET_THREAD_AFFINITY
-	// give the main thread an affinity for the first cpu
-	SetThreadAffinityMask( GetCurrentThread(), 1 );
-#endif
-
-	// Launch the script debugger
-	if ( strstr( GetCommandLine(), "+debugger" ) ) {
-
-#ifdef ID_ALLOW_TOOLS
-		DebuggerClientInit(GetCommandLine());
-#endif
-		return 0;
-	}
-
-	// ::SetFocus( win32.hWnd ); // DG: let SDL handle focus, otherwise input is fucked up! (#100)
-
-	// main game loop
-	while( 1 ) {
-#if ID_DEDICATED
-		// Since this is a Dedicated Server, process all Windowing Messages
-		// Now.
-		while(PeekMessage (&msg, NULL, 0, 0, PM_REMOVE)){
-			TranslateMessage(&msg);
-			DispatchMessage(&msg);
-		}
-
-		// Give the OS a little time to recuperate.
-		Sleep(10);
-#endif
-
-		Win_Frame();
-
-#ifdef ID_ALLOW_TOOLS
-		if ( com_editors ) {
-			if ( com_editors & EDITOR_GUI ) {
-				// GUI editor
-				GUIEditorRun();
-			} else if ( com_editors & EDITOR_RADIANT ) {
-				// Level Editor
-				RadiantRun();
-			}
-			else if (com_editors & EDITOR_MATERIAL ) {
-				//BSM Nerve: Add support for the material editor
-				MaterialEditorRun();
-			}
-			else {
-				if ( com_editors & EDITOR_LIGHT ) {
-					// in-game Light Editor
-					LightEditorRun();
-				}
-				if ( com_editors & EDITOR_SOUND ) {
-					// in-game Sound Editor
-					SoundEditorRun();
-				}
-				if ( com_editors & EDITOR_DECL ) {
-					// in-game Declaration Browser
-					DeclBrowserRun();
-				}
-				if ( com_editors & EDITOR_AF ) {
-					// in-game Articulated Figure Editor
-					AFEditorRun();
-				}
-				if ( com_editors & EDITOR_PARTICLE ) {
-					// in-game Particle Editor
-					ParticleEditorRun();
-				}
-				if ( com_editors & EDITOR_SCRIPT ) {
-					// in-game Script Editor
-					ScriptEditorRun();
-				}
-				if ( com_editors & EDITOR_PDA ) {
-					// in-game PDA Editor
-					PDAEditorRun();
-				}
-			}
-		}
-#endif
-		// run the game
-		common->Frame();
-	}
-
-	// never gets here
-	return 0;
+	// Last, because it is the thing that reports on everything above it having
+	// gone wrong, and because it wants the log open to report into.
+	Win_InstallCrashHandlers();
 }
 
 /*
@@ -1514,80 +1236,3 @@ void idSysLocal::StartProcess( const char *exePath, bool doexit ) {
 		cmdSystem->BufferCommandText( CMD_EXEC_APPEND, "quit\n" );
 	}
 }
-
-// the actual WinMain(), based on SDL2_main and SDL3's SDL_main_impl.h + SDL_RunApp()
-// but modified to pass ANSI strings to SDL_main() instead of UTF-8,
-// because dhewm3 doesn't use Unicode internally (except for Dear ImGui,
-// which doesn't use commandline arguments)
-// for SDL1.2, SDL_win32_main.c is still used instead
-#if SDL_VERSION_ATLEAST(2, 0, 0)
-
-/* Pop up an out of memory message, returns to Windows */
-static BOOL OutOfMemory(void)
-{
-	SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, "Fatal Error", "Out of memory - aborting", NULL);
-	return -1;
-}
-
-int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR szCmdLine, int sw)
-{
-	(void)hInst;
-	(void)hPrev;
-	(void)szCmdLine;
-	(void)sw;
-
-	LPWSTR *argvw;
-	char **argv;
-	int i, argc, result;
-
-	argvw = CommandLineToArgvW(GetCommandLineW(), &argc);
-	if (!argvw) {
-		return OutOfMemory();
-	}
-
-	/* Note that we need to be careful about how we allocate/free memory here.
-	* If the application calls SDL_SetMemoryFunctions(), we can't rely on
-	* SDL_free() to use the same allocator after SDL_main() returns.
-	*/
-
-	/* Parse it into argv and argc */
-	argv = (char **)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, (argc + 1) * sizeof(*argv));
-	if (!argv) {
-		return OutOfMemory();
-	}
-	for (i = 0; i < argc; ++i) {
-		// NOTE: SDL2+ uses CP_UTF8 instead of CP_ACP here (and in the other call below)
-		//       but Doom3 needs ANSI strings on Windows (so paths work with the Windows ANSI APIs)
-		const int ansiSize = WideCharToMultiByte(CP_ACP, 0, argvw[i], -1, NULL, 0, NULL, NULL);
-		if (!ansiSize) {  // uhoh?
-			SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, "Fatal Error", "Error processing command line arguments", NULL);
-			return -1;
-		}
-
-		argv[i] = (char *)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, ansiSize);  // this size includes the null-terminator character.
-		if (!argv[i]) {
-			return OutOfMemory();
-		}
-
-		if (WideCharToMultiByte(CP_ACP, 0, argvw[i], -1, argv[i], ansiSize, NULL, NULL) == 0) {  // failed? uhoh!
-			SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, "Fatal Error", "Error processing command line arguments", NULL);
-			return -1;
-		}
-	}
-	argv[i] = NULL;
-	LocalFree(argvw);
-
-	SDL_SetMainReady();
-
-	// Run the application main() code
-	result = SDL_main(argc, argv);
-
-	// Free argv, to avoid memory leak
-	for (i = 0; i < argc; ++i) {
-		HeapFree(GetProcessHeap(), 0, argv[i]);
-	}
-	HeapFree(GetProcessHeap(), 0, argv);
-
-	return result;
-}
-#endif
