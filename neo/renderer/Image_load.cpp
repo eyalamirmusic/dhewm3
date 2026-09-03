@@ -588,8 +588,10 @@ void idImage::GenerateImage( const byte *pic, int width, int height,
 
 	SetImageFilterAndRepeat();
 
-	// The whole chain has been handed over, down to 1x1. Last, and after the
-	// filter, because a backend that builds its texture here reads both.
+	// The whole chain has been handed over, down to 1x1. Last of all, so that
+	// nothing an image's loader does can arrive after the texture is built -
+	// which is the property the seam's comment on this call is written against,
+	// not an ordering the eacp backend happens to need.
 	renderBackend->FinishImage( this );
 
 	// see if we messed anything up
@@ -1028,6 +1030,11 @@ void idImage::UploadPrecompressedImage( byte *data, int len ) {
 			break;
 		default:
 			common->Warning( "Invalid compressed internal format\n" );
+			// AllocImage has already run, so a backend that gathers an upload
+			// has a slot open on this image. Closing it with no levels builds
+			// nothing, which is the right answer, and leaves the slot free for
+			// the next image rather than for this one to keep.
+			renderBackend->FinishImage( this );
 			return;
 		}
 	} else if ( ( header->ddspf.dwFlags & DDSF_RGBA ) && header->ddspf.dwRGBBitCount == 32 ) {
@@ -1049,6 +1056,7 @@ void idImage::UploadPrecompressedImage( byte *data, int len ) {
 		internalFormat = GL_ALPHA8;
 	} else {
 		common->Warning( "Invalid uncompressed internal format\n" );
+		renderBackend->FinishImage( this );	// as above
 		return;
 	}
 
@@ -1078,6 +1086,25 @@ void idImage::UploadPrecompressedImage( byte *data, int len ) {
 				(internalFormat <= GL_COMPRESSED_RGBA_S3TC_DXT1_EXT ? 8 : 16);
 		} else {
 			size = uw * uh * (header->ddspf.dwRGBBitCount / 8);
+		}
+
+		// The one bound on this walk, and it belongs here because this is the
+		// only layer that knows `len`. numMipmaps comes out of the file's own
+		// header and the loop follows it whatever the payload actually holds, so
+		// a .dds claiming eleven levels with one in it walks `imagedata` off the
+		// end of the buffer the whole file was read into. That was harmless for
+		// as long as no backend dereferenced the pointer - the OpenGL one handed
+		// it to glCompressedTexImage2D, which read it - and it is a heap
+		// over-read again now that the eacp backend copies from it.
+		//
+		// Stop rather than skip: the levels above this one are already uploaded,
+		// and numMipmaps is corrected so that the "chain stops short" block
+		// below says what actually arrived rather than what the header claimed.
+		if ( size <= 0 || imagedata + size > data + len ) {
+			common->Warning( "%s: .dds is shorter than its own mip chain (level %i of %i)",
+							 imgName.c_str(), i, numMipmaps );
+			numMipmaps = i;
+			break;
 		}
 
 		if ( uw > uploadWidth || uh > uploadHeight ) {
@@ -1118,9 +1145,12 @@ void idImage::UploadPrecompressedImage( byte *data, int len ) {
 
 	SetImageFilterAndRepeat();
 
-	// Last, so that a backend building its texture here sees both the level
-	// count SetImageMaxLevel just gave and the filter the block above may have
-	// dropped to TF_LINEAR.
+	// Last, so that a backend building its texture here sees the level count
+	// SetImageMaxLevel just gave rather than the one the header claimed. The
+	// filter the block above may have dropped to TF_LINEAR is *not* a reason:
+	// the eacp backend reads `filter` when level 0 arrives, well before this,
+	// and a demotion to TF_LINEAR on a one-level .dds costs it nothing because
+	// one supplied level and one built level are the same texture.
 	renderBackend->FinishImage( this );
 }
 

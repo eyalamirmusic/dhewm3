@@ -274,19 +274,16 @@ static void R_EacpConvertToRGBA( byte *dst, const byte *src, int numPixels,
 ================================================================================
 */
 
-static bool R_EacpIsBlockFormat( int internalFormat ) {
-	switch ( internalFormat ) {
-	case GL_COMPRESSED_RGB_S3TC_DXT1_EXT:
-	case GL_COMPRESSED_RGBA_S3TC_DXT1_EXT:
-	case GL_COMPRESSED_RGBA_S3TC_DXT3_EXT:
-	case GL_COMPRESSED_RGBA_S3TC_DXT5_EXT:
-	case GL_COMPRESSED_RGBA_BPTC_UNORM:
-		return true;
-	default:
-		return false;
-	}
-}
-
+// The eacp format one of GL's five block-compressed internal formats names, and
+// **RGBA8Unorm - which is not a block format at all - for anything else**.
+//
+// Every one of the five is named rather than swept into the default, which used
+// to answer BC7 and is the same kind of wrong answer eacp's own switches were
+// made exhaustive to stop: a GL name arriving here without a mapping would have
+// been uploaded as BC7 blocks, and a BC7 block and a DXT3 block are both sixteen
+// bytes, so nothing downstream could have noticed. An answer that is not a block
+// format at all cannot be uploaded by mistake, and `isCompressedFormat` on the
+// result is the test the caller makes.
 static GPU::TextureFormat R_EacpBlockFormat( int internalFormat ) {
 	switch ( internalFormat ) {
 	case GL_COMPRESSED_RGB_S3TC_DXT1_EXT:
@@ -296,9 +293,17 @@ static GPU::TextureFormat R_EacpBlockFormat( int internalFormat ) {
 		return GPU::TextureFormat::BC2RGBA;
 	case GL_COMPRESSED_RGBA_S3TC_DXT5_EXT:
 		return GPU::TextureFormat::BC3RGBA;
-	default:
+	case GL_COMPRESSED_RGBA_BPTC_UNORM:
 		return GPU::TextureFormat::BC7RGBA;
+	default:
+		return GPU::TextureFormat::RGBA8Unorm;
 	}
+}
+
+// Whether that mapping found one, so that the two questions cannot drift apart:
+// there is one table and this reads it.
+static bool R_EacpIsBlockFormat( int internalFormat ) {
+	return GPU::isCompressedFormat( R_EacpBlockFormat( internalFormat ) );
 }
 
 /*
@@ -306,18 +311,30 @@ static GPU::TextureFormat R_EacpBlockFormat( int internalFormat ) {
 R_EacpUncompressedEquivalent
 
 **What a compressed internal format is stored as when the pixels arrive
-uncompressed**, which happens for every image that has no .dds:
+uncompressed**, which happens whenever an image is loaded from its .tga:
 SelectInternalFormat returns a GL_COMPRESSED_* format for a diffuse, specular or
 bump image as soon as textureCompressionAvailable is true, and on OpenGL the
 driver would have compressed the RGBA bytes on their way in.
 
-**This port has no encoder and does not get one in this step.** The argument is
-the content: 2087 of the tour map's 2112 file-backed images already have a .dds,
-so an encoder would be for the remaining 25 - seven skybox cubes and eighteen
-demo menu images, about 17 MB - and every encoder makes a different picture out
-of the same pixels, which is a decision worth making on evidence rather than to
-fill in a switch. So such an upload is stored as RGBA8 with the swizzle of the
-*uncompressed* format it stands in for, which is what this answers.
+**This port has no encoder and does not get one in this step**, and the argument
+is a measured number rather than a shrug. Counting the images that actually
+reach this function during a demo_mars_city1 load - which is not the same set as
+"has no .dds", because most of what stays on the .tga path is TD_HIGH_QUALITY and
+would never have been compressed anyway - gives **9 images and 12.8 MB of RGBA8
+with their mips**: the seven env/* reflection cubes at 12.3 MB of it, and
+lights/duolight02grey and lights/flashlight5 at 0.4 MB between them. Every
+encoder makes a different picture out of the same pixels, so writing one for 12.8
+MB is a decision to make on evidence rather than to fill in a switch. The upload
+is stored as RGBA8 with the swizzle of the *uncompressed* format it stands in
+for, which is what this answers.
+
+**The seven cubes are structural rather than a gap in the demo's data.**
+ActuallyLoadImage's `cubeFiles != CF_2D` branch never calls
+CheckPrecompressedImage at all - "we don't check for pre-compressed cube images
+currently", says its comment - so a cube map takes the .tga path whatever the pk4
+holds, and the missing dds/env/ directory is a consequence rather than the cause.
+An encoder here would therefore be aimed at cube maps first, which is also where
+eacp's own refusals bite hardest: a compressed cube cannot be given a chain.
 
 The image's own internalFormat is then corrected to what was really stored, so
 that BitsForInternalFormat, StorageSize and listImages describe the texture that
@@ -677,10 +694,16 @@ private:
 	// Where one level of one face of an image being uploaded goes, and the
 	// place the buffer behind it is sized when level 0 arrives. NULL means the
 	// level is not wanted and the caller drops it - see the definition for the
-	// four ways that happens.
+	// five ways that happens.
 	byte *					PendingLevel( idImage *image, int face, int level,
 										  int width, int height,
 										  GPU::TextureFormat format );
+
+	// Notice a warning without printing it, and print whatever was noticed.
+	// Never call common->Warning or common->Printf while the pending slot is
+	// open; the member comment on pendingWarning says what happens if you do.
+	void					DeferWarning( const char *fmt, ... ) id_attribute((format(printf,2,3)));
+	void					FlushDeferredWarning( void );
 
 	// The pass, and it is a pointer because a RenderPass cannot be anything
 	// else: it has no default state and no move, so the only way to hold one
@@ -737,11 +760,28 @@ private:
 	// hands over one level of one face at a time. So a texture cannot be built
 	// until the upload is finished, and FinishImage is what says it is.
 	//
-	// One slot rather than a table keyed by image, because image loading is one
-	// image at a time: AllocImage opens the slot at the top of each of the three
-	// loaders and FinishImage closes it at the bottom, and nothing in between
-	// loads another image. Anything arriving for an image that does not hold the
-	// slot is dropped rather than written into somebody else's buffer.
+	// One slot rather than a table keyed by image, because image loading is
+	// **almost** one image at a time: AllocImage opens the slot at the top of
+	// each of the three loaders and FinishImage closes it at the bottom, and
+	// nothing the loaders themselves do in between loads another image.
+	// Anything arriving for an image that does not hold the slot is dropped
+	// rather than written into somebody else's buffer.
+	//
+	// **"Almost" is the whole of why nothing here prints.** `common->Warning`
+	// reaches idCommonLocal::VPrintf, which calls session->PacifierUpdate(),
+	// which during a map change runs a whole UpdateScreen() every 100 ms - and
+	// that draws GUIs, so it can Bind() an image that is not loaded yet and
+	// send it round ActuallyLoadImage -> GenerateImage -> AllocImage, and it
+	// runs RB_ExecuteBackEndCommands, whose first act is
+	// CompleteBackgroundImageLoads() -> UploadPrecompressedImage ->
+	// AllocImage. Either takes the slot out from under the upload that printed,
+	// which then drops its remaining levels and finishes with no texture - and
+	// silently, the missing-texture warning being one-shot. So a warning
+	// noticed while the slot is open is *stored* here and printed by
+	// FinishImage once the slot is closed and the texture is built, or by
+	// AllocImage before it opens the next one. DeferWarning and
+	// FlushDeferredWarning are the pair, and they are the only reason this
+	// class holds an idStr.
 	//
 	// The buffer is kept rather than freed between images - a level load uploads
 	// two thousand of them - and pendingFaces is a bit per cube face, so a cube
@@ -765,6 +805,11 @@ private:
 	// dimensions - so that FinishImage builds nothing rather than a texture out
 	// of a buffer with a hole in it.
 	bool				pendingFailed;
+
+	// The warning the open upload noticed, held until it is safe to print. Empty
+	// when there is none; the first one wins, since every caller is one-shot
+	// anyway and a second would only name the same fault twice.
+	idStr				pendingWarning;
 
 	// imgui-eacp's renderer half, and everything the settings menu costs the GPU:
 	// one shader, one pipeline, the font atlas and a streaming buffer pair. In
@@ -827,9 +872,11 @@ private:
 	// the difference between a note and an unusable console.
 	bool				warnedCopyFramebuffer;
 	bool				warnedCopyDepthbuffer;
-	bool				warnedCompressed;
+	bool				warnedCompressedFormat;
+	bool				warnedCompressedSize;
 	bool				warnedExternalFormat;
 	bool				warnedUploadShape;
+	bool				warnedNoTexture;
 	bool				warnedTexgen;
 	bool				warnedNewStage;
 	bool				warnedMissingTexture;
@@ -891,9 +938,11 @@ idRenderBackendEacp::idRenderBackendEacp() {
 	postProcessPass = false;
 	warnedCopyFramebuffer = false;
 	warnedCopyDepthbuffer = false;
-	warnedCompressed = false;
+	warnedCompressedFormat = false;
+	warnedCompressedSize = false;
 	warnedExternalFormat = false;
 	warnedUploadShape = false;
+	warnedNoTexture = false;
 	warnedTexgen = false;
 	warnedNewStage = false;
 	warnedMissingTexture = false;
@@ -2854,9 +2903,8 @@ void idRenderBackendEacp::DrawInteraction( const drawInteraction_t *din ) {
 		textures[i] = images[i] ? TextureFor( images[i] ) : NULL;
 
 		if ( !textures[i] ) {
-			// An image the upload path turned away, exactly as in DrawStage -
-			// and one more likely here, since a light's projected image is
-			// often a .dds this build cannot read.
+			// An image the upload path turned away, exactly as in DrawStage and
+			// for the reasons TextureForStage lists.
 			if ( !warnedMissingTexture ) {
 				warnedMissingTexture = true;
 				common->Warning( "eacp: '%s' has no texture on the GPU, so a surface will not draw",
@@ -4064,9 +4112,8 @@ void idRenderBackendEacp::BlendLightSurface( const drawSurf_t *surf,
 	GPU::Texture *	falloff = TextureFor( light.falloff );
 
 	if ( !projection || !falloff ) {
-		// A light's projected image is often a .dds this build cannot read, so
-		// this is the same warning DrawInteraction carries and for the same
-		// reason.
+		// The same warning DrawInteraction carries and for the same reason;
+		// TextureForStage lists the ways an image gets here with no texture.
 		if ( !warnedMissingTexture ) {
 			warnedMissingTexture = true;
 			common->Warning( "eacp: '%s' has no texture on the GPU, so a blend light "
@@ -4122,8 +4169,14 @@ const GPU::Texture *idRenderBackendEacp::TextureForStage( const idImage *image, 
 	GPU::Texture *	texture = image ? TextureFor( image ) : NULL;
 
 	if ( !texture ) {
-		// An image the upload path turned away - a .dds this build cannot read,
-		// or a cube whose six faces did not all arrive.
+		// An image the upload path turned away. Since step 10 that is no longer
+		// "a .dds this build cannot read" - it reads all of them - and what is
+		// left is four things: a source pixel layout UploadImageLevel does not
+		// take, a cube whose six faces did not all arrive, a chain whose levels
+		// did not come in the shape the first one promised, and a .dds whose
+		// only level GetDownsize skipped as oversized. FinishImage names the
+		// image the first time any of them happens; this names the material that
+		// then cannot draw.
 		if ( !warnedMissingTexture ) {
 			warnedMissingTexture = true;
 			common->Warning( "eacp: '%s' has no texture on the GPU, so a surface will not draw",
@@ -4846,6 +4899,47 @@ void idRenderBackendEacp::ReplaceTexture( idImage *image,
 
 /*
 ====================
+idRenderBackendEacp::DeferWarning / FlushDeferredWarning
+
+A warning noticed while the pending slot is open, printed once it is closed. The
+comment on pendingWarning has the reason and it is not a style preference: a
+print during a level load can re-enter the image loader through
+PacifierUpdate's UpdateScreen and take the slot away from the upload that was
+printing.
+====================
+*/
+void idRenderBackendEacp::DeferWarning( const char *fmt, ... ) {
+	if ( pendingWarning.Length() ) {
+		return;
+	}
+
+	char	text[1024];
+	va_list	args;
+
+	va_start( args, fmt );
+	idStr::vsnPrintf( text, sizeof( text ) - 1, fmt, args );
+	va_end( args );
+
+	text[sizeof( text ) - 1] = '\0';
+	pendingWarning = text;
+}
+
+void idRenderBackendEacp::FlushDeferredWarning( void ) {
+	if ( !pendingWarning.Length() ) {
+		return;
+	}
+
+	// Cleared *before* the print, not after: printing is what can re-enter, and
+	// a re-entrant upload that defers a warning of its own must not have it
+	// overwritten by this one being cleared on the way out.
+	const idStr	message( pendingWarning );
+
+	pendingWarning.Clear();
+	common->Warning( "%s", message.c_str() );
+}
+
+/*
+====================
 idRenderBackendEacp::AllocImage
 
 A name, and nothing behind it yet - the texture is created when the upload that
@@ -4859,13 +4953,26 @@ calls it as its first act after PurgeImage, so it is the one place that can say
 "whatever was half-gathered before, this image starts clean" - which is what
 makes an upload interrupted part way through, or an image reloaded over itself,
 begin again rather than mix two sets of levels.
+
+**The flush is before the slot is opened rather than after**, and the order is
+the point: printing can re-enter this function, so a nested load has to find the
+slot in the state it was in - free - run to completion and give it back, before
+this call claims it.
 ====================
 */
 void idRenderBackendEacp::AllocImage( idImage *image ) {
 	static unsigned int	nextName = 1;
 
+	FlushDeferredWarning();
+
 	image->texnum = nextName++;
-	image->backendTexture = NULL;
+
+	// Released rather than forgotten. UploadPrecompressedImage does not
+	// PurgeImage first, so an image that already has a texture can arrive here -
+	// a background cache load completing on an image reloadImages re-created
+	// meanwhile - and dropping the pointer would leak the eacp texture behind
+	// it.
+	ReplaceTexture( image, NULL );
 
 	pendingImage = image;
 	pendingWidth = 0;
@@ -4916,7 +5023,7 @@ and the place that buffer is sized - which is when level 0 of face 0 arrives,
 that being the first call in which the size, the format and the shape are all
 known.
 
-NULL, and the caller drops the level, in four cases:
+NULL, and the caller drops the level, in five cases:
 
   - the image does not hold the pending slot at all, which is an upload that
     never went through AllocImage or one whose image was freed under it;
@@ -4929,6 +5036,11 @@ NULL, and the caller drops the level, in four cases:
     eacp's own chain built per face out of that face's own pixels. Seven images
     in the demo are cubes and none of them has a .dds, so what this costs is
     R_MipMap's filter on seven skyboxes;
+  - a level index past the end of the chain the size has - `mipLevelCount` of
+    level 0's dimensions - which is a .dds whose dwMipMapCount claims more
+    levels than a texture that size can hold. Dropped rather than failed: the
+    levels that did fit are a complete chain as far as they go, and eacp is
+    handed exactly them;
   - a level whose dimensions are not the ones the chain has at that index, or
     one arriving out of order. Those two are failures rather than drops: the
     buffer would have a hole in it, so pendingFailed stops FinishImage building
@@ -5008,9 +5120,9 @@ byte *idRenderBackendEacp::PendingLevel( idImage *image, int face, int level,
 		 || level != pendingLevels ) {
 		if ( !warnedUploadShape ) {
 			warnedUploadShape = true;
-			common->Warning( "eacp: image '%s' uploaded level %i as %ix%i, which is not "
-							 "level %i of a %ix%i chain", image->imgName.c_str(), level,
-							 width, height, pendingLevels, pendingWidth, pendingHeight );
+			DeferWarning( "eacp: image '%s' uploaded level %i as %ix%i, which is not "
+						  "level %i of a %ix%i chain", image->imgName.c_str(), level,
+						  width, height, pendingLevels, pendingWidth, pendingHeight );
 		}
 		pendingFailed = true;
 		return NULL;
@@ -5055,8 +5167,8 @@ void idRenderBackendEacp::UploadImageLevel( idImage *image, int face, int level,
 	if ( R_EacpSourceStride( externalFormat ) == 0 ) {
 		if ( !warnedExternalFormat ) {
 			warnedExternalFormat = true;
-			common->Warning( "eacp: image '%s' uploaded in an unsupported source format 0x%x",
-							 image->imgName.c_str(), externalFormat );
+			DeferWarning( "eacp: image '%s' uploaded in an unsupported source format 0x%x",
+						  image->imgName.c_str(), externalFormat );
 		}
 		return;
 	}
@@ -5093,12 +5205,16 @@ Gap 4, closed. One level of blocks out of a .dds, gathered into the pending
 upload exactly as an uncompressed level is and uploaded to the device untouched
 - no decode here, none in eacp, and none on the way to the sampler.
 
-The one thing this does that its uncompressed twin does not is **check the byte
-count against the dimensions**. The .dds loader computes a level's size from the
-file's own header and its own idea of how many bytes a block is, and this knows
-the same thing from the format; the two disagreeing means the file is not the
-shape its header claims, and copying numBytes anyway would read past the end of
-the buffer the whole file was read into. Refused and named rather than trusted.
+**The byte-count check below is not the bounds guard, and this comment used to
+say it was.** `numBytes` is not measured against the file: the loader computes it
+from the level's own dimensions with the same block arithmetic `levelBytes` uses,
+so for every format either can name the two agree by construction and the branch
+cannot fire. What can run off the end of the buffer the .dds was read into is the
+*source* pointer, which the loader walks by the header's own mip count - and the
+bound for that is in the loader, which is the only layer that knows the file's
+length. The check stays as a cheap invariant against a future loader that
+computes a size some other way; it is not what keeps this memcpy inside the
+file.
 
 Levels are renumbered from 0 by the loader when GetDownsize skips the top ones,
 so the `level` argument is already the index in the chain that will be created,
@@ -5112,25 +5228,25 @@ void idRenderBackendEacp::UploadCompressedImageLevel( idImage *image, int level,
 		return;
 	}
 
-	if ( !R_EacpIsBlockFormat( internalFormat ) ) {
-		if ( !warnedCompressed ) {
-			warnedCompressed = true;
-			common->Warning( "eacp: image '%s' uploaded as compressed in format 0x%x, "
-							 "which is not one of the block formats",
-							 image->imgName.c_str(), internalFormat );
+	const GPU::TextureFormat	format = R_EacpBlockFormat( internalFormat );
+
+	if ( !GPU::isCompressedFormat( format ) ) {
+		if ( !warnedCompressedFormat ) {
+			warnedCompressedFormat = true;
+			DeferWarning( "eacp: image '%s' uploaded as compressed in format 0x%x, "
+						  "which is not one of the block formats",
+						  image->imgName.c_str(), internalFormat );
 		}
 		return;
 	}
 
-	const GPU::TextureFormat	format = R_EacpBlockFormat( internalFormat );
-
 	if ( (size_t)numBytes != GPU::levelBytes( format, width, height ) ) {
-		if ( !warnedCompressed ) {
-			warnedCompressed = true;
-			common->Warning( "eacp: image '%s' level %i is %i bytes where %ix%i of that "
-							 "format is %i - the file is not the shape its header says",
-							 image->imgName.c_str(), level, numBytes, width, height,
-							 (int)GPU::levelBytes( format, width, height ) );
+		if ( !warnedCompressedSize ) {
+			warnedCompressedSize = true;
+			DeferWarning( "eacp: image '%s' level %i is %i bytes where %ix%i of that "
+						  "format is %i - the caller's block arithmetic and eacp's "
+						  "disagree", image->imgName.c_str(), level, numBytes, width,
+						  height, (int)GPU::levelBytes( format, width, height ) );
 		}
 		return;
 	}
@@ -5176,6 +5292,19 @@ The three shapes it builds are the three the loaders produce:
     .dds. Short is correct rather than tolerated - see SetImageMaxLevel.
   - an image nothing will sample the chain of: level 0 alone, mipLevels left at
     0, which is eacp's "one level".
+
+**Every print in this function is at the end**, after the slot is closed and the
+texture is built, for the reason pendingWarning's comment gives: a warning here
+can re-enter the image loader through PacifierUpdate, and a re-entrant upload
+would take the slot - and with it the buffer this function is still reading -
+away from underneath it.
+
+**An image that leaves here with no texture is worth a line**, because the
+alternative is finding out about it as a surface that does not draw. It happens
+for four reasons and only the last is a defect: a level of the wrong shape
+(pendingFailed), a cube that did not get all six faces, a .dds whose only level
+GetDownsize skipped as oversized - a mip-less file above image_downSizeLimit
+uploads nothing at all - and a loader that gave up between AllocImage and here.
 ====================
 */
 void idRenderBackendEacp::FinishImage( idImage *image ) {
@@ -5185,29 +5314,36 @@ void idRenderBackendEacp::FinishImage( idImage *image ) {
 
 	pendingImage = NULL;
 
-	if ( pendingFailed || pendingLevels == 0 || pendingWidth <= 0 || pendingHeight <= 0 ) {
-		return;
-	}
+	const bool	gathered = !pendingFailed && pendingLevels > 0
+						   && pendingWidth > 0 && pendingHeight > 0
+						   && ( !pendingCube || pendingFaces == 0x3f );
 
-	GPU::TextureDescriptor	descriptor;
+	if ( gathered ) {
+		GPU::TextureDescriptor	descriptor;
 
-	descriptor.width = pendingWidth;
-	descriptor.height = pendingHeight;
-	descriptor.format = pendingFormat;
+		descriptor.width = pendingWidth;
+		descriptor.height = pendingHeight;
+		descriptor.format = pendingFormat;
 
-	if ( pendingCube ) {
-		if ( pendingFaces != 0x3f ) {
-			return;
+		if ( pendingCube ) {
+			descriptor.cube = true;
+			descriptor.mipmapped = ( image->filter == TF_DEFAULT );
+		} else if ( pendingChain ) {
+			descriptor.mipLevels = pendingLevels;
 		}
 
-		descriptor.cube = true;
-		descriptor.mipmapped = ( image->filter == TF_DEFAULT );
-	} else if ( pendingChain ) {
-		descriptor.mipLevels = pendingLevels;
+		ReplaceTexture( image, makeOwned<GPU::Texture>( GPU::Device::shared(), descriptor,
+														pendingPixels.Ptr() ) );
 	}
 
-	ReplaceTexture( image, makeOwned<GPU::Texture>( GPU::Device::shared(), descriptor,
-													pendingPixels.Ptr() ) );
+	if ( TextureFor( image ) == NULL && !warnedNoTexture ) {
+		warnedNoTexture = true;
+		DeferWarning( "eacp: image '%s' finished its upload with %i level(s) of %ix%i "
+					  "and no texture", image->imgName.c_str(), pendingLevels,
+					  pendingWidth, pendingHeight );
+	}
+
+	FlushDeferredWarning();
 }
 
 /*
