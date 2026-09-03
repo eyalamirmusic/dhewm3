@@ -123,27 +123,75 @@ void R_EacpSetFrame( GPU::Frame *frame ) {
 
 	Formats.
 
-	Doom 3 hands the backend GL's internal formats, and its source pixels are
-	always tightly packed RGBA bytes on this build - see UploadImageLevel's
-	comment on why the .dds path cannot reach here yet. eacp stores one 8-bit
-	four-channel format, so what the internal format decides is not the storage
-	but the *swizzle*: GL_LUMINANCE8 samples as (l, l, l, 1) and GL_ALPHA8 as
-	(0, 0, 0, a), and a shader reading a texture uploaded without that applied
-	reads different numbers from the same file.
+	Doom 3 hands the backend two format arguments per upload and they answer
+	different questions. `externalFormat` is how the *source* bytes are laid out
+	and `internalFormat` is what GL was being asked to keep them as; eacp stores
+	one 8-bit four-channel format for everything that is not a block, so what
+	reaches the texture is the second applied to the first.
 
-	Applied on the CPU as the pixels are copied, because the alternative is a
-	shader variant per format and the conversion happens once per image while
-	the sampling happens once per fragment.
+	**The source layouts are three and a half.** GL_RGBA is everything the engine
+	generated, four bytes a pixel. The uncompressed .dds files bring the other
+	three, and the demo pk4 has two of them: GL_BGRA_EXT for a 32-bit .dds (5
+	files) and GL_BGR_EXT for a 24-bit one, which is **three** bytes a pixel and
+	the only source here whose stride is not four (38 files). GL_ALPHA is a
+	one-byte .dds, which the demo has none of and which mods do.
+
+	**What internalFormat decides is the swizzle**, not the storage: GL_LUMINANCE8
+	samples as (l, l, l, 1) and GL_ALPHA8 as (0, 0, 0, a), and a shader reading a
+	texture uploaded without that applied reads different numbers from the same
+	file.
+
+	The two are one loop rather than two passes because a per-pixel copy is
+	already a switch; applied on the CPU because the alternative is a shader
+	variant per format, and this happens once per image where the sampling
+	happens once per fragment.
 
 ================================================================================
 */
 
-static void R_EacpSwizzleToRGBA( byte *dst, const byte *src, int numPixels, int internalFormat ) {
+// Bytes one source pixel occupies in this layout, and 0 for one that is not a
+// source at all - which the caller refuses rather than reading at some other
+// stride.
+static int R_EacpSourceStride( int externalFormat ) {
+	switch ( externalFormat ) {
+	case GL_RGBA:
+	case GL_BGRA_EXT:
+		return 4;
+	case GL_BGR_EXT:
+		return 3;
+	case GL_ALPHA:
+		return 1;
+	default:
+		return 0;
+	}
+}
+
+static void R_EacpConvertToRGBA( byte *dst, const byte *src, int numPixels,
+								 int externalFormat, int internalFormat ) {
+	const int	stride = R_EacpSourceStride( externalFormat );
+
 	for ( int i = 0 ; i < numPixels ; i++ ) {
-		const byte	r = src[i*4+0];
-		const byte	g = src[i*4+1];
-		const byte	b = src[i*4+2];
-		const byte	a = src[i*4+3];
+		const byte *	s = src + i * stride;
+		byte			r, g, b, a;
+
+		switch ( externalFormat ) {
+		case GL_BGRA_EXT:
+			b = s[0]; g = s[1]; r = s[2]; a = s[3];
+			break;
+		case GL_BGR_EXT:
+			// A 24-bit .dds carries no alpha at all, and internalFormat is
+			// GL_RGB8 for it, so this 255 is what the swizzle below would write
+			// anyway. Set here as well so that the byte is never read from a
+			// pixel that has none.
+			b = s[0]; g = s[1]; r = s[2]; a = 255;
+			break;
+		case GL_ALPHA:
+			r = g = b = 0; a = s[0];
+			break;
+		default:
+			r = s[0]; g = s[1]; b = s[2]; a = s[3];
+			break;
+		}
 
 		switch ( internalFormat ) {
 		case GL_ALPHA8:
@@ -198,6 +246,96 @@ static void R_EacpSwizzleToRGBA( byte *dst, const byte *src, int numPixels, int 
 			dst[i*4+3] = a;
 			break;
 		}
+	}
+}
+
+/*
+================================================================================
+
+	The block-compressed formats.
+
+	Step 10, and eacp gap 4. What arrives out of a .dds is 4x4 blocks of texels
+	as one 8- or 16-byte record each, and it reaches the device exactly as it
+	came off disk: eacp neither compresses nor decompresses, which is what makes
+	a compressed texture a quarter or an eighth of the memory rather than a
+	decode at load time.
+
+	The mapping is smaller than the enum makes it look. DXT1 with and without
+	punch-through alpha is one format on both APIs, BC1. DXT3 is BC2 and DXT5 is
+	BC3. **RXGB is BC3 too** - it is DXT5 with the normal's x channel moved into
+	alpha, which is what Doom 3's own compressor emitted for every normal map,
+	and 750 of the demo's 3642 .dds files are it. Nothing here or in eacp knows
+	that: the bytes are uploaded untouched and the convention belongs to the
+	shader, which reads a bump texel as .wyz (RenderProgs_Eacp.cpp) - so an RXGB
+	.dds and a .tga normal map that GenerateImage has swizzled the same way land
+	in the same layout. BC7 is dhewm3's own addition rather than id's, through
+	the DX10 header's dxgiFormat 98; the demo has none.
+
+================================================================================
+*/
+
+static bool R_EacpIsBlockFormat( int internalFormat ) {
+	switch ( internalFormat ) {
+	case GL_COMPRESSED_RGB_S3TC_DXT1_EXT:
+	case GL_COMPRESSED_RGBA_S3TC_DXT1_EXT:
+	case GL_COMPRESSED_RGBA_S3TC_DXT3_EXT:
+	case GL_COMPRESSED_RGBA_S3TC_DXT5_EXT:
+	case GL_COMPRESSED_RGBA_BPTC_UNORM:
+		return true;
+	default:
+		return false;
+	}
+}
+
+static GPU::TextureFormat R_EacpBlockFormat( int internalFormat ) {
+	switch ( internalFormat ) {
+	case GL_COMPRESSED_RGB_S3TC_DXT1_EXT:
+	case GL_COMPRESSED_RGBA_S3TC_DXT1_EXT:
+		return GPU::TextureFormat::BC1RGBA;
+	case GL_COMPRESSED_RGBA_S3TC_DXT3_EXT:
+		return GPU::TextureFormat::BC2RGBA;
+	case GL_COMPRESSED_RGBA_S3TC_DXT5_EXT:
+		return GPU::TextureFormat::BC3RGBA;
+	default:
+		return GPU::TextureFormat::BC7RGBA;
+	}
+}
+
+/*
+====================
+R_EacpUncompressedEquivalent
+
+**What a compressed internal format is stored as when the pixels arrive
+uncompressed**, which happens for every image that has no .dds:
+SelectInternalFormat returns a GL_COMPRESSED_* format for a diffuse, specular or
+bump image as soon as textureCompressionAvailable is true, and on OpenGL the
+driver would have compressed the RGBA bytes on their way in.
+
+**This port has no encoder and does not get one in this step.** The argument is
+the content: 2087 of the tour map's 2112 file-backed images already have a .dds,
+so an encoder would be for the remaining 25 - seven skybox cubes and eighteen
+demo menu images, about 17 MB - and every encoder makes a different picture out
+of the same pixels, which is a decision worth making on evidence rather than to
+fill in a switch. So such an upload is stored as RGBA8 with the swizzle of the
+*uncompressed* format it stands in for, which is what this answers.
+
+The image's own internalFormat is then corrected to what was really stored, so
+that BitsForInternalFormat, StorageSize and listImages describe the texture that
+exists rather than the one that was asked for. A backend overriding a front-end
+decision needs a reason and this is it: on OpenGL the driver was free to
+substitute too - a compressed format is a request, not a promise - and
+glGetTexLevelParameter with GL_TEXTURE_INTERNAL_FORMAT is how a caller found out
+what it got. This is that query, answered by the only layer that knows.
+====================
+*/
+static int R_EacpUncompressedEquivalent( int internalFormat ) {
+	switch ( internalFormat ) {
+	case GL_COMPRESSED_RGB_S3TC_DXT1_EXT:
+		// The one with no alpha channel: BC1 without punch-through samples as
+		// opaque, and GL_RGB8's swizzle writes 255 into it.
+		return GL_RGB8;
+	default:
+		return GL_RGBA8;
 	}
 }
 
@@ -854,13 +992,25 @@ void idRenderBackendEacp::Init( void ) {
 	glConfig.twoSidedStencilAvailable = true;
 	glConfig.textureNonPowerOfTwoAvailable = true;
 
-	// Gap 4. The pk4s carry every texture twice - 3395 .dds files beside 3771
-	// .tga in the demo - and CheckPrecompressedImage is gated on this, so
-	// saying no here loads the uncompressed original rather than needing a
-	// decompressor. It costs load time and four times the memory, which is
-	// what the gap is about.
-	glConfig.textureCompressionAvailable = false;
-	glConfig.bptcTextureCompressionAvailable = false;
+	// Gap 4, closed by step 10. eacp has the four block-compressed formats now -
+	// BC1, BC2, BC3 and BC7 - so this is what opens the .dds beside every .tga
+	// in the pk4s: CheckPrecompressedImage tests this flag before it reads a
+	// file header, and with it false the engine decompressed nothing because it
+	// never looked. 2087 of the tour map's 2112 file-backed images have one.
+	//
+	// Asked of the device rather than asserted. Every Mac has the BC formats and
+	// every feature-level-11 Direct3D device is required to, but an
+	// Apple-family iOS GPU mostly does not, and a texture in a format the device
+	// refuses is *invalid* on eacp rather than quietly something else - so the
+	// question has to be answered before the engine decides which file to open,
+	// which is exactly what this flag does.
+	glConfig.textureCompressionAvailable = device.supportsBlockCompression();
+
+	// BC7 comes with the rest: there is no device on either API that has BC1 and
+	// not BC7, so one query answers both. What it switches on is a .dds carrying
+	// the DX10 header with dxgiFormat 98, or the 'BC70'/'BC7L' fourccs - the
+	// demo pk4 has none, and dhewm3's own re-compressor writes them.
+	glConfig.bptcTextureCompressionAvailable = glConfig.textureCompressionAvailable;
 
 	// Gap 7: sampling is fixed when an eacp shader is compiled, and the four
 	// configurations it offers are linear or nearest by clamp or repeat. Mip
@@ -911,6 +1061,13 @@ void idRenderBackendEacp::Init( void ) {
 	glConfig.isWayland = false;
 
 	common->Printf( "GPU: %s\n", device.name().c_str() );
+
+	// Said out loud beside the device name, because it decides which half of the
+	// pk4 the whole level load reads and there is nothing else in the log that
+	// would say which one it took.
+	common->Printf( "eacp: %s\n", glConfig.textureCompressionAvailable
+					? "block-compressed textures, so the .dds files are used"
+					: "no block-compressed textures, so every .tga is uploaded whole" );
 
 	// **The one thing here that is a decision rather than a statement**, and the
 	// one that has to be made before anything is compiled: since 4e.1 the frame
@@ -4895,9 +5052,7 @@ detail and the count of what it costs.
 void idRenderBackendEacp::UploadImageLevel( idImage *image, int face, int level, int internalFormat,
 											int width, int height, int externalFormat,
 											const byte *pixels ) {
-	if ( externalFormat != GL_RGBA ) {
-		// The .dds path, which textureCompressionAvailable = false keeps shut,
-		// is the only producer of anything else.
+	if ( R_EacpSourceStride( externalFormat ) == 0 ) {
 		if ( !warnedExternalFormat ) {
 			warnedExternalFormat = true;
 			common->Warning( "eacp: image '%s' uploaded in an unsupported source format 0x%x",
@@ -4910,6 +5065,16 @@ void idRenderBackendEacp::UploadImageLevel( idImage *image, int face, int level,
 		return;
 	}
 
+	// Uncompressed pixels wearing a compressed internal format, which is what
+	// SelectInternalFormat produces for every image that has no .dds now that
+	// the flag is on. There is no encoder here, so the truth is RGBA8 and the
+	// image is told so - see R_EacpUncompressedEquivalent for the whole
+	// argument, including why the backend gets to overrule this decision.
+	if ( R_EacpIsBlockFormat( internalFormat ) ) {
+		internalFormat = R_EacpUncompressedEquivalent( internalFormat );
+		image->internalFormat = internalFormat;
+	}
+
 	byte *	destination = PendingLevel( image, face, level, width, height,
 										GPU::TextureFormat::RGBA8Unorm );
 
@@ -4917,27 +5082,66 @@ void idRenderBackendEacp::UploadImageLevel( idImage *image, int face, int level,
 		return;
 	}
 
-	R_EacpSwizzleToRGBA( destination, pixels, width * height, internalFormat );
+	R_EacpConvertToRGBA( destination, pixels, width * height, externalFormat, internalFormat );
 }
 
 /*
 ====================
 idRenderBackendEacp::UploadCompressedImageLevel
 
-Gap 4. Unreachable while textureCompressionAvailable is false, since that is
-what CheckPrecompressedImage tests before it opens a .dds at all - so this
-warns rather than decompresses, and the warning is the thing to look for if
-that flag is ever turned on before a decoder exists.
+Gap 4, closed. One level of blocks out of a .dds, gathered into the pending
+upload exactly as an uncompressed level is and uploaded to the device untouched
+- no decode here, none in eacp, and none on the way to the sampler.
+
+The one thing this does that its uncompressed twin does not is **check the byte
+count against the dimensions**. The .dds loader computes a level's size from the
+file's own header and its own idea of how many bytes a block is, and this knows
+the same thing from the format; the two disagreeing means the file is not the
+shape its header claims, and copying numBytes anyway would read past the end of
+the buffer the whole file was read into. Refused and named rather than trusted.
+
+Levels are renumbered from 0 by the loader when GetDownsize skips the top ones,
+so the `level` argument is already the index in the chain that will be created,
+and PendingLevel is where it lands.
 ====================
 */
 void idRenderBackendEacp::UploadCompressedImageLevel( idImage *image, int level, int internalFormat,
 													  int width, int height, int numBytes,
 													  const byte *data ) {
-	if ( !warnedCompressed ) {
-		warnedCompressed = true;
-		common->Warning( "eacp: compressed texture upload is not implemented (image '%s')",
-						 image->imgName.c_str() );
+	if ( width <= 0 || height <= 0 || numBytes <= 0 || data == NULL ) {
+		return;
 	}
+
+	if ( !R_EacpIsBlockFormat( internalFormat ) ) {
+		if ( !warnedCompressed ) {
+			warnedCompressed = true;
+			common->Warning( "eacp: image '%s' uploaded as compressed in format 0x%x, "
+							 "which is not one of the block formats",
+							 image->imgName.c_str(), internalFormat );
+		}
+		return;
+	}
+
+	const GPU::TextureFormat	format = R_EacpBlockFormat( internalFormat );
+
+	if ( (size_t)numBytes != GPU::levelBytes( format, width, height ) ) {
+		if ( !warnedCompressed ) {
+			warnedCompressed = true;
+			common->Warning( "eacp: image '%s' level %i is %i bytes where %ix%i of that "
+							 "format is %i - the file is not the shape its header says",
+							 image->imgName.c_str(), level, numBytes, width, height,
+							 (int)GPU::levelBytes( format, width, height ) );
+		}
+		return;
+	}
+
+	byte *	destination = PendingLevel( image, 0, level, width, height, format );
+
+	if ( destination == NULL ) {
+		return;
+	}
+
+	memcpy( destination, data, numBytes );
 }
 
 void idRenderBackendEacp::SetImageMaxLevel( idImage *image, int maxLevel ) {
