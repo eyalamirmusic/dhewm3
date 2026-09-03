@@ -243,6 +243,7 @@ public:
 												int width, int height, int numBytes,
 												const byte *data );
 	virtual void	SetImageMaxLevel( idImage *image, int maxLevel );
+	virtual void	FinishImage( idImage *image );
 	virtual void	UploadScratchImage( idImage *image, const byte *data, int cols, int rows );
 	virtual void	SetImageFilterAndRepeat( const idImage *image );
 	virtual void	SetCubeImageFilterAndRepeat( const idImage *image );
@@ -535,6 +536,14 @@ private:
 	static void				ReplaceTexture( idImage *image,
 											OwningPointer<GPU::Texture> texture );
 
+	// Where one level of one face of an image being uploaded goes, and the
+	// place the buffer behind it is sized when level 0 arrives. NULL means the
+	// level is not wanted and the caller drops it - see the definition for the
+	// four ways that happens.
+	byte *					PendingLevel( idImage *image, int face, int level,
+										  int width, int height,
+										  GPU::TextureFormat format );
+
 	// The pass, and it is a pointer because a RenderPass cannot be anything
 	// else: it has no default state and no move, so the only way to hold one
 	// past the expression that opened it is to build it where it will live.
@@ -583,18 +592,41 @@ private:
 	// backend has no equivalent because GL remembers this itself.
 	idImage *			boundImages[MAX_MULTITEXTURE_UNITS];
 
-	// The six faces of the cube currently being uploaded, gathered because
-	// GenerateCubeImage hands them over one at a time and eacp takes them all at
-	// once. A member rather than a local, since it has to survive between the
-	// six calls; kept rather than freed, since the next cube is almost always
-	// the same size as this one and a level load uploads a dozen of them.
+	// The image whose upload is under way, and everything gathered for it so
+	// far. This is what step 10 generalised the cube accumulation into, and the
+	// reason is the same fact one step further: eacp fixes a texture's level
+	// count *and* its face count when the resource is created, while the seam
+	// hands over one level of one face at a time. So a texture cannot be built
+	// until the upload is finished, and FinishImage is what says it is.
 	//
-	// cubeFacesFilled is a bit per face, so a loader that gave up half way
-	// through leaves the image with no texture rather than with a cube whose
-	// missing faces hold the last one's pixels.
-	idList<byte>		cubeFaces;
-	int					cubeFaceBytes;
-	int					cubeFacesFilled;
+	// One slot rather than a table keyed by image, because image loading is one
+	// image at a time: AllocImage opens the slot at the top of each of the three
+	// loaders and FinishImage closes it at the bottom, and nothing in between
+	// loads another image. Anything arriving for an image that does not hold the
+	// slot is dropped rather than written into somebody else's buffer.
+	//
+	// The buffer is kept rather than freed between images - a level load uploads
+	// two thousand of them - and pendingFaces is a bit per cube face, so a cube
+	// loader that gave up half way through leaves the image with no texture
+	// rather than a cube whose missing faces hold the last one's pixels.
+	idImage *			pendingImage;
+	idList<byte>		pendingPixels;
+	int					pendingWidth;
+	int					pendingHeight;
+	GPU::TextureFormat	pendingFormat;
+	int					pendingLevels;
+	int					pendingFaces;
+	bool				pendingCube;
+
+	// Whether the levels below the first are being kept, which is decided when
+	// level 0 arrives and is what sizes the buffer. See PendingLevel.
+	bool				pendingChain;
+
+	// Set by anything that makes the gathered bytes untrustworthy - a level of
+	// the wrong size, a compressed level whose byte count does not match its
+	// dimensions - so that FinishImage builds nothing rather than a texture out
+	// of a buffer with a hole in it.
+	bool				pendingFailed;
 
 	// imgui-eacp's renderer half, and everything the settings menu costs the GPU:
 	// one shader, one pipeline, the font atlas and a streaming buffer pair. In
@@ -659,6 +691,7 @@ private:
 	bool				warnedCopyDepthbuffer;
 	bool				warnedCompressed;
 	bool				warnedExternalFormat;
+	bool				warnedUploadShape;
 	bool				warnedTexgen;
 	bool				warnedNewStage;
 	bool				warnedMissingTexture;
@@ -699,8 +732,15 @@ idRenderBackendEacp::idRenderBackendEacp() {
 	suspendedHasViewport = false;
 	suspendedHasScissor = false;
 	passHasWorldView = false;
-	cubeFaceBytes = 0;
-	cubeFacesFilled = 0;
+	pendingImage = NULL;
+	pendingWidth = 0;
+	pendingHeight = 0;
+	pendingFormat = GPU::TextureFormat::RGBA8Unorm;
+	pendingLevels = 0;
+	pendingFaces = 0;
+	pendingCube = false;
+	pendingChain = false;
+	pendingFailed = false;
 	memset( boundImages, 0, sizeof( boundImages ) );
 	drawProgram = NULL;
 	drawPipeline = NULL;
@@ -715,6 +755,7 @@ idRenderBackendEacp::idRenderBackendEacp() {
 	warnedCopyDepthbuffer = false;
 	warnedCompressed = false;
 	warnedExternalFormat = false;
+	warnedUploadShape = false;
 	warnedTexgen = false;
 	warnedNewStage = false;
 	warnedMissingTexture = false;
@@ -4650,10 +4691,17 @@ void idRenderBackendEacp::ReplaceTexture( idImage *image,
 ====================
 idRenderBackendEacp::AllocImage
 
-A name, and nothing behind it yet - the texture is created by the first upload,
-which is the first point its size and format are known. texnum is what the rest
-of the engine tests against TEXTURE_NOT_LOADED, so it has to become something
-here even though it names nothing on this backend.
+A name, and nothing behind it yet - the texture is created when the upload that
+is about to start finishes, which is the first point its size, its format and
+its level count are all known. texnum is what the rest of the engine tests
+against TEXTURE_NOT_LOADED, so it has to become something here even though it
+names nothing on this backend.
+
+This is also where the pending upload is opened. Every one of the three loaders
+calls it as its first act after PurgeImage, so it is the one place that can say
+"whatever was half-gathered before, this image starts clean" - which is what
+makes an upload interrupted part way through, or an image reloaded over itself,
+begin again rather than mix two sets of levels.
 ====================
 */
 void idRenderBackendEacp::AllocImage( idImage *image ) {
@@ -4661,10 +4709,25 @@ void idRenderBackendEacp::AllocImage( idImage *image ) {
 
 	image->texnum = nextName++;
 	image->backendTexture = NULL;
+
+	pendingImage = image;
+	pendingWidth = 0;
+	pendingHeight = 0;
+	pendingLevels = 0;
+	pendingFaces = 0;
+	pendingCube = false;
+	pendingChain = false;
+	pendingFailed = false;
 }
 
 void idRenderBackendEacp::FreeImage( idImage *image ) {
 	ReplaceTexture( image, NULL );
+
+	// An image freed while its upload was still open takes the slot with it,
+	// so nothing that arrives afterwards can be attributed to a dead pointer.
+	if ( pendingImage == image ) {
+		pendingImage = NULL;
+	}
 
 	for ( int i = 0 ; i < MAX_MULTITEXTURE_UNITS ; i++ ) {
 		if ( boundImages[i] == image ) {
@@ -4689,38 +4752,149 @@ void idRenderBackendEacp::BindNoImage( void ) {
 
 /*
 ====================
+idRenderBackendEacp::PendingLevel
+
+Where one level of one face lands in the buffer the pending upload is gathering,
+and the place that buffer is sized - which is when level 0 of face 0 arrives,
+that being the first call in which the size, the format and the shape are all
+known.
+
+NULL, and the caller drops the level, in four cases:
+
+  - the image does not hold the pending slot at all, which is an upload that
+    never went through AllocImage or one whose image was freed under it;
+  - a level below the first on an image nothing will sample the chain of, which
+    is what pendingChain decides and where that rule's reason lives;
+  - **a level below the first of a cube**, which eacp cannot be given: a
+    TextureDescriptor carries six faces or a supplied chain, not both, because
+    nothing there can pin which level a direction sampled. So a cube keeps
+    exactly what it had before this function existed - level 0 of each face, and
+    eacp's own chain built per face out of that face's own pixels. Seven images
+    in the demo are cubes and none of them has a .dds, so what this costs is
+    R_MipMap's filter on seven skyboxes;
+  - a level whose dimensions are not the ones the chain has at that index, or
+    one arriving out of order. Those two are failures rather than drops: the
+    buffer would have a hole in it, so pendingFailed stops FinishImage building
+    anything out of it.
+====================
+*/
+byte *idRenderBackendEacp::PendingLevel( idImage *image, int face, int level,
+										 int width, int height,
+										 GPU::TextureFormat format ) {
+	if ( pendingImage != image || pendingFailed ) {
+		return NULL;
+	}
+
+	const bool	cube = ( image->type == TT_CUBIC );
+
+	if ( level == 0 && face == 0 ) {
+		// The upload begins here, whatever came before it. The chain is kept
+		// only for TF_DEFAULT - Doom 3's name for "the mipmapped one" - because
+		// TF_LINEAR and TF_NEAREST sample level 0 alone and a chain built for
+		// them is a third more upload and memory for nothing. That rule is
+		// older than this function; what changed is that it now decides how big
+		// this buffer is rather than what descriptor.mipmapped says.
+		pendingWidth = width;
+		pendingHeight = height;
+		pendingFormat = format;
+		pendingCube = cube;
+		pendingLevels = 0;
+		pendingFaces = 0;
+		pendingChain = ( image->filter == TF_DEFAULT ) && !cube;
+
+		const size_t	bytes = cube
+			? GPU::levelBytes( format, width, height ) * 6
+			: GPU::mipChainBytes( format, width, height,
+								  pendingChain ? GPU::mipLevelCount( width, height ) : 1 );
+
+		pendingPixels.SetNum( (int)bytes, false );
+	}
+
+	if ( pendingWidth <= 0 || pendingHeight <= 0 || cube != pendingCube
+		 || format != pendingFormat ) {
+		return NULL;
+	}
+
+	if ( cube ) {
+		if ( level != 0 || face < 0 || face > 5 ) {
+			return NULL;
+		}
+
+		if ( width != pendingWidth || height != pendingHeight ) {
+			pendingFailed = true;
+			return NULL;
+		}
+
+		pendingFaces |= 1 << face;
+		pendingLevels = 1;
+
+		return pendingPixels.Ptr()
+			   + (size_t)face * GPU::levelBytes( pendingFormat, width, height );
+	}
+
+	if ( face != 0 || ( level != 0 && !pendingChain ) ) {
+		return NULL;
+	}
+
+	if ( level < 0 || level >= GPU::mipLevelCount( pendingWidth, pendingHeight ) ) {
+		return NULL;
+	}
+
+	// The level's size has to be the size the chain has at that index, and the
+	// levels have to arrive in order, because the offset below is computed from
+	// the index rather than from a running cursor. Both are true of all three
+	// loaders - Doom 3 halves with a floor of one, which is mipExtent - so a
+	// failure here is a loader this backend has not been told about rather than
+	// content it cannot take.
+	if ( width != GPU::mipExtent( pendingWidth, level )
+		 || height != GPU::mipExtent( pendingHeight, level )
+		 || level != pendingLevels ) {
+		if ( !warnedUploadShape ) {
+			warnedUploadShape = true;
+			common->Warning( "eacp: image '%s' uploaded level %i as %ix%i, which is not "
+							 "level %i of a %ix%i chain", image->imgName.c_str(), level,
+							 width, height, pendingLevels, pendingWidth, pendingHeight );
+		}
+		pendingFailed = true;
+		return NULL;
+	}
+
+	pendingLevels = level + 1;
+
+	return pendingPixels.Ptr()
+		   + GPU::mipChainBytes( pendingFormat, pendingWidth, pendingHeight, level );
+}
+
+/*
+====================
 idRenderBackendEacp::UploadImageLevel
 
-Level 0 only, and the reason is eacp's rather than a shortcut. Doom 3 builds its
-own mip chain and uploads it a level at a time; eacp builds one on the CPU from
-level 0 - deliberately, so that Metal's generateMipmaps and a hand-written D3D12
-chain cannot produce two different pictures - and has no per-level entry point
-at all. So the levels below the first are dropped and eacp's own are used.
+One level of one face, swizzled into RGBA8 and gathered rather than uploaded -
+FinishImage is what turns the gathering into a texture, and its comment on the
+seam says why an API that fixes a level count at creation needs the two to be
+separate calls.
 
-Two things go with them, and both are worth knowing before someone looks for the
-bug: R_MipMap's preserveBorder, which is what keeps a TR_CLAMP_TO_ZERO image's
-zero edge intact all the way down its chain, and image_colorMipLevels, the
-debug tool that tints each level.
+**Doom 3's own mip chain is what reaches the GPU now**, which is step 10 and
+eacp gap 23. Before it, this took level 0 and dropped the rest, and eacp built a
+chain of its own from that level - deliberately on eacp's side, one filter shared
+by both backends so that Metal's generateMipmaps and a hand-written D3D12 chain
+could not produce two pictures. What that lost was the two things Doom 3 does to
+its own chain that an unweighted average does not: R_MipMap's preserveBorder,
+which keeps a TR_CLAMP_TO_ZERO image's zero edge intact all the way down so a
+projected light seen at a distance cannot spill past its own image, and
+image_colorMipLevels, the debug tool that tints each level and which could not
+show anything at all while the levels it tinted were being thrown away.
+eacp's TextureDescriptor::mipLevels is the answer, and eacp's own builder stays
+the default rather than becoming the wrong way.
 
-**A cube arrives as six of these calls and leaves as one texture**, which is the
-one place this function is not a single upload. GenerateCubeImage uploads level 0
-of faces 0 through 5 in order and then their mip chains; eacp takes a cube as one
-block of six faces, in that same order, so the six are accumulated into a buffer
-and the texture is created on the sixth. The buffer is a member rather than a
-local for exactly that reason - the calls are separate and the creation is not.
+**A cube is the one shape that still keeps eacp's chain**, because a descriptor
+carries six faces or a supplied chain and not both. PendingLevel above has the
+detail and the count of what it costs.
 ====================
 */
 void idRenderBackendEacp::UploadImageLevel( idImage *image, int face, int level, int internalFormat,
 											int width, int height, int externalFormat,
 											const byte *pixels ) {
-	if ( level != 0 ) {
-		return;
-	}
-
-	if ( image->type != TT_CUBIC && face != 0 ) {
-		return;
-	}
-
 	if ( externalFormat != GL_RGBA ) {
 		// The .dds path, which textureCompressionAvailable = false keeps shut,
 		// is the only producer of anything else.
@@ -4736,68 +4910,14 @@ void idRenderBackendEacp::UploadImageLevel( idImage *image, int face, int level,
 		return;
 	}
 
-	const int	facePixels = width * height;
+	byte *	destination = PendingLevel( image, face, level, width, height,
+										GPU::TextureFormat::RGBA8Unorm );
 
-	if ( image->type == TT_CUBIC ) {
-		// Six faces of one size, so a face arriving with a different size than
-		// the run in progress is a new cube and the buffer starts again. Face 0
-		// does the same thing, which is what makes an interrupted upload - an
-		// image reloaded over itself - start clean rather than mix two cubes.
-		const int	needed = facePixels * 4 * 6;
-
-		if ( face == 0 || cubeFaceBytes != needed ) {
-			cubeFaces.SetNum( needed, false );
-			cubeFaceBytes = needed;
-			cubeFacesFilled = 0;
-		}
-
-		if ( face < 0 || face > 5 ) {
-			return;
-		}
-
-		R_EacpSwizzleToRGBA( cubeFaces.Ptr() + face * facePixels * 4, pixels,
-							 facePixels, internalFormat );
-
-		cubeFacesFilled |= 1 << face;
-
-		// Created on the last one, and only once all six are in - a cube whose
-		// loader gave up part way through leaves the image with no texture,
-		// which DrawStage reports rather than drawing something half-built.
-		if ( cubeFacesFilled != 0x3f ) {
-			return;
-		}
-
-		GPU::TextureDescriptor	descriptor;
-
-		descriptor.width = width;
-		descriptor.height = height;
-		descriptor.format = GPU::TextureFormat::RGBA8Unorm;
-		descriptor.cube = true;
-		descriptor.mipmapped = ( image->filter == TF_DEFAULT );
-
-		ReplaceTexture( image, makeOwned<GPU::Texture>( GPU::Device::shared(), descriptor,
-														cubeFaces.Ptr() ) );
+	if ( destination == NULL ) {
 		return;
 	}
 
-	byte *		swizzled = (byte *)R_StaticAlloc( facePixels * 4 );
-	R_EacpSwizzleToRGBA( swizzled, pixels, facePixels, internalFormat );
-
-	GPU::TextureDescriptor	descriptor;
-
-	descriptor.width = width;
-	descriptor.height = height;
-	descriptor.format = GPU::TextureFormat::RGBA8Unorm;
-
-	// Only where something will sample them. TF_DEFAULT is Doom 3's name for
-	// "the mipmapped one"; TF_LINEAR and TF_NEAREST both sample level 0 alone,
-	// so a chain built for them is a third more upload and memory for nothing.
-	descriptor.mipmapped = ( image->filter == TF_DEFAULT );
-
-	ReplaceTexture( image, makeOwned<GPU::Texture>( GPU::Device::shared(), descriptor,
-													swizzled ) );
-
-	R_StaticFree( swizzled );
+	R_EacpSwizzleToRGBA( destination, pixels, width * height, internalFormat );
 }
 
 /*
@@ -4821,7 +4941,69 @@ void idRenderBackendEacp::UploadCompressedImageLevel( idImage *image, int level,
 }
 
 void idRenderBackendEacp::SetImageMaxLevel( idImage *image, int maxLevel ) {
-	// The .dds path's, and it goes with UploadCompressedImageLevel.
+	// Nothing to do, and it is not an omission any more. What this said on
+	// OpenGL - "the chain stops here, do not sample below it" - is said on eacp
+	// by the level count the texture is created with, and that count is how many
+	// levels the upload actually handed over. A .dds whose chain stops before
+	// 1x1 uploads maxLevel + 1 of them and gets a texture with exactly that
+	// many, which is what GL_TEXTURE_MAX_LEVEL bought: the sampler clamps to the
+	// last level there is rather than reading one nothing wrote.
+}
+
+/*
+====================
+idRenderBackendEacp::FinishImage
+
+The upload is complete, so the texture can be built: this is where every image
+on this backend is created, and the only place. The seam's own comment says why
+it has to be a call of its own rather than something read off the last upload -
+in short, because eacp fixes a level count when the resource is created and
+Doom 3 hands the levels over one at a time with no end marker of its own.
+
+The three shapes it builds are the three the loaders produce:
+
+  - a cube, once all six faces are in. A loader that gave up part way through
+    leaves the image with no texture, which DrawStage reports rather than
+    drawing something half-built. eacp builds the chain here, per face, for the
+    reason PendingLevel gives - and gives such a texture exactly one level if
+    its format is compressed, blocks having no average.
+  - an image whose chain Doom 3 built: mipLevels is how many levels arrived,
+    which is the whole chain from GenerateImage and may be short of 1x1 from a
+    .dds. Short is correct rather than tolerated - see SetImageMaxLevel.
+  - an image nothing will sample the chain of: level 0 alone, mipLevels left at
+    0, which is eacp's "one level".
+====================
+*/
+void idRenderBackendEacp::FinishImage( idImage *image ) {
+	if ( pendingImage != image ) {
+		return;
+	}
+
+	pendingImage = NULL;
+
+	if ( pendingFailed || pendingLevels == 0 || pendingWidth <= 0 || pendingHeight <= 0 ) {
+		return;
+	}
+
+	GPU::TextureDescriptor	descriptor;
+
+	descriptor.width = pendingWidth;
+	descriptor.height = pendingHeight;
+	descriptor.format = pendingFormat;
+
+	if ( pendingCube ) {
+		if ( pendingFaces != 0x3f ) {
+			return;
+		}
+
+		descriptor.cube = true;
+		descriptor.mipmapped = ( image->filter == TF_DEFAULT );
+	} else if ( pendingChain ) {
+		descriptor.mipLevels = pendingLevels;
+	}
+
+	ReplaceTexture( image, makeOwned<GPU::Texture>( GPU::Device::shared(), descriptor,
+													pendingPixels.Ptr() ) );
 }
 
 /*

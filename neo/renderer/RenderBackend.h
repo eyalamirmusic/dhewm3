@@ -256,6 +256,30 @@ public:
 	// back black.
 	virtual void			SetImageMaxLevel( idImage *image, int maxLevel ) = 0;
 
+	// Every level of every face of this image has now been handed over: the
+	// three loaders that upload one - GenerateImage, GenerateCubeImage and
+	// UploadPrecompressedImage - each call this as their last act, and nothing
+	// else does.
+	//
+	// It exists because "upload a level" and "the upload is finished" are not
+	// the same statement and OpenGL never had to distinguish them. glTexImage2D
+	// takes a level into a texture object that already exists, so a chain can
+	// arrive a level at a time with no end marker at all; an API that fixes a
+	// texture's level count when the resource is created cannot create anything
+	// until it knows how many levels are coming. A backend on such an API
+	// accumulates the levels and builds the texture here.
+	//
+	// Naming it rather than giving SetImageFilterAndRepeat the second meaning is
+	// the deliberate half. That call *looks* like the end of an upload in two of
+	// the three loaders, and is not: GenerateCubeImage makes its own
+	// SetCubeImageFilterAndRepeat call *before* uploading a single face. A seam
+	// whose contract depends on which loader is running is a seam that will be
+	// read wrong.
+	//
+	// A no-op on a backend that creates its texture as the first level arrives,
+	// which is what the OpenGL one did.
+	virtual void			FinishImage( idImage *image ) = 0;
+
 	// The video and cinematic path: a whole image replaced every frame at a
 	// size that usually has not changed, which is worth telling the API
 	// because it is what lets it keep the storage it already has.

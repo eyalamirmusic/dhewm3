@@ -588,6 +588,10 @@ void idImage::GenerateImage( const byte *pic, int width, int height,
 
 	SetImageFilterAndRepeat();
 
+	// The whole chain has been handed over, down to 1x1. Last, and after the
+	// filter, because a backend that builds its texture here reads both.
+	renderBackend->FinishImage( this );
+
 	// see if we messed anything up
 	GL_CheckErrors();
 }
@@ -685,6 +689,12 @@ void idImage::GenerateCubeImage( const byte *pic[6], int size,
 		scaled_height >>= 1;
 		miplevel++;
 	}
+
+	// Six faces and all their levels are in. Note that this loader's filter call
+	// is SetCubeImageFilterAndRepeat, made above *before* the first upload -
+	// which is exactly why the end of an upload has an entry point of its own
+	// rather than being read off that one.
+	renderBackend->FinishImage( this );
 
 	// see if we messed anything up
 	GL_CheckErrors();
@@ -1107,6 +1117,11 @@ void idImage::UploadPrecompressedImage( byte *data, int len ) {
 	}
 
 	SetImageFilterAndRepeat();
+
+	// Last, so that a backend building its texture here sees both the level
+	// count SetImageMaxLevel just gave and the filter the block above may have
+	// dropped to TF_LINEAR.
+	renderBackend->FinishImage( this );
 }
 
 /*
