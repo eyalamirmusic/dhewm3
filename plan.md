@@ -76,7 +76,12 @@ gate is **297 of 297** either way, `capture.cfg` asking for no samples, so the
 feature is measured by replaying the reference demo twice at the same 297
 instants, once at 0 samples and once at 4: **0.140 of 255** over the whole tour,
 **0.574** on its worst frame, and the difference image is silhouettes and
-nothing else — inside the washroom mirror as well as around it.**
+nothing else — inside the washroom mirror as well as around it. The defect step 9
+found on the way is closed too, and it was older than the step that exposed it:
+a level load under `com_fixedTic 1` put thousands of render passes on the one
+command buffer an eacp frame is, and every frame after it was black — the backend
+submits between screens now, at 297 of 297, and "The black frame under a fixed
+tic" in §6 has the bisect.**
 
 Reference implementation for almost everything on the platform side:
 `~/Code/PureDOOM/examples/EACP` — a complete engine hosted on eacp, with its own
@@ -739,6 +744,15 @@ Numbers are never reused, so a hole is an entry that closed.
     reason to exist, so they are two calls; `Tests/GPU/TextureReadTests.cpp`
     pins the pair, and fails without the flush.
 
+    **`Frame::flush` has a second user now, and it is not a readback.** One eacp
+    frame is one command buffer, and dhewm3 draws whole screens inside a single
+    `common->Frame()` while a map loads — enough of them, under `com_fixedTic 1`,
+    to run the driver out of kernel storage for it. The backend flushes between
+    screens so that a level load is several submissions rather than one; §6's
+    "The black frame under a fixed tic" is the whole story. Nothing in eacp had
+    to change for it, which is the reason this stays a note under a closed gap
+    rather than a gap of its own.
+
 22. ~~**A pass could not keep the depth buffer it was handed.**~~ — **closed**,
     and kept because the shape of the answer is the interesting part.
     `Frame::beginPass` cleared depth and stencil unconditionally and Metal
@@ -961,6 +975,13 @@ Numbers are never reused, so a hole is an entry that closed.
   and never called, so `TT_3D` never happened and eacp needs no 3D texture. Step
   5 deleted the function; `TT_3D` itself survives in `textureType_t` because the
   storage-size accounting still names it.
+- **A frame cannot hold an unbounded number of passes, and bounding it is the
+  app's job.** A level load put thousands of them on one `GPU::Frame` and the
+  driver ran out of kernel storage for the command buffer behind it (§6, "The
+  black frame under a fixed tic"). eacp already has the tool — `Frame::flush`,
+  gap 21 — and what put the passes there is dhewm3 drawing whole screens inside
+  one `common->Frame()`, so the boundary is this port's to place and not
+  something eacp is missing.
 
 ---
 
@@ -3834,11 +3855,14 @@ reproduces at **0 samples as well as 4**, on the current binary, independently o
 this step's own measurements, so it is not the multisampling. Step 6 above took
 ten pinned cameras with `com_fixedTic 1` and got pictures, and nothing in
 `Session.cpp`'s `com_fixedTic` code has changed since, so the break is somewhere
-in step 7, the arena or this step. **It is being bisected as this is written and
-the result is not in this document.** What it costs meanwhile is exactly the
-instrument `regression/README.md` recommends for a live shot, which is why the
-numbers above come from demo playback — the README itself calls that immune — and
-why the `_scratch` comparison had to stay qualitative.
+in step 7, the arena or this step. **It is closed now, and it was never about
+screenshots**: the window itself is black for the rest of the run, because a
+level load fills one command buffer. Bisected to step 8's arena, fixed in
+`548041a`, and written up in "The black frame under a fixed tic" below. What it
+cost this step is exactly the instrument `regression/README.md` recommends for a
+live shot, which is why the numbers above come from demo playback — the README
+itself calls that immune — and why the `_scratch` comparison had to stay
+qualitative.
 
 **The live menu turns out not to be an instrument either**, and that retires a
 number this plan has quoted since 4e.1. The demo *does* have a main menu —
@@ -3873,6 +3897,120 @@ changes did before it: 15 files, about 770 lines, plus
 282, all passing** and clean under the validation layers, and the whole tree is
 **1411 of 1411**. The D3D12 half is written and unrun, and §5's gap 20 has the
 one backend difference worth knowing about it.
+
+#### The black frame under a fixed tic — **closed, and it was older than the arena**
+
+The defect step 9 found and handed on — "`com_fixedTic 1` makes a live in-game
+`screenshot` come back entirely black" — is not about screenshots, and it is not
+about `com_fixedTic` either. One eacp `Frame` is one command buffer, dhewm3 draws
+whole screens inside one of them while a map loads, and a load under a fixed tic
+draws enough of them to fill it. Fixed in `548041a`,
+`neo/renderer/RenderBackend_Eacp.cpp`, 33 lines added and nothing removed.
+
+**The symptom is the window, not the file.** The screenshot is a TGA of the right
+dimensions with every byte zero, at every size from 320x240 to 2048x1536, and the
+window photographed beside it is black too. What names the layer is that there is
+no **FPS counter** in the frame: `com_showFPS 1` was set in every probe cfg and
+the counter is drawn by `console->Draw( false )` at the very end of
+`idSessionLocal::Draw`, *after* `DrawWipeModel` — so a frame missing it is black
+below the game view rather than `game->Draw` returning false or a wipe that never
+cleared, and `com_wipeSeconds 0` not helping says the same thing a second way.
+The console screen and the loading screen draw fine; so does a load taken at
+`com_fixedTic 0` and then switched to 1. And it is **permanent**: after one
+fixed-tic load, `com_fixedTic 0`, another `devmap` and `vid_restart` all fail to
+bring the picture back. The run is broken for good.
+
+**Two probes named it, and neither is a rendering probe.** `com_wipeSeconds 10`
+at the *ordinary* clock does not go black, it aborts:
+
+```
+Assertion failed: (0 && "Failed to allocate IOGPUDeviceShmem."), function
+-[IOGPUMetalDeviceShmem initWithDevice:shmemSize:shmemType:]
+  ...
+  IOGPUMetalCommandBufferStorageGrowKernelCommandBuffer + 168
+  ...
+  eacp::GPU::Frame::beginPass(eacp::GPU::RenderPassDescriptor const&) + 588
+  idRenderBackendEacp::PresentFrameTarget() + 148
+```
+
+That is the driver refusing to grow the kernel storage of **one command buffer**,
+with nothing in it about the picture. And the same black run under
+`MTL_DEBUG_LAYER=1` **draws** — 41.33 / 118.09 / 11.06 of 255 — which says this is
+a **threshold** rather than a picture: slow the process down and the same second
+of wall clock fits.
+
+**The mechanism, and the part of it that is this port's shape.** Step 4b moved
+`common->Frame()` into `View::render` because the engine's frame issues its render
+commands inside the call and the backend consumes them there, so the eacp frame
+has to be open around the whole of it — which makes one engine frame one
+`MTLCommandBuffer`. dhewm3 then draws whole `BeginFrame`/`Draw`/`EndFrame` rounds
+*inside* that one call while a map is loading: `idSessionLocal::PacifierUpdate` on
+every load print, `CompleteWipe`'s `while ( Sys_Milliseconds() < wipeStopTime )
+UpdateScreen( true )`, and `ShowLoadingGui`'s second of `session->Frame();
+session->UpdateScreen( false )`. Each round ends in `SwapBuffers`, which is
+`EndPass` plus `PresentFrameTarget` — two more render encoders on that same
+command buffer. `com_fixedTic` is what makes them thousands rather than sixty:
+`idSessionLocal::Frame` sets `minTic = latchedTicNumber` when it is set, so
+`ShowLoadingGui`'s loop never waits for a tic and runs as fast as the machine
+draws. Where the refusal lands decides which symptom you get — inside
+`renderCommandEncoderWithDescriptor:` it is the abort above, and otherwise the
+command buffer simply stops being able to draw, and since nothing recreates it,
+every frame after that is black. That is why nothing recovers the run.
+
+**Bisected to the arena — and the arena is the trigger, not the defect.**
+
+| state | dhewm3 | eacp | fixed-tic load |
+| --- | --- | --- | --- |
+| current | `8220a7b` | gap 20 tree | **black** 0.00 |
+| the arena | `0e16476` | `5715af9` | **black** 0.00 |
+| step 7 | `b24f8aa` | `df86cb6` | **picture** 41.35 / 118.11 / 11.06 |
+
+So the commit that turns it black is `9ffa4d5` with its eacp half `5ea9468` —
+step 8's arena — and gap 20 is not involved, which the `r_multiSamples 0`
+measurements already said. **But the step 7 build goes black on the same
+`com_wipeSeconds 10` run**; it just does not abort. Before the arena, every
+streamed draw allocated and updated a GPU buffer of its own, which is exactly the
+cost step 8 was written to remove, and that cost was what had been holding the
+unthrottled loop's round count down. Removing it let the same one second of wall
+clock record several times as many passes onto the same command buffer. The
+fragility is older than the commit that exposed it, and step 8 moved a threshold
+rather than breaking anything.
+
+**The fix is a submission boundary.** `GPU::Frame::flush()` in `SwapBuffers`
+before presenting — "send what has been recorded and carry on recording" — but
+only when this frame has already put a screen on the drawable, which a file-static
+cleared by `R_EacpSetFrame` records. So the screen *before* this one goes as its
+own submission, and a frame that presents once, which is every frame that is not a
+load, is submitted exactly as it was before and pays nothing. Deferring the flush
+to the *next* `SwapBuffers` rather than doing it after every one is what buys
+that; `EndPass` immediately above it is what satisfies flush's "no pass may be
+open". `flush` is gap 21's — it exists because `ReadPixels` has to read back a
+frame it is inside of — and this is its second user and its second reason.
+
+**Measured.** The failing load is a picture at all three stops and matches the
+step 7 build to two decimals — **41.35 / 118.12 / 11.04** of 255 against 41.35 /
+118.11 / 11.06. `com_fixedTic 0` and the load-at-0-then-switch-to-1 probe are
+pictures, and `com_wipeSeconds 10` now neither aborts nor blacks out at either
+setting.
+
+**The gate says a submission boundary is not a picture**, and it does reach the
+new call, a screenshot being a second screen on the frame. The first capture named
+frame 59 alone — three pixels of 76,800 moved, by one level, at a mean of 0.0000 —
+two captures of *this* binary move that same frame against each other, and the
+second capture is **297 of 297 identical** against `gap20`. That is the machine's
+jitter as `regression/README.md` defines it: recapture, then believe the second
+one.
+
+**What is inferred rather than measured**, since the mechanism is longer than the
+evidence. Measured: the abort and its stack, the black run drawing under the
+validation layers, the persistence across `com_fixedTic 0` / `devmap` /
+`vid_restart`, the three bisect states, and every number above. Inferred: that the
+silent black frame is the *same* refusal landing somewhere other than an encoder
+open — nothing prints when a command buffer stops being able to draw — and that
+the arena's part is the round count, which was read off the two builds' behaviour
+on `com_wipeSeconds 10` rather than off a counter on `ShowLoadingGui`'s loop. The
+fix follows from the measured half either way: a command buffer that is submitted
+between screens cannot accumulate them.
 
 ### Shader inventory for Phase 2
 
@@ -4331,7 +4469,11 @@ demo at 0 and 4 samples — frame-exact, 297 instants each — at 0.140 of 255 o
 the tour and 0.574 on its worst frame, with the live mirror camera at 0.048
 against a 0.000 floor and a `vid_restart` round trip that comes back
 byte-identical. eacp's half is uncommitted on `develop`, awaiting the user's own
-commit.
+commit. The one defect it turned up on the way — a live in-game frame black under
+`com_fixedTic 1` — is closed as well, in `548041a` and in §6's "The black frame
+under a fixed tic": a level load was putting thousands of render passes on the
+one command buffer an eacp frame is, which the arena made reachable rather than
+caused, and the backend now submits the screen before each present on its own.
 
 **Why 4e.8 went before step 5 rather than after it, in one number.** At the
 tour's second camera stop the two builds disagreed by 0.458 of 255, and the heat

@@ -111,6 +111,19 @@ stop is looking at a fog light bound to a mover. Two live runs of one build read
 sequence a function of the command buffer alone, at which point two runs are
 byte-identical. The demo playback the gate uses never had the problem.
 
+**Between `9ffa4d5` and `548041a` that instrument was broken, and a pinned shot
+taken on a binary in that range is not evidence.** A level load under
+`com_fixedTic 1` blacked out the frame - a TGA of every byte zero, and the window
+with it - for the rest of the run, on any binary in that range and at any size.
+It is not a picture and not a screenshot bug: an eacp frame is one command
+buffer, a load draws whole screens inside the one `common->Frame()` it is open
+around, and `com_fixedTic` takes the pacing off that loop until the buffer runs
+the driver out of kernel storage (plan.md §6, "The black frame under a fixed
+tic"). If the limit ever comes back, the one-line reproducer is
+`com_wipeSeconds 10` at the ordinary clock, which crosses it without
+`com_fixedTic` and aborts out of
+`IOGPUMetalCommandBufferStorageGrowKernelCommandBuffer` rather than going black.
+
 **The Metal validation layers move the eacp build's frames.** A capture under
 `MTL_SHADER_VALIDATION=1` differs from one without on 99 of 297 frames, by a
 mean of 0.000 of 255 and a worst pixel of 25 - instrumented shaders and a
@@ -192,6 +205,23 @@ Two things about the level are worth knowing before editing the tour:
   you are running, and print `backEnd.viewDef->renderView.time` to check where a
   run actually landed. The gate itself is immune and that is the point of it: a
   recorded demo replays the render world frame by frame, whatever the event rate.
+
+- **A `+exec` run boots to the fullscreen console, not to the menu**, and that is
+  not a missing gui. `idCommonLocal::Init` starts the menu only
+  `if ( !AddStartupCommands() )`, and a `+exec` on the command line counts as a
+  startup command - so every cfg-driven run comes up on the console, which
+  `idSessionLocal::Draw` draws when there is no map and no active gui.
+  `disconnect` in the cfg (`Stop()` + `StartMenu()`) is how a script gets the
+  main menu. The demo does have one: `guis/mainmenu.gui` is missing from the demo
+  pk4, which is what every gate log since 4e.4 warns about, and
+  `idSessionLocal::Init` falls back to `guis/demo_mainmenu.gui`, which is there.
+
+- **The live menu is not an instrument at all**, once you have it on screen. Its
+  animation runs on the GUI clock, which is wall time, and `com_fixedTic` pins
+  only the game tick - so two runs of one build differ by **1.58 of 255** at
+  `com_fixedTic 0` and **0.75** at 1, against readings of the same order for the
+  thing being measured. Measure a feature on the replay, or on pinned 3D cameras,
+  where the run-to-run floor is 0.000.
 
   This is not hypothetical. §6 of `plan.md` carried an "over-bright frame" as a
   defect of the eacp backend for two steps on the strength of a comparison made
