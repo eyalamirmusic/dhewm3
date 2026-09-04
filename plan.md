@@ -134,7 +134,16 @@ cube, block compression, multisample depth resolve — and takes the D3D12 devic
 down with `DXGI_ERROR_DRIVER_INTERNAL_ERROR` about three seconds into a loaded
 level. The same binary on the WARP software rasterizer runs that level
 indefinitely, and eacp's suite is **303 of 303** there, which is what makes that
-sentence a statement about the driver rather than about this port.**
+sentence a statement about the driver rather than about this port. Step 12 is
+the first question of speed, and it was asked on that host: 25–30 fps in the
+heaviest stretch of the intro cinematic, all of it backend CPU, because every
+streamed write on D3D12 was a staging copy and two barriers. eacp's streaming
+arena is an upload heap there now, mapped once and written by memcpy, at 303 of
+303 on WARP and on the real adapter — **`bk` 9.5 → 1.0 ms, and the whole run at
+the 16.7 ms cap** — `r_mode` sizes the render target rather than being ignored,
+fitted into a window eacp cannot resize (gap 8), and GPU-resident static
+geometry was built, measured, found not to pay on this driver, and left behind
+`r_useResidentGeometry 0` with the reason written down.**
 
 Reference implementation for almost everything on the platform side:
 `~/Code/PureDOOM/examples/EACP` — a complete engine hosted on eacp, with its own
@@ -642,6 +651,12 @@ free number.**
 8. **`Window::setFullscreen(bool)`** — the public `Window` API has no fullscreen
    toggle. `r_fullscreen` needs it, and so does Alt-Enter, which
    `sys/events.cpp` handles and `sys/eacp/Input.cpp` therefore does not.
+   Step 12 found the other half: there is no size setter either —
+   `WindowOptions::width/height` and its flags are read once at construction,
+   and `Display.h`'s comment names a `Window::setBounds` that does not exist —
+   so `r_mode` cannot size the window. It sizes the render target instead, which
+   is fitted into whatever window there is (§6 step 12); `r_fullscreen` warns
+   once. A `Window::setSize`/`setFullscreen` in eacp is what closes this.
 9. **Modifier keys produce no key events** — PureDOOM's gap #2, still open. Doom 3
    binds Ctrl/Shift/Alt as ordinary keys — `_attack`, `_strafe` and `_speed` in
    the stock config. Worked around as PureDOOM does, by diffing
@@ -4712,6 +4727,130 @@ invalid slot — 1024 is *fewer descriptors than Doom 3's first level has
 textures*, so this was a ceiling an app reached by loading its content — the
 device-removed reason logged once rather than recovered from in silence, and
 `EACP_D3D12_WARP`.
+
+#### Step 12 — the frame rate on the Windows host: the streaming arena, `r_mode`, and resident geometry — **done**
+
+The first step whose question was speed rather than a picture, and the first one
+asked on the Windows host: on this machine the game held 60 fps through most of
+`demo_mars_city1` and fell to **25–30 fps** in the heaviest stretch of the intro
+cinematic. The tool that answered it is the engine's own `com_speeds 1`, driven
+by a cfg (`devmap`, `wait N` — which counts frames on this build — and `quit`)
+and read back out of the log: `all` is the wall time between frames, `gfr`,
+`rf` and `bk` the game, frontend and backend milliseconds. In the slow stretch
+`all` was 36–41 ms with `bk` at **15–25 ms** and the other two under a
+millisecond, so the cost was CPU time in the backend, not the GPU and not the
+game. Ruled out on the way, each by measurement: a debug build (the eacp debug
+layer is compiled out under `NDEBUG`), x64 emulation (the binary is native
+arm64), WARP (`EACP_D3D12_WARP` unset), MSAA (off), a per-frame read-back
+(only screenshots read back), input (ten seconds of injected 500 Hz mouse
+motion and a held key changed nothing) and sound.
+
+**Where the backend's time went.** Since 4e the vertex cache holds system memory
+on this backend and every surface's vertices and indexes are streamed into
+eacp's `StreamingBuffers` before each draw — per pass, so an interaction streams
+again per light. On Metal a streamed write is one memcpy into a shared-storage
+arena. On D3D12 it was a memcpy into an upload chunk, a barrier to `COPY_DEST`,
+a `CopyBufferRegion` into a default-heap arena and a barrier back before the
+draw: hundreds of copy commands and barriers a frame, through a virtual driver
+that charges for each of them.
+
+**Three things were done, and they are not equal.**
+
+1. **eacp: the streaming arena lives in an upload heap on D3D12.** A new
+   `GPU::BufferStorage` (`Device` / `Streaming`), a defaulted parameter on
+   `Buffer` and `Device::makeBuffer`, which `StreamingBuffers` sets on both of
+   the places it creates an arena. A streaming buffer is one `UPLOAD`-heap
+   resource mapped once and kept mapped, bound in place by GPU address; a write
+   is a memcpy and nothing is recorded. `transitionForUse` returns early on it,
+   its destructor goes through `deferRelease` rather than the default-heap free
+   list, a `Storage` buffer is refused host storage (an upload heap takes no
+   unordered access) and keeps the device heap, and if `makeUploadBuffer` or
+   `Map` fails the buffer falls through to the old path. Safety rests on what
+   Metal always relied on: the arena rotates per frame in flight, and
+   `GPUView` waits on the back buffer's fence before a frame writes the pool
+   that frame *N−3* read. That coupling is now written down in
+   `StreamingBuffers.h` and `Buffer.h` rather than enforced. **303 of 303 GPU
+   tests on WARP and on the Parallels adapter, before and after** — the real
+   adapter passes all 303 at `8d95793`, so step 11's "fails 12" is out of date.
+   A/B on a pristine `HEAD` export of this tree, swapping only the eacp
+   change: over frames 2400–3099 `bk` **9.5 / 2.6 ms → 1.0 / 1.0 ms**, `all`
+   **28.4 / 24.7 → 18.0 / 16.7 ms**, worst frame **282 / 84 → 49 / 30 ms**, and
+   no 50-frame bin's `bk` above 1.6 ms. This is the change that did the work.
+   **eacp's half is uncommitted on `develop` and awaits the user's own commit**;
+   until it lands, `cmake-build-eacp2` is the tree that builds against
+   `C:\Code\eacp` (`CPM_eacp_SOURCE`) and `cmake-build-release` still fetches
+   the old one.
+2. **`r_mode` means what it says.** `GLimp_Init` was measuring the drawable and
+   ignoring the cvars, so on this 2× display the config's 1024×768 rasterized
+   at 2048×1536. eacp's `Graphics::Window` has no size setter and no
+   fullscreen toggle (gap 8, both halves — `WindowOptions` is read once at
+   construction), so the window cannot be made to follow the mode; the render
+   target can, and does. `glConfig.vidWidth/vidHeight` come from the mode
+   (`R_GetModeInfo`, so `r_mode -1` with `r_customWidth/Height` works),
+   `EnsureFrameTarget` sizes the target from them, and `GLimp_UpdateWindowSize`
+   — now called every frame from `View::update`, the engine hearing nothing of
+   a user's resize otherwise — fits the largest rectangle of the mode's aspect
+   into the view's bounds and keeps it in `winWidth/winHeight`.
+   `PresentFrameTarget` spans the blit quad by that ratio, centred, the cleared
+   black showing either side; `dhewm3::contentRect()` places it, and
+   `Input.cpp` and `ImGuiBackend.cpp` subtract its origin from every absolute
+   mouse point. `Backend::DisplayScale()` answers 1.0, because eacp hands ImGui
+   points and `GetDefaultScale`'s `winWidth != vidWidth` proxy would have
+   doubled the menu once the two agreed. `GLimp_SetScreenParms` applies a mode
+   change at `vid_restart` instead of refusing it (still refusing a changed
+   `r_multiSamples`, which falls through to the full restart as the SDL host
+   does), `GLimp_GetCurState` reports the mode and the sample count in the
+   cvar's terms so the settings menu's Apply button stops seeing a phantom
+   change, and `r_fullscreen` is warned about once rather than refused, because
+   a refusal in `GLimp_Init` sends `R_InitOpenGL` round its retry loop and
+   drops `r_mode` to 3 as well. Measured: r_mode 5 draws 1024×768 into
+   1024×768 of a 1024×768-point window at 2×; r_mode 9 draws 1280×720 into
+   1024×576 with a 96-point band above and below, pixel-counted; a mouse point
+   maps onto the menu only with the offset applied. The gate is unaffected —
+   `BeginFrame` overrides `vidWidth/vidHeight` for a capture frame either way.
+   Found on the way and left open: **`tr.viewportOffset` is applied nowhere in
+   this tree**, so a genuinely tiled screenshot repeats one tile — reachable now
+   that `vidWidth` is the mode rather than 2048.
+3. **Resident geometry, built and left off.** `vertCache_t` grew a
+   `backendBuffer` (a `void *`, for the reason `idImage::backendTexture` is
+   one) and an `allocFrame`; the seam grew `FreeVertexCacheBuffer`, the mirror
+   of `FreeImage`, which `idVertexCache::ActuallyFree` calls — so there is no
+   map to go stale. A block is uploaded on its first draw, not in `Alloc` (a
+   load allocates far more than a frame draws, and `Alloc` runs outside the
+   backend's frame), when it is `TAG_USED`, still owned, and not allocated this
+   frame — that last test is what stops a skinned model rebuilt through
+   `Alloc` every frame from being called static. `R_CreateIndexCache` is back
+   at the four `Touch( tri->indexCache )` sites step 5 had stranded, so
+   indexes have a block to hang residency off. `PurgeAll` drains the deferred
+   frees and `idVertexCache::Shutdown` purges before `headerAllocator.Shutdown`,
+   which is the last moment the headers and the backend both exist. **It does
+   not pay on this driver**: 29% of geometry binds become resident, ~500
+   buffers, and a deterministic `timeDemo` of the 18-stop tour goes **49.3 →
+   50.7 s**, backend **0.90 → 1.06 ms/frame**; live it is a wash. A D3D12
+   driver charges for resources referenced by a command list rather than for
+   bytes copied — the argument eacp's arena makes, pointed the other way — so a
+   buffer per surface is hundreds of resources where an arena is three. If it
+   is to pay it wants one static arena that resident blocks are sub-allocated
+   from, so a bind is an offset; this is the mechanism that would sit on, and
+   `r_useResidentGeometry` defaults to 0. Vertex residency is **2073 of 2073**
+   identical on a demo recorded and replayed here; the index half moves 137
+   frames by at most 9 of 255 on at most 18 pixels of 76800, with identical
+   index data on every draw — the same indexes out of their own buffer draw
+   very slightly differently from the same indexes out of the arena, on this
+   GPU, and it is recorded rather than chased.
+
+**All three together**, on `cmake-build-eacp2`: the full 4595-frame run of
+the cinematic and four tour stops at **16.7 ms every 400-frame bin, `bk` 0.4
+ms, 12 frames over 25 ms** against several hundred before, and the screenshots
+at the stops are the level, lit and shadowed, at 1024×768.
+
+**Two notes for the next person.** The engine's log is one fixed path,
+`Documents/My Games/dhewm3/dhewm3log.txt`, whatever `fs_savepath` says, so two
+runs cannot share a machine and a measurement is only as good as the check that
+the log carries its own `fs_savepath`. And `gate.sh record` is broken on
+Windows: it waits for `demos/reference.demo` to *exist*, and here the file
+exists the moment `recordDemo` starts, so it kills the engine after ~16 frames
+— waiting for the process to exit is the fix, not yet made.
 
 ### Shader inventory for Phase 2
 

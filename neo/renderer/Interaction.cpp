@@ -1144,6 +1144,8 @@ void idInteraction::AddActiveInteraction( void ) {
 						vertexCache.Touch( lightTris->lightingCache );
 					}
 
+					R_CreateIndexCache( lightTris );
+
 					if ( lightTris->indexCache ) {
 						vertexCache.Touch( lightTris->indexCache );
 					}
@@ -1222,6 +1224,15 @@ void idInteraction::AddActiveInteraction( void ) {
 
 			// touch the shadow surface so it won't get purged
 			vertexCache.Touch( shadowTris->shadowCache );
+
+			// The shadow volume's indexes, which are the interaction's own and
+			// live as long as it does. A volume drawn without its caps is a
+			// prefix of these, so one block serves every way of drawing it.
+			R_CreateIndexCache( shadowTris );
+
+			if ( shadowTris->indexCache ) {
+				vertexCache.Touch( shadowTris->indexCache );
+			}
 
 			// see if we can avoid using the shadow volume caps
 			bool inside = R_PotentiallyInsideInfiniteShadow( sint->ambientTris, localViewOrigin, localLightOrigin );

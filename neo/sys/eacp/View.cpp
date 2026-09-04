@@ -5,15 +5,40 @@
 #include <eacp/Core/App/AppEnvironment.h>
 #include <eacp/Graphics/Window/Window.h>
 
+#include <algorithm>
 #include <string>
 #include <vector>
 
 #include "sys/platform.h"
 #include "framework/Common.h"
+#include "renderer/tr_local.h" // glConfig, GLimp_UpdateWindowSize
 #include "renderer/RenderBackend_Eacp.h"
 
 namespace dhewm3
 {
+Graphics::Rect contentRect()
+{
+    auto* view = R_EacpGetView();
+
+    if (view == nullptr)
+        return {};
+
+    const auto bounds = view->getLocalBounds();
+
+    // Clamped rather than trusted, because the two are written by different
+    // things: the bounds are the window's and change the moment the user drags
+    // a corner, while winWidth/winHeight are last frame's fit. A stale fit that
+    // is a few points too big would put the picture's edge outside the window
+    // and every mouse point with it.
+    const auto w = std::min((float) glConfig.winWidth, bounds.w);
+    const auto h = std::min((float) glConfig.winHeight, bounds.h);
+
+    if (w <= 0.f || h <= 0.f)
+        return bounds;
+
+    return {(bounds.w - w) * 0.5f, (bounds.h - h) * 0.5f, w, h};
+}
+
 View::View()
 {
     // Doom 3's lighting is stencil shadow volumes, so the drawable needs a
@@ -104,6 +129,17 @@ void View::startEngine()
 
 void View::update(Threads::FrameTime)
 {
+    // Where the picture goes in the window, re-measured. The window cannot be
+    // resized to r_mode, but the user can resize it to anything, and a drag of
+    // the corner is the one thing that moves the fit GLimp_UpdateWindowSize
+    // computed - so it is recomputed here rather than waited for, there being no
+    // resize the engine would otherwise hear about.
+    //
+    // In update() rather than render() because glConfig.vidWidth/vidHeight are
+    // borrowed for the length of a frame (a tiled screenshot renders into them),
+    // and this is the side of common->Frame() where they are the mode's.
+    GLimp_UpdateWindowSize();
+
     // Shift, Ctrl and Alt arrive as state and never as key events (plan.md §5,
     // gap 9), so they are polled once a frame and the difference is turned into
     // the down/up pair the engine binds - _attack, _strafe and _speed. Read

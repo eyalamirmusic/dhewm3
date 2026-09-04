@@ -30,6 +30,20 @@ namespace dhewm3
 {
 using namespace eacp;
 
+// The part of the window the frame is drawn into, in points.
+//
+// The window cannot be resized to r_mode - eacp's Graphics::Window has no size
+// setter (plan.md §5, gap 8) - so the picture is fitted into whatever window
+// there is rather than stretched across it, and this is where it lands: the
+// largest rectangle of the render target's aspect, centred, with black either
+// side. GLimp_UpdateWindowSize (sys/eacp/GLimp.cpp) is what decides its size and
+// keeps it in glConfig.winWidth/winHeight; this places that size in the window.
+//
+// Which is what an incoming mouse point has to be measured from, because
+// everything that reads winWidth/winHeight - the menu cursor, ImGui's layout -
+// is measuring the picture and not the window.
+Graphics::Rect contentRect();
+
 struct View final : GPU::GPUView
 {
     View();

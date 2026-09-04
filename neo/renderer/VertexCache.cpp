@@ -31,6 +31,7 @@ If you have questions concerning this license or the applicable additional terms
 #include "renderer/tr_local.h"
 
 #include "renderer/VertexCache.h"
+#include "renderer/RenderBackend.h"
 
 static const int	FRAME_MEMORY_BYTES = 0x200000;
 static const int	EXPAND_HEADERS = 1024;
@@ -63,6 +64,23 @@ void idVertexCache::ActuallyFree( vertCache_t *block ) {
 		// let the owner know we have purged it
 		*block->user = NULL;
 		block->user = NULL;
+	}
+
+	// And let the backend know, before anything else about the block changes.
+	// This is the one place a block stops existing, so it is the one place the
+	// GPU copy of it has to go - the header itself is about to go back on the
+	// free list and be handed out again, and a stale buffer on it would be
+	// drawn as somebody else's geometry.
+	//
+	// The test is on the field rather than on the backend, because a block that
+	// was never drawn never got one; guarding on renderBackend as well only
+	// matters on the way down, where a leak is better than a call into
+	// something that has been deleted.
+	if ( block->backendBuffer ) {
+		if ( renderBackend ) {
+			renderBackend->FreeVertexCacheBuffer( block );
+		}
+		block->backendBuffer = NULL;
 	}
 
 	// temp blocks are in a shared space that won't be freed
@@ -163,6 +181,16 @@ void idVertexCache::PurgeAll() {
 	while( staticHeaders.next != &staticHeaders ) {
 		ActuallyFree( staticHeaders.next );
 	}
+
+	// The deferred list too, which the original did not do because it did not
+	// have to: nothing on it held anything but system memory, and EndFrame
+	// would get to it. It holds GPU buffers now, and every caller of this is a
+	// moment at which the device that owns them is about to go - a vid restart
+	// on its way through GLimp_Shutdown, and Shutdown below. Waiting for the
+	// frames to pass is exactly what none of them can do.
+	while( deferredFreeList.next != &deferredFreeList ) {
+		ActuallyFree( deferredFreeList.next );
+	}
 }
 
 /*
@@ -171,7 +199,13 @@ idVertexCache::Shutdown
 ===========
 */
 void idVertexCache::Shutdown() {
-//	PurgeAll();	// !@#: also purge the temp buffers
+	// The original left this out - nothing it held was worth the trouble of
+	// releasing at exit, and the temp buffers would still not be released here.
+	// A block can hold a GPU buffer now, and this is the last moment at which
+	// both ends of that are true: the headers are about to stop existing under
+	// headerAllocator.Shutdown, and the backend that owns the buffers is not
+	// taken down until ShutdownOpenGL, which is after this.
+	PurgeAll();
 
 	headerAllocator.Shutdown();
 }
@@ -202,8 +236,10 @@ void idVertexCache::Alloc( void *data, int size, vertCache_t **buffer, bool inde
 			block->prev->next = block;
 
 			// idBlockAlloc hands back raw memory, so virtMem has to start NULL
-			// rather than as whatever was in that heap block.
+			// rather than as whatever was in that heap block. The backend's
+			// copy of it is on the same terms, and for the same reason.
 			block->virtMem = NULL;
+			block->backendBuffer = NULL;
 		}
 	}
 
@@ -234,6 +270,7 @@ void idVertexCache::Alloc( void *data, int size, vertCache_t **buffer, bool inde
 	// load time lots of things may be created, but they aren't
 	// referenced by the GPU yet, and can be purged if needed.
 	block->frameUsed = currentFrame - NUM_VERTEX_FRAMES;
+	block->allocFrame = currentFrame;
 
 	block->indexBuffer = indexBuffer;
 
@@ -337,6 +374,12 @@ vertCache_t	*idVertexCache::AllocFrameTemp( void *data, int size ) {
 			block->prev = &freeDynamicHeaders;
 			block->next->prev = block;
 			block->prev->next = block;
+
+			// Raw memory, as above. A frame temp never gets a GPU buffer of its
+			// own - its bytes are different every frame, which is the whole
+			// reason it is a frame temp - but the field is read by the backend
+			// on every block it draws, so it has to be something.
+			block->backendBuffer = NULL;
 		}
 	}
 
@@ -357,6 +400,7 @@ vertCache_t	*idVertexCache::AllocFrameTemp( void *data, int size ) {
 	dynamicCountThisFrame++;
 	block->user = NULL;
 	block->frameUsed = 0;
+	block->allocFrame = currentFrame;
 
 	// copy the data
 	block->virtMem = tempBuffers[listNum]->virtMem;

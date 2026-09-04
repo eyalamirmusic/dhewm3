@@ -73,6 +73,42 @@ bool R_CreateAmbientCache( srfTriangles_t *tri, bool needsLighting ) {
 
 /*
 ==================
+R_CreateIndexCache
+
+The surface's indexes in the vertex cache, beside its vertices.
+
+This is the original r_useIndexBuffers path, which existed to put indexes in an
+ARB_vertex_buffer_object and went when that did. It is back because a cache
+block is the only thing in this renderer with a lifetime a backend can hang a
+GPU buffer off: RB_DrawElementsWithCounters reaches the GPU once per draw and a
+material with four stages draws one surface four times, so indexes that are not
+kept anywhere are copied to the GPU more often than vertices are. See "Resident
+geometry" in RenderBackend_Eacp.cpp for what that buys, which on the machine
+this was written on is nothing - hence the cvar, and hence its default.
+
+Only for surfaces the caller already keeps - a real model surface, a light's own
+tris, an interaction's shadow volume - and never one built in frame memory,
+because the block's `user` pointer is written back through when it is purged and
+frame memory does not survive to be written to. Every caller is at a Touch of a
+cache the surface already owns, which is where the original put it too and is
+the same test.
+==================
+*/
+void R_CreateIndexCache( srfTriangles_t *tri ) {
+	if ( tri->indexCache || !tri->indexes || tri->numIndexes <= 0 ) {
+		return;
+	}
+
+	if ( !r_useResidentGeometry.GetBool() ) {
+		return;
+	}
+
+	vertexCache.Alloc( tri->indexes, tri->numIndexes * sizeof( tri->indexes[0] ),
+					   &tri->indexCache, true );
+}
+
+/*
+==================
 R_CreateLightingCache
 
 Returns false if the cache couldn't be allocated, in which case the surface should be skipped.
@@ -1062,6 +1098,8 @@ void R_AddLightSurfaces( void ) {
 			// touch the shadow surface so it won't get purged
 			vertexCache.Touch( tri->shadowCache );
 
+			R_CreateIndexCache( tri );
+
 			if ( tri->indexCache ) {
 				vertexCache.Touch( tri->indexCache );
 			}
@@ -1444,6 +1482,8 @@ static void R_AddAmbientDrawsurfs( viewEntity_t *vEntity ) {
 			}
 			// touch it so it won't get purged
 			vertexCache.Touch( tri->ambientCache );
+
+			R_CreateIndexCache( tri );
 
 			if ( tri->indexCache ) {
 				vertexCache.Touch( tri->indexCache );

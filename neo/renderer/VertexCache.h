@@ -44,6 +44,18 @@ typedef struct vertCache_s {
 										// ARB_vertex_buffer_object alternative
 	bool			indexBuffer;		// holds indexes instead of vertexes
 
+	// The backend's copy of this block on the GPU, if it has made one, and it
+	// is a void * for the reason idImage::backendTexture is: this header is
+	// compiled by every backend and none of their types may appear in it. Only
+	// the backend ever reads it; the cache's only business with it is that the
+	// block is about to stop existing, which is idRenderBackend::FreeVertexCacheBuffer.
+	//
+	// NULL means "not on the GPU", which is the state every block starts in and
+	// returns to when it is purged. It is deliberately not a promise that the
+	// bytes are up to date: a block's contents never change after Alloc copies
+	// them in, which is what makes keeping a GPU copy sound at all.
+	void			*backendBuffer;
+
 	intptr_t		offset;
 	int				size;				// may be larger than the amount asked for, due
 										// to round up and minimum fragment sizes
@@ -51,6 +63,12 @@ typedef struct vertCache_s {
 	struct vertCache_s	**	user;				// will be set to zero when purged
 	struct vertCache_s *next, *prev;	// may be on the static list or one of the frame lists
 	int				frameUsed;			// it can't be purged if near the current frame
+	int				allocFrame;			// the frame the data was copied in on. Not
+										// bookkeeping the cache itself needs: it is
+										// how a backend tells geometry that outlives
+										// a frame from geometry that is rebuilt every
+										// one, which decides whether keeping a GPU
+										// copy of it can ever pay for itself
 } vertCache_t;
 
 
@@ -60,7 +78,12 @@ public:
 	void			Shutdown();
 
 	// called when vertex programs are enabled or disabled, because
-	// the cached data is no longer valid
+	// the cached data is no longer valid; by R_VidRestart, because the device
+	// is about to go; and by Shutdown, because a block that is still alive
+	// holds a GPU buffer that would outlive the backend that made it. All three
+	// mean *all*, so the deferred free list goes too - blocks that are already
+	// dead and are only waiting for the frames to pass, which after any of
+	// those three they no longer need to.
 	void			PurgeAll();
 
 	// Tries to allocate space for the given data in fast vertex
@@ -97,6 +120,11 @@ public:
 
 	// listVertexCache calls this
 	void			List();
+
+	// Which frame the cache thinks it is in, for comparing against a block's
+	// allocFrame. Bumped by EndFrame, so a block whose allocFrame is not this
+	// is one that was already here when the frame began.
+	int				CurrentFrame( void ) const { return currentFrame; }
 
 private:
 	void			InitMemoryBlocks( int size );

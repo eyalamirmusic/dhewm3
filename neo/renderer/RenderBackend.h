@@ -64,6 +64,7 @@ Suite 120, Rockville, Maryland 20850 USA.
 */
 
 typedef struct srfTriangles_s srfTriangles_t;
+typedef struct vertCache_s vertCache_t;
 class idImage;
 
 // Dear ImGui's finished frame - the vertex and index buffers, the draw lists,
@@ -190,6 +191,17 @@ public:
 	// separately because the shadow path deliberately draws less of the surface
 	// than it holds, depending on whether the caps are needed.
 	virtual void			DrawIndexed( const srfTriangles_t *tri, int numIndexes ) = 0;
+
+	// A vertex cache block is about to stop existing, and whatever the backend
+	// put on the GPU for it has to go with it. Called from
+	// idVertexCache::ActuallyFree, which is the only place a block dies, and
+	// only for a block whose backendBuffer is not NULL - so a backend that
+	// never puts anything there never hears from it.
+	//
+	// It is the mirror of FreeImage: the block is the identity, the backend
+	// owns whatever hangs off it, and this is the ONLY place that is released.
+	// The block is still readable here and stops being so immediately after.
+	virtual void			FreeVertexCacheBuffer( vertCache_t *block ) = 0;
 
 	// Report anything the API has queued up against us. A no-op on backends
 	// that report errors as they happen instead.

@@ -384,6 +384,7 @@ public:
 	virtual void	SetTexEnv( int env );
 	virtual void	SelectTexture( int unit );
 	virtual void	DrawIndexed( const srfTriangles_t *tri, int numIndexes );
+	virtual void	FreeVertexCacheBuffer( vertCache_t *block );
 	virtual void	CheckErrors( void );
 
 	virtual void	AllocImage( idImage *image );
@@ -1219,9 +1220,12 @@ renderer draws rather than the drawable.
 viewport, scissor and screen-space coordinate in the renderer is measured
 against, so a target of any other size would put the picture somewhere the
 renderer does not think it is. The blit then maps that rectangle onto whatever
-the drawable happens to be, which is also what makes a window resize scale the
-frame rather than corrupt it - GLimp_SetScreenParms refuses to resize (gap 8),
-so the two really can differ.
+the drawable happens to be, which is what makes a window resize scale the frame
+rather than corrupt it - and the two genuinely differ here, because this is
+where r_mode arrives: sys/eacp/GLimp.cpp sets vidWidth/vidHeight from the mode
+while the window keeps whatever size it was constructed at (gap 8, no window
+size setter). A mode change is therefore nothing more than the next call finding
+a size it does not hold.
 
 BGRA8Unorm because that is the drawable's format and the pipelines are compiled
 against one number for both; stencil because the shadow pass needs the plane,
@@ -1439,6 +1443,14 @@ to have run before it.
 The quad is written with the target's row 0 at the top of the screen: clip space
 has y up and a texture's rows start at the top, so the corner at y = +1 is the
 one that samples t = 0.
+
+**And it does not always cover the drawable.** The window cannot be resized to
+r_mode - eacp's Window has no size setter (plan.md §5, gap 8) - so the target and
+the window are free to be different shapes, and GLimp_UpdateWindowSize fits the
+one into the other rather than stretching it: glConfig.winWidth/winHeight are the
+picture's size in points, the view's bounds are the window's, and the ratio of
+the two is how much of the drawable this quad spans. Centred, with the cleared
+black showing through either side.
 ======================
 */
 void idRenderBackendEacp::PresentFrameTarget( void ) {
@@ -1452,13 +1464,33 @@ void idRenderBackendEacp::PresentFrameTarget( void ) {
 		return;
 	}
 
-	static const eacpBlitVert_t	quad[6] = {
-		{ { -1.0f,  1.0f }, { 0.0f, 0.0f } },
-		{ { -1.0f, -1.0f }, { 0.0f, 1.0f } },
-		{ {  1.0f, -1.0f }, { 1.0f, 1.0f } },
-		{ { -1.0f,  1.0f }, { 0.0f, 0.0f } },
-		{ {  1.0f, -1.0f }, { 1.0f, 1.0f } },
-		{ {  1.0f,  1.0f }, { 1.0f, 0.0f } },
+	// The whole drawable unless the host says otherwise, which is what a view
+	// that has not been measured yet and a picture that matches its window both
+	// come out as.
+	float	spanX = 1.0f;
+	float	spanY = 1.0f;
+
+	if ( GPU::GPUView * view = R_EacpGetView() ) {
+		const auto	bounds = view->getLocalBounds();
+
+		if ( bounds.w > 0.0f && glConfig.winWidth > 0.0f
+			 && glConfig.winWidth < bounds.w ) {
+			spanX = glConfig.winWidth / bounds.w;
+		}
+
+		if ( bounds.h > 0.0f && glConfig.winHeight > 0.0f
+			 && glConfig.winHeight < bounds.h ) {
+			spanY = glConfig.winHeight / bounds.h;
+		}
+	}
+
+	const eacpBlitVert_t	quad[6] = {
+		{ { -spanX,  spanY }, { 0.0f, 0.0f } },
+		{ { -spanX, -spanY }, { 0.0f, 1.0f } },
+		{ {  spanX, -spanY }, { 1.0f, 1.0f } },
+		{ { -spanX,  spanY }, { 0.0f, 0.0f } },
+		{ {  spanX, -spanY }, { 1.0f, 1.0f } },
+		{ {  spanX,  spanY }, { 1.0f, 0.0f } },
 	};
 
 	draw.program->image = *frameTarget;
@@ -1723,6 +1755,183 @@ void idRenderBackendEacp::ReleaseImGuiTextures( void ) {
 }
 
 #endif
+
+/*
+================================================================================
+
+	Resident geometry.
+
+	idVertexCache hands out system memory on this backend, so by default every
+	draw copies its bytes into a streaming buffer on the way past: a surface's
+	vertices once per pass over it, its indexes once per draw. That is the right
+	thing for geometry that is different every frame - a GUI, a deform, a
+	skinned model, a dynamic shadow volume - and it looks like pure waste for
+	the world, which is the same triangles at the same addresses for the whole
+	of a level. On D3D12 each write is a memcpy into an upload chunk, a barrier,
+	a CopyBufferRegion and a barrier back.
+
+	So r_useResidentGeometry gives a block the cache means to keep a GPU buffer
+	of its own, uploaded the first time it is drawn and bound by every draw
+	after that.
+
+	**It is off by default, because on this machine it does not pay**, and the
+	measurement is the point of writing it rather than a footnote to it. Windows
+	on Arm in a Parallels VM, the "Parallels Display Adapter" D3D12 driver,
+	demo_mars_city1: over regression/record.cfg's eighteen camera stops recorded
+	as a demo and replayed with timeDemo - the only workload here that repeats
+	exactly - it costs about 2.5% of wall time (49.3 -> 50.6 s for 2160 frames)
+	and backend CPU goes *up*, 0.90 -> 1.06 ms a frame; over the intro cinematic
+	and the tour played live at vsync it is a wash, 17.55/17.84 ms a frame
+	against 17.58/17.64 and no fewer frames over 25 ms. About 29% of the
+	geometry binds in a frame become resident, half of the rest are index binds
+	on frame-memory surfaces that have no cache block to hang one off, and the
+	streaming those 29% no longer do is not worth what binding them costs.
+
+	Which is the same argument eacp's own StreamingBuffers makes, pointed the
+	other way: what a driver charges for is *resources referenced by a command
+	list*, not bytes copied into one, and a buffer per surface is hundreds of
+	resources where an arena is three. If this is to be made to pay on D3D12 it
+	wants one static arena that every resident block is sub-allocated out of -
+	the vertex cache's own shape, mirrored on the GPU - so that a bind is an
+	offset rather than another resource. That is a different piece of work; this
+	one is the mechanism it would sit on, and the number that says it is needed.
+
+	**Keyed on the block, not on the pointer.** The buffer hangs off vertCache_t
+	itself, which is why VertexCache.h grew a field rather than this file
+	growing a map: there is nothing to go stale, and no chance of a recycled
+	header address being taken for the geometry that used to live there.
+	idVertexCache::ActuallyFree is the one place a block dies and it is where
+	the buffer is released, which makes the residency exactly as long-lived as
+	the thing it caches. That a block's bytes are copied in by Alloc and never
+	written again is what makes an upload-once copy sound in the first place;
+	nothing in the renderer writes through vertexCache.Position.
+
+	**Uploaded on first draw rather than in Alloc.** Either reason on its own
+	would decide it. A level load allocates far more blocks than any frame
+	draws - every surface of every model, most of them never seen from where the
+	player stands - and a GPU buffer for each is memory spent on nothing. And
+	Alloc is called by the frontend, outside the backend's frame: eacp stages an
+	upload onto whatever command list is already recording, so a copy issued
+	there has to acquire and submit a list of its own, which is the expensive
+	shape of the very thing this exists to remove. Inside a draw there is always
+	a recording open, and the copy lands on it in order ahead of the draw that
+	reads it.
+
+	**Which blocks.** Three questions, and the last is the one that matters.
+
+	TAG_TEMP is the frame temp arena, whose bytes are different every frame by
+	definition. A block whose `user` has been cleared has already been Freed and
+	is only waiting out the frames - which is also what the overflow path in
+	AllocFrameTemp produces, a static block Freed in the same breath as it was
+	allocated.
+
+	And a block allocated *this* frame is not yet known to be worth keeping. A
+	skinned model is rebuilt every frame and its vertices go through Alloc, not
+	AllocFrameTemp, so the tag alone would call an animating character static:
+	one GPU buffer built and destroyed per surface per frame, which is strictly
+	worse than streaming it. Waiting for the block to still be here on the next
+	frame it is drawn in costs the world one frame of streaming and tells the
+	two apart exactly, because "was already here when this frame began" is what
+	static means from the backend's side. It is why VertexCache.h stamps
+	allocFrame; nothing else needed it.
+
+	**One thing here is not understood, and it is the index half.** Made
+	resident, vertices replay the reference demo 2073 of 2073 frames identical;
+	indexes move 137 of those frames, by at most 9 of 255 on at most 18 pixels
+	of 76800, along lit and shadowed edges in dark corners. It is repeatable -
+	two captures of either setting agree with themselves exactly - and it is not
+	the data: a probe compared the cached indexes against the live ones on every
+	draw of the whole tour and found no draw where they differed, in count or in
+	content. So the same indexes read out of a buffer of their own draw very
+	slightly differently from the same indexes read out of the streaming arena,
+	which is a statement about a virtual GPU that already fails 12 of eacp's own
+	303 tests rather than one about this file. It is recorded here rather than
+	chased because the feature it belongs to is off, and it is the first thing
+	to re-measure on real hardware.
+
+================================================================================
+*/
+
+/*
+======================
+idRenderBackendEacp::FreeVertexCacheBuffer
+======================
+*/
+void idRenderBackendEacp::FreeVertexCacheBuffer( vertCache_t *block ) {
+	// Ownership carried by hand, as in ReplaceTexture and for the same reason:
+	// what the block holds is a void * in a header that no eacp type may appear
+	// in, so the delete has to be named. Clearing the field is the caller's,
+	// which is the only caller there is.
+	delete (GPU::Buffer *)block->backendBuffer;
+}
+
+/*
+======================
+R_EacpGeometry
+
+One vertex cache block as something a draw can bind: a range over the block's
+own resident buffer when it has earned one, and a slice of this frame's
+streaming arena when it has not.
+
+`data` is what the streaming path copies and is ignored by the resident one,
+which reads the block itself - so it is the same bytes either way. A caller with
+no block at all, a quad built on the stack, goes on calling StreamVertices
+directly.
+======================
+*/
+static GPU::BufferRange R_EacpGeometry( vertCache_t *block, const void *data,
+										std::size_t bytes, bool indexes ) {
+	if ( block != NULL && r_useResidentGeometry.GetBool()
+		 && block->tag == TAG_USED && block->user != NULL
+		 && block->allocFrame != vertexCache.CurrentFrame() ) {
+
+		GPU::Buffer *	resident = (GPU::Buffer *)block->backendBuffer;
+
+		if ( resident == NULL ) {
+			// The whole block, rather than what this draw asked for: two paths
+			// can want different amounts of one block - a shadow volume drawn
+			// without its caps is a prefix of the same indexes - and what is
+			// uploaded has to cover whichever wants most.
+			resident = new GPU::Buffer( GPU::Device::shared(),
+										vertexCache.Position( block ),
+										(std::size_t)block->size,
+										indexes ? GPU::BufferUsage::Index
+												: GPU::BufferUsage::Vertex );
+
+			if ( !resident->isValid() ) {
+				// No storage, which on this path means the device is gone or
+				// out of memory. Stream this draw and try again on the next
+				// one, rather than dropping the surface.
+				delete resident;
+				resident = NULL;
+			}
+
+			block->backendBuffer = resident;
+		}
+
+		if ( resident != NULL ) {
+			if ( bytes > (std::size_t)block->size ) {
+				bytes = (std::size_t)block->size;
+			}
+
+			return { resident, 0, bytes };
+		}
+	}
+
+	return indexes ? eacpRenderProgs.StreamIndices( data, bytes )
+				   : eacpRenderProgs.StreamVertices( data, bytes );
+}
+
+/*
+======================
+R_EacpVertices
+
+A surface's vertex cache block, for the five paths that draw one.
+======================
+*/
+static GPU::BufferRange R_EacpVertices( vertCache_t *block, std::size_t bytes ) {
+	return R_EacpGeometry( block, vertexCache.Position( block ), bytes, false );
+}
 
 /*
 ================================================================================
@@ -2243,10 +2452,8 @@ void idRenderBackendEacp::FillDepthBufferSurface( const drawSurf_t *surf,
 
 	// Once per surface rather than once per stage: a perforated material with
 	// two alpha-tested stages is two draws over one piece of geometry.
-	const idDrawVert *	vertices = (const idDrawVert *)vertexCache.Position( tri->ambientCache );
-
-	drawVertices = eacpRenderProgs.StreamVertices( vertices,
-													(std::size_t)tri->numVerts * sizeof( idDrawVert ) );
+	drawVertices = R_EacpVertices( tri->ambientCache,
+								   (std::size_t)tri->numVerts * sizeof( idDrawVert ) );
 
 	bool	drawSolid = ( shader->Coverage() == MC_OPAQUE );
 
@@ -2553,11 +2760,8 @@ void idRenderBackendEacp::CreateDrawInteractions( const drawSurf_t *surf ) {
 		// Once per surface, however many primitive interactions it decomposes
 		// into: a two-layer material under a two-stage light is four draws over
 		// one piece of geometry.
-		const idDrawVert *	vertices =
-			(const idDrawVert *)vertexCache.Position( surf->geo->ambientCache );
-
-		drawVertices = eacpRenderProgs.StreamVertices(
-			vertices, (std::size_t)surf->geo->numVerts * sizeof( idDrawVert ) );
+		drawVertices = R_EacpVertices( surf->geo->ambientCache,
+									   (std::size_t)surf->geo->numVerts * sizeof( idDrawVert ) );
 
 		RB_CreateSingleDrawInteractions( surf, R_EacpDrawInteraction );
 	}
@@ -2856,10 +3060,8 @@ void idRenderBackendEacp::ShadowSurface( const drawSurf_t *surf ) {
 	// says how much of it there is: a volume that extrudes on the GPU shares
 	// the ambient surface's doubled cache, so the surface's own numVerts is not
 	// the count.
-	const void *	vertices = vertexCache.Position( tri->shadowCache );
-
-	drawVertices = eacpRenderProgs.StreamVertices( vertices,
-													(std::size_t)tri->shadowCache->size );
+	drawVertices = R_EacpVertices( tri->shadowCache,
+								   (std::size_t)tri->shadowCache->size );
 
 	drawProgram = draw.program;
 	drawPipeline = draw.pipeline;
@@ -3135,10 +3337,8 @@ void idRenderBackendEacp::DrawSurfaceShaderPasses( const drawSurf_t *surf ) {
 	// vertices go into a streaming buffer once and every stage of it draws from
 	// there. Once per surface rather than once per stage, because a material
 	// with four stages is four draws over one piece of geometry.
-	const idDrawVert *	vertices = (const idDrawVert *)vertexCache.Position( tri->ambientCache );
-
-	drawVertices = eacpRenderProgs.StreamVertices( vertices,
-													(std::size_t)tri->numVerts * sizeof( idDrawVert ) );
+	drawVertices = R_EacpVertices( tri->ambientCache,
+								   (std::size_t)tri->numVerts * sizeof( idDrawVert ) );
 
 	for ( int stage = 0 ; stage < shader->GetNumStages() ; stage++ ) {
 		const shaderStage_t *	pStage = shader->GetStage( stage );
@@ -3933,10 +4133,8 @@ void idRenderBackendEacp::FogSurface( const drawSurf_t *surf, const eacpFog_t &f
 	drawProgram = draw.program;
 	drawPipeline = draw.pipeline;
 
-	const idDrawVert *	vertices = (const idDrawVert *)vertexCache.Position( tri->ambientCache );
-
-	drawVertices = eacpRenderProgs.StreamVertices(
-		vertices, (std::size_t)tri->numVerts * sizeof( idDrawVert ) );
+	drawVertices = R_EacpVertices( tri->ambientCache,
+								   (std::size_t)tri->numVerts * sizeof( idDrawVert ) );
 
 	RB_DrawElementsWithCounters( tri );
 }
@@ -4139,10 +4337,8 @@ void idRenderBackendEacp::BlendLightSurface( const drawSurf_t *surf,
 	drawProgram = draw.program;
 	drawPipeline = draw.pipeline;
 
-	const idDrawVert *	vertices = (const idDrawVert *)vertexCache.Position( tri->ambientCache );
-
-	drawVertices = eacpRenderProgs.StreamVertices(
-		vertices, (std::size_t)tri->numVerts * sizeof( idDrawVert ) );
+	drawVertices = R_EacpVertices( tri->ambientCache,
+								   (std::size_t)tri->numVerts * sizeof( idDrawVert ) );
 
 	RB_DrawElementsWithCounters( tri );
 }
@@ -4833,11 +5029,14 @@ void idRenderBackendEacp::DrawIndexed( const srfTriangles_t *tri, int numIndexes
 	// The index cache holds system memory here for the same reason the vertex
 	// cache does - this backend generates no buffer objects - so both branches
 	// end in a real pointer and the difference is only where it came from.
-	// Nothing fills indexCache in since step 5 deleted r_useIndexBuffers, whose
-	// whole purpose was to put indexes in an ARB_vertex_buffer_object; the
-	// branch stays because it is what an eacp index buffer would slot into.
-	const glIndex_t *	indexes = tri->indexCache
-		? (const glIndex_t *)vertexCache.Position( tri->indexCache )
+	// What indexCache is *for* on this backend is the residency above: a block
+	// is what a GPU buffer can hang off, so indexes that have one are uploaded
+	// once instead of copied per draw. The frontend fills it in for the
+	// surfaces it keeps, at the same places and on the same test the original
+	// r_useIndexBuffers used.
+	vertCache_t *		indexBlock = tri->indexCache;
+	const glIndex_t *	indexes = indexBlock
+		? (const glIndex_t *)vertexCache.Position( indexBlock )
 		: tri->indexes;
 
 	if ( !indexes ) {
@@ -4845,7 +5044,8 @@ void idRenderBackendEacp::DrawIndexed( const srfTriangles_t *tri, int numIndexes
 	}
 
 	const GPU::BufferRange	buffer =
-		eacpRenderProgs.StreamIndices( indexes, (std::size_t)numIndexes * sizeof( glIndex_t ) );
+		R_EacpGeometry( indexBlock, indexes,
+						(std::size_t)numIndexes * sizeof( glIndex_t ), true );
 
 	pass->setPipeline( *drawPipeline );
 	pass->setVertexBuffer( drawVertices );

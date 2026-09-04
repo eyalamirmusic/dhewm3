@@ -789,11 +789,19 @@ void mouseMotion(const MouseEvent& event)
         // A position, in points and top-left origin: eacp's backing views set
         // isFlipped, so this is the space glConfig.winWidth/winHeight are in,
         // which is what idUserInterface scales an absolute event by.
+        //
+        // Measured from the picture rather than from the window, because that is
+        // what winWidth/winHeight are: the window cannot be resized to r_mode,
+        // so the frame is fitted into it and there may be black either side
+        // (contentRect, View.cpp). An unshifted point would put the cursor a
+        // letterbox bar's width to the right of what it is over.
+        const auto content = contentRect();
+
         auto sysEvent = sysEvent_t {};
 
         sysEvent.evType = SE_MOUSE_ABS;
-        sysEvent.evValue = (int) event.pos.x;
-        sysEvent.evValue2 = (int) event.pos.y;
+        sysEvent.evValue = (int) (event.pos.x - content.x);
+        sysEvent.evValue2 = (int) (event.pos.y - content.y);
 
         pushEvent(sysEvent);
         return;

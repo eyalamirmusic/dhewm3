@@ -92,6 +92,25 @@ void setClipboardText(ImGuiContext*, const char* text)
     if (text != nullptr)
         Sys_SetClipboardData(text);
 }
+
+// The same event with its position measured from the picture rather than from
+// the window.
+//
+// io.DisplaySize is glConfig.winWidth/winHeight, which since r_mode was
+// honoured is the rectangle the frame is *fitted* into rather than the whole
+// window - the window cannot be resized to the mode, so there may be black
+// either side of the picture (contentRect, View.cpp). ImGui laid out in that
+// rectangle has to be pointed at in it too, or every widget is a letterbox
+// bar's width from where the cursor says it is.
+MouseEvent inContentSpace(MouseEvent event)
+{
+    const auto content = dhewm3::contentRect();
+
+    event.pos.x -= content.x;
+    event.pos.y -= content.y;
+
+    return event;
+}
 } // namespace
 
 /*
@@ -147,7 +166,7 @@ bool mouseButton(const MouseEvent& event, bool down)
         && event.button != Graphics::MouseButton::Middle)
         return false;
 
-    Gui::sendMouseButton(ImGui::GetIO(), event, down);
+    Gui::sendMouseButton(ImGui::GetIO(), inContentSpace(event), down);
 
     if (D3::ImGuiHooks::IsKeyBindMode())
         return false;
@@ -167,7 +186,7 @@ bool mouseMotion(const MouseEvent& event)
     // In logical points with the origin at the top left, which is the space
     // io.DisplaySize is in - see Backend::NewFrame. eacp's backing views set
     // isFlipped, so this is already y-down and nothing has to be turned over.
-    Gui::sendMousePosition(ImGui::GetIO(), event);
+    Gui::sendMousePosition(ImGui::GetIO(), inContentSpace(event));
 
     if (D3::ImGuiHooks::IsKeyBindMode())
         return false;
@@ -184,7 +203,7 @@ bool mouseWheel(const MouseEvent& event)
     // a trackpad's points have to be divided by; imgui-eacp owns that
     // conversion, and the engine's own K_MWHEELUP threshold is a separate
     // question answered in Input.cpp.
-    Gui::sendMouseWheel(ImGui::GetIO(), event, ImGui::GetStyle().FontSizeBase);
+    Gui::sendMouseWheel(ImGui::GetIO(), inContentSpace(event), ImGui::GetStyle().FontSizeBase);
 
     if (D3::ImGuiHooks::IsKeyBindMode())
         return false;
@@ -367,11 +386,29 @@ void NewFrame()
     }
 }
 
+/*
+    What sys_imgui.cpp multiplies the menu's font sizes by when imgui_scale is
+    -1, and on this host the answer is always one.
+
+    It is asking how many pixels a *point* of menu is worth, because the SDL
+    backend it was written for hands ImGui a DisplaySize in pixels: on a 150%
+    Windows display a 13-unit font is 13 pixels there, which is unreadably small,
+    so the scale has to put the density back.
+
+    eacp lays views out in points and Backend::NewFrame passes those points
+    through as DisplaySize, with the density carried separately in
+    DisplayFramebufferScale - so a 13-unit font is already 13 points tall on any
+    display and there is nothing left to correct. Answering the backing scale
+    here would double the menu on a 2x panel.
+
+    The reason this is worth saying out loud rather than leaving to
+    GetDefaultScale's own early-out is that the early-out reads
+    `winWidth != vidWidth`, which was a proxy for "the framebuffer is scaled for
+    me" and stopped being true the day r_mode started deciding vidWidth: on this
+    host the two are equal whenever the mode happens to match the window.
+*/
 float DisplayScale()
 {
-    if (auto* view = dhewm3::Input::getView())
-        return view->backingScale();
-
     return 1.0f;
 }
 } // namespace Backend
