@@ -790,6 +790,30 @@ static bool GetJointTransform( void *model, const idJointMat *frame, const char 
 
 /*
 ================
+DeclConstraintType
+
+The idDeclAF constraint types and the idPhysics_AF constraint types are separate
+enums whose values only coincide by accident: constraintType_t has an extra
+CONSTRAINT_HINGESTEERING in the middle, so DECLAF_CONSTRAINT_SLIDER (5) lines up
+with CONSTRAINT_HINGESTEERING and DECLAF_CONSTRAINT_SPRING (6) with
+CONSTRAINT_SLIDER.  Map explicitly instead of comparing them directly.
+================
+*/
+static constraintType_t DeclConstraintType( declAFConstraintType_t type ) {
+	switch ( type ) {
+		case DECLAF_CONSTRAINT_FIXED:				return CONSTRAINT_FIXED;
+		case DECLAF_CONSTRAINT_BALLANDSOCKETJOINT:	return CONSTRAINT_BALLANDSOCKETJOINT;
+		case DECLAF_CONSTRAINT_UNIVERSALJOINT:		return CONSTRAINT_UNIVERSALJOINT;
+		case DECLAF_CONSTRAINT_HINGE:				return CONSTRAINT_HINGE;
+		case DECLAF_CONSTRAINT_SLIDER:				return CONSTRAINT_SLIDER;
+		case DECLAF_CONSTRAINT_SPRING:				return CONSTRAINT_SPRING;
+		case DECLAF_CONSTRAINT_INVALID:				break;
+	}
+	return CONSTRAINT_INVALID;
+}
+
+/*
+================
 idAF::Load
 ================
 */
@@ -892,13 +916,8 @@ bool idAF::Load( idEntity *ent, const char *fileName ) {
 	for ( i = 0; i < physicsObj.GetNumConstraints(); i++ ) {
 		idAFConstraint *constraint = physicsObj.GetConstraint( i );
 		for ( j = 0; j < file->constraints.Num(); j++ ) {
-			// DG: FIXME: GCC rightfully complains that file->constraints[j]->type and constraint->GetType()
-			//  are of different enum types, and their values are different in some cases:
-			//  CONSTRAINT_HINGESTEERING has no DECLAF_CONSTRAINT_ equivalent,
-			//  and thus DECLAF_CONSTRAINT_SLIDER != CONSTRAINT_SLIDER (5 != 6)
-			//  and DECLAF_CONSTRAINT_SPRING != CONSTRAINT_SPRING (6 != 10)
 			if ( file->constraints[j]->name.Icmp( constraint->GetName() ) == 0 &&
-					file->constraints[j]->type == constraint->GetType() ) {
+					DeclConstraintType( file->constraints[j]->type ) == constraint->GetType() ) {
 				break;
 			}
 		}

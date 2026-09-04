@@ -26,6 +26,7 @@ if(APPLE)
 endif()
 
 include(CheckCXXCompilerFlag)
+include(CheckLinkerFlag)
 
 # --------------------------------------------------------------------------- #
 # Options
@@ -840,6 +841,19 @@ if(CORE)
 
 	if(APPLE)
 		target_link_libraries(dhewm3 PRIVATE "-framework Cocoa")
+
+		# CMake repeats a static library on the link line whenever a later
+		# entry depends on it, because GNU ld resolves archives in one pass and
+		# needs the repeat. Apple's linker does not, and since Xcode 15 it says
+		# so once per repeat: eacp-gpu (named here and reached again through
+		# imgui-eacp) and ResEmbed (reached through both eacp-core and Miro)
+		# each earn a line. The repeats are correct and belong to the
+		# dependency graph rather than to this file; this turns off the
+		# complaint about them.
+		check_linker_flag(CXX "LINKER:-no_warn_duplicate_libraries" HAVE_NO_WARN_DUPLICATE_LIBRARIES)
+		if(HAVE_NO_WARN_DUPLICATE_LIBRARIES)
+			target_link_options(dhewm3 PRIVATE "LINKER:-no_warn_duplicate_libraries")
+		endif()
 	else()
 		# What sys/win32/ needs and eacp does not already bring: the sockets and
 		# the adapter table for win_net.cpp, the shell for Sys_GetPath's

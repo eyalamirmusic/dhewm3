@@ -321,7 +321,7 @@ is a measured number rather than a shrug. Counting the images that actually
 reach this function during a demo_mars_city1 load - which is not the same set as
 "has no .dds", because most of what stays on the .tga path is TD_HIGH_QUALITY and
 would never have been compressed anyway - gives **9 images and 12.8 MB of RGBA8
-with their mips**: the seven env/* reflection cubes at 12.3 MB of it, and
+with their mips**: the seven env/ reflection cubes at 12.3 MB of it, and
 lights/duolight02grey and lights/flashlight5 at 0.4 MB between them. Every
 encoder makes a different picture out of the same pixels, so writing one for 12.8
 MB is a decision to make on evidence rather than to fill in a switch. The upload
@@ -2436,7 +2436,7 @@ void idRenderBackendEacp::FillDepthBufferSurface( const drawSurf_t *surf,
 	draw.alphaTestRef = 0.0f;
 	draw.clipPlane = clipPlane;
 
-	if ( shader->GetSort() == SS_SUBVIEW ) {
+	if ( shader->GetSort() == (float)SS_SUBVIEW ) {
 		// A subview's own surface - the mirror, the monitor - is drawn down by
 		// the overbright factor rather than to black, because what will be
 		// composited into it later has already been scaled up by it.
@@ -3221,7 +3221,7 @@ int idRenderBackendEacp::DrawShaderPasses( drawSurf_t **drawSurfs, int numDrawSu
 	// than handed to a program environment: it decides whether a reflection
 	// stage gets the gamma correction, and the shared code's answer is that the
 	// post-process half does not.
-	postProcessPass = ( drawSurfs[0]->material->GetSort() >= SS_POST_PROCESS );
+	postProcessPass = ( drawSurfs[0]->material->GetSort() >= (float)SS_POST_PROCESS );
 
 	if ( postProcessPass ) {
 		if ( r_skipPostProcess.GetBool() ) {
@@ -3263,7 +3263,7 @@ int idRenderBackendEacp::DrawShaderPasses( drawSurf_t **drawSurfs, int numDrawSu
 			}
 		}
 
-		if ( drawSurfs[i]->material->GetSort() >= SS_POST_PROCESS
+		if ( drawSurfs[i]->material->GetSort() >= (float)SS_POST_PROCESS
 			 && !backEnd.currentRenderCopied ) {
 			break;
 		}

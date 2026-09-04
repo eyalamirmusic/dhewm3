@@ -2193,7 +2193,7 @@ bool idMaterial::Parse( const char *text, const int textLength ) {
 	}
 
 	// see if there is a subview stage
-	if ( sort == SS_SUBVIEW ) {
+	if ( sort == (float)SS_SUBVIEW ) {
 		hasSubview = true;
 	} else {
 		hasSubview = false;
@@ -2244,7 +2244,7 @@ bool idMaterial::Parse( const char *text, const int textLength ) {
 	}
 
 	// the sorts can make reasonable defaults
-	if ( sort == SS_BAD ) {
+	if ( sort == (float)SS_BAD ) {
 		if ( TestMaterialFlag(MF_POLYGONOFFSET) ) {
 			sort = SS_DECAL;
 		} else if ( coverage == MC_TRANSLUCENT ) {
@@ -2260,7 +2260,7 @@ bool idMaterial::Parse( const char *text, const int textLength ) {
 	for ( i = 0 ; i < numStages ; i++ ) {
 		shaderStage_t	*pStage = &pd->parseStages[i];
 		if ( pStage->texture.image == globalImages->currentRenderImage ) {
-			if ( sort != SS_PORTAL_SKY ) {
+			if ( sort != (float)SS_PORTAL_SKY ) {
 				sort = SS_POST_PROCESS;
 				coverage = MC_TRANSLUCENT;
 			}
@@ -2269,7 +2269,7 @@ bool idMaterial::Parse( const char *text, const int textLength ) {
 		if ( pStage->newStage ) {
 			for ( int j = 0 ; j < pStage->newStage->numFragmentProgramImages ; j++ ) {
 				if ( pStage->newStage->fragmentProgramImages[j] == globalImages->currentRenderImage ) {
-					if ( sort != SS_PORTAL_SKY ) {
+					if ( sort != (float)SS_PORTAL_SKY ) {
 						sort = SS_POST_PROCESS;
 						coverage = MC_TRANSLUCENT;
 					}
@@ -2283,7 +2283,7 @@ bool idMaterial::Parse( const char *text, const int textLength ) {
 	// set the drawStateBits depth flags
 	for ( i = 0 ; i < numStages ; i++ ) {
 		shaderStage_t	*pStage = &pd->parseStages[i];
-		if ( sort == SS_POST_PROCESS ) {
+		if ( sort == (float)SS_POST_PROCESS ) {
 			// post-process effects fill the depth buffer as they draw, so only the
 			// topmost post-process effect is rendered
 			pStage->drawStateBits |= GLS_DEPTHFUNC_LESS;
