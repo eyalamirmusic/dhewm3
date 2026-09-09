@@ -1914,7 +1914,7 @@ static GPU::BufferRange R_EacpGeometry( vertCache_t *block, const void *data,
 				bytes = (std::size_t)block->size;
 			}
 
-			return { resident, 0, bytes };
+			return { resident, 0, (int)bytes };
 		}
 	}
 
