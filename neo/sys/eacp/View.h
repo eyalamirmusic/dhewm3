@@ -24,7 +24,12 @@ common->Frame() is running once a refresh, and it is being driven by a keyboard.
 
 #pragma once
 
+#include "DemoData.h"
+
 #include <eacp/GPU/GPU.h>
+
+#include <memory>
+#include <optional>
 
 namespace dhewm3
 {
@@ -67,6 +72,19 @@ private:
     // game library, so it takes a second or two of that refresh; the display
     // link coalesces the ticks it misses.
     void startEngine();
+
+    // What the window shows instead while there is nothing to start the engine
+    // with: the demo being downloaded and unpacked, or why it could not be.
+    struct DemoScreen;
+    void drawDemoScreen(GPU::Frame& frame);
+
+    // Made on the first refresh, and asked every refresh until the engine is
+    // started whether there is game data to start it with.
+    std::optional<DemoData> demoData;
+
+    // Made the first time there is a download to show, which on a machine that
+    // has game data is never - so neither renderer is built there.
+    std::unique_ptr<DemoScreen> demoScreen;
 
     bool engineStarted = false;
 };

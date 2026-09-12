@@ -53,8 +53,8 @@ numbers: 297 identical across two captures, 297 moved with `r_skipSpecular 1`.
 
 **There is one binary now.** Step 5 deleted the SDL/GL one; a build tree holds a
 single `dhewm3`, `BUILD` defaults to `cmake-build-release`, and `GAME` has
-nothing left to choose. That default is the IDE's own Release tree: it fetches
-the demo data itself (`FETCH_DEMO_DATA` is on there), and a Release build hashes
+nothing left to choose. That default is the IDE's own Release tree: it holds the
+`neo/demo/demo00.pk4` the build used to fetch at configure time, and a Release build hashes
 identically to the Debug builds every baseline was captured on - checked once,
 297 of 297 against the step 7 baseline, before the port's own `cmake-build-eacp`
 was deleted. `gate.sh` refuses a binary that links `libSDL3`, because after
@@ -269,7 +269,10 @@ before/after check on a change, not a cross-machine conformance suite.
 
 ## Requirements
 
-A playable build and the demo data (`FETCH_DEMO_DATA`, on by default). Set
+A playable build and the demo data: either a `neo/demo/demo00.pk4` in the build
+tree, or the demo the game downloads the first time it starts without game data -
+start it once and let that finish before the first capture, since the download
+is longer than `GATE_TIMEOUT`. Set
 `BUILD=...` if your build tree is not `cmake-build-release`. Everything the gate
 writes goes to `regression/work`, which is `fs_savepath` for these runs - your
 own config, saves and screenshots are never touched.

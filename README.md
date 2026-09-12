@@ -100,6 +100,13 @@ cmake --build build --parallel
 The results end up in `build/neo/`: `dhewm3.app` (or `dhewm3.exe`), plus the `base`
 and `d3xp` game libraries next to it.
 
+There is no game data in the build. Started without any, dhewm3 downloads the free
+Doom 3 demo on its first run instead - 463 MB, with a progress bar in the window -
+unpacks `demo00.pk4` into its own Resources folder
+(`~/Library/Application Support/dhewm3/Resources` on macOS,
+`%APPDATA%\dhewm3\Resources` on Windows), and runs on that from then on. Pointed at
+the retail game, as below, it downloads nothing.
+
 Useful options (pass as `-DOPTION=VALUE` to the first command):
 
 | Option | Default | Meaning |
@@ -172,9 +179,8 @@ build\neo\dhewm3.exe +set fs_basepath C:\path\to\your\doom3
 ```
 
 It finds the game data on its own if you do not say: next to the executable first, then
-a retail install's registry entry, then Steam's. `FETCH_DEMO_DATA` needs a POSIX `sh` to
-unpack the demo installer, which comes with Git for Windows - if the demo is silently
-skipped at configure time, that is why, and the build says so.
+a retail install's registry entry, then Steam's. With none of those it downloads the
+demo, as above.
 
 The one place the two hosts differ that you might notice is `sys/win32/`: it is the
 Sys_ layer, the same thirty-odd entry points `sys/posix/posix_main.cpp` answers for
@@ -321,7 +327,7 @@ POSSIBILITY OF SUCH DAMAGE.
 
 ## miniz
 
-src/framework/miniz/*
+Linked from eacp (`ThirdParty/miniz`), which this fork builds against; `src/framework/miniz/minizconf.h` is minizip's.
 
 The MIT License (MIT)
 

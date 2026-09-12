@@ -50,7 +50,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 //#include <zlib.h>
-#include "../miniz/miniz.h" // DG: use miniz instead of zlib
+#include <miniz.h> // DG: use miniz instead of zlib - eacp's copy, the one it links anyway
 #include "../miniz/minizconf.h"
 
 #if defined(USE_FILE32API)

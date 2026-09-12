@@ -37,7 +37,6 @@ option(BASE				"Build the base game code (Doom 3)" ON)
 option(D3XP				"Build the d3xp game code (Resurrection of Evil)" ON)
 option(HARDLINK_GAME	"Compile the game code into the executable instead of separate game libraries" OFF)
 option(REPRODUCIBLE_BUILD "Replace __DATE__ and __TIME__ with hardcoded values for reproducible builds" OFF)
-option(FETCH_DEMO_DATA	"Download the free Doom 3 demo so the build is runnable without the retail game" ON)
 
 if(NOT MSVC)
 	option(ASAN			"Enable the Address Sanitizer" OFF)
@@ -377,12 +376,10 @@ set(src_framework
 	framework/async/MsgChannel.cpp
 	framework/async/NetworkSystem.cpp
 	framework/async/ServerScan.cpp
-	framework/miniz/miniz.c
 	framework/minizip/ioapi.c
 	framework/minizip/unzip.cpp
 )
 
-always_optimize_sourcefile(framework/miniz/miniz.c)
 always_optimize_sourcefile(framework/minizip/ioapi.c)
 always_optimize_sourcefile(framework/minizip/unzip.cpp)
 
@@ -754,6 +751,8 @@ set(src_sys
 	sys/eacp/Main.cpp
 	sys/eacp/View.h
 	sys/eacp/View.cpp
+	sys/eacp/DemoData.h
+	sys/eacp/DemoData.cpp
 	sys/eacp/Platform.h
 	sys/eacp/GLimp.cpp
 	sys/eacp/Input.h
@@ -836,8 +835,16 @@ if(CORE)
 	# mutexes, and the odds and ends in cpu.cpp, posix_main.cpp and Common.cpp -
 	# and this line is the proof: a surviving reference would not link.
 	# imgui-eacp brings imgui::imgui and eacp-sprites with it, which is where
-	# <imgui.h> and the whole GPU stack come from on this target.
-	target_link_libraries(dhewm3 PRIVATE idlib eacp-gpu imgui-eacp OpenAL::OpenAL)
+	# <imgui.h> and the whole GPU stack come from on this target. eacp-network
+	# and eacp-text are the first run on a machine with no game data: the demo
+	# is fetched with OnlineResource, behind a progress screen drawn with the
+	# sprite and glyph batchers (sys/eacp/DemoData.cpp).
+	#
+	# miniz is eacp's too. The engine used to compile a copy of its own, for
+	# minizip's inflate and stb_image_write's deflate, and eacp-core carries
+	# another for its Zip module - which OnlineResource reaches, so the two
+	# would each define the whole zlib API in one executable. One copy it is.
+	target_link_libraries(dhewm3 PRIVATE idlib eacp-gpu eacp-sprites eacp-text eacp-network miniz imgui-eacp OpenAL::OpenAL)
 
 	if(APPLE)
 		target_link_libraries(dhewm3 PRIVATE "-framework Cocoa")
@@ -913,8 +920,7 @@ if(CORE)
 
 	# openal-soft is fetched and built on Windows (../CMake/OpenALSoft.cmake), so
 	# its DLL is somewhere under _deps rather than on the loader's search path.
-	# Put it next to the executable, which is also where the game libraries and
-	# the demo data land.
+	# Put it next to the executable, which is also where the game libraries land.
 	if(WIN32 AND TARGET OpenAL)
 		add_custom_command(TARGET dhewm3 POST_BUILD
 			COMMAND ${CMAKE_COMMAND} -E copy_if_different
@@ -961,9 +967,6 @@ if(CORE AND NOT HARDLINK_GAME)
 		add_dependencies(dhewm3 d3xp)
 	endif()
 endif()
-
-# Optionally fetch the free Doom 3 demo, so a fresh build has game data to run with.
-include(DemoData)
 
 if(is_multi_config)
 	message(STATUS "Building dhewm3 for ${os} (build type is chosen at build time)")

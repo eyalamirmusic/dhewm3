@@ -15,7 +15,7 @@
 #include "stb_image.h"
 
 
-#include "framework/miniz/miniz.h"
+#include <miniz.h>
 
 static unsigned char* compress_for_stbiw(unsigned char* data, int data_len, int* out_len, int quality)
 {

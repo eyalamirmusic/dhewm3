@@ -4,8 +4,11 @@
 
 #include <eacp/Core/App/AppEnvironment.h>
 #include <eacp/Graphics/Window/Window.h>
+#include <eacp/Sprites/SpriteRenderer.h>
+#include <eacp/Text/TextRenderer.h>
 
 #include <algorithm>
+#include <cstdarg>
 #include <string>
 #include <vector>
 
@@ -38,6 +41,41 @@ Graphics::Rect contentRect()
 
     return {(bounds.w - w) * 0.5f, (bounds.h - h) * 0.5f, w, h};
 }
+
+namespace
+{
+std::string formatted(const char* format, ...)
+{
+    char buffer[512] = {};
+
+    // idStr's, because idlib/Str.h turns vsnprintf into a compile error.
+    va_list args;
+    va_start(args, format);
+    idStr::vsnPrintf(buffer, sizeof(buffer), format, args);
+    va_end(args);
+
+    return buffer;
+}
+
+std::string megabytes(std::int64_t bytes)
+{
+    return formatted("%.1f MB", (double) bytes / (1024.0 * 1024.0));
+}
+} // namespace
+
+// Two renderers and nothing else. Built on the first refresh that has a download
+// to show rather than with the view, because building them compiles pipelines
+// and loads a font - a second's work a machine that has game data never needs.
+struct View::DemoScreen
+{
+    explicit DemoScreen(int sampleCount)
+        : sprites(Graphics::Point {1.0f, 1.0f}, sampleCount)
+    {
+    }
+
+    Sprites::SpriteRenderer sprites;
+    Text::TextRenderer text {14.0f};
+};
 
 View::View()
 {
@@ -113,7 +151,10 @@ void View::startEngine()
 
     // Apps::run snapshotted main()'s argv. Index 0 is the executable path,
     // which idCommonLocal::ParseCommandLine says it does not want.
-    auto arguments = std::vector<std::string> {};
+    //
+    // What DemoData has to say goes first: fs_cdpath, when the engine is to run
+    // on the demo it downloaded.
+    auto arguments = demoData->engineArguments();
     const auto& commandLine = Apps::getAppEnvironment().commandLineArgs;
 
     for (std::size_t i = 1; i < commandLine.size(); ++i)
@@ -165,15 +206,111 @@ void View::render(GPU::Frame& frame)
     // told not to sleep on top of it (sys/eacp/GLimp.cpp).
     R_EacpSetFrame(&frame);
 
+    // Not started until there is game data to start it with. On a machine that
+    // has some that is the first refresh, as it always was; on one that has none
+    // it is once the demo is downloaded and unpacked, with the window showing
+    // how far along that is in the meantime.
     if (!engineStarted)
+    {
+        if (!demoData)
+            demoData.emplace();
+
+        demoData->update();
+    }
+
+    if (engineStarted)
+        common->Frame();
+    else if (demoData->stage() == DemoData::Stage::ready)
         startEngine();
     else
-        common->Frame();
+        drawDemoScreen(frame);
 
     // Null outside the frame, so that a draw issued from anywhere else - a
     // console command, a level load's own screen update - is a no-op that says
     // so rather than a use of a Frame that has already presented.
     R_EacpSetFrame(nullptr);
+}
+
+void View::drawDemoScreen(GPU::Frame& frame)
+{
+    if (!demoScreen)
+        demoScreen = std::make_unique<DemoScreen>(sampleCount());
+
+    auto& sprites = demoScreen->sprites;
+    auto& text = demoScreen->text;
+    const auto& data = *demoData;
+
+    const auto bounds = getLocalBounds();
+    auto pass = frame.beginPass({Graphics::Color {0.06f, 0.06f, 0.07f}});
+
+    sprites.setLogicalSize({bounds.w, bounds.h});
+    sprites.begin(pass);
+
+    text.setViewport({bounds.w, bounds.h}, frame.backingScale());
+    text.begin();
+
+    const auto bright = Graphics::Color {0.92f, 0.92f, 0.92f};
+    const auto dim = Graphics::Color {0.55f, 0.55f, 0.58f};
+    const auto red = Graphics::Color {1.0f, 0.45f, 0.4f};
+
+    const auto width = std::min(bounds.w - 64.0f, 640.0f);
+    const auto left = (bounds.w - width) * 0.5f;
+    const auto line = text.lineHeight();
+    const auto bar = Graphics::Rect {left, bounds.h * 0.5f - 10.0f, width, 20.0f};
+
+    // Two lines, because one is wider than the bar and a narrow window cuts it.
+    const auto drawHint = [&](float y)
+    {
+        text.draw("To play the full game instead, quit and start dhewm3 with", {left, y}, dim);
+        text.draw("+set fs_basepath <your Doom 3 directory>", {left, y + line}, dim);
+    };
+
+    if (data.stage() == DemoData::Stage::failed)
+    {
+        text.draw("The Doom 3 demo could not be fetched", {left, bar.y}, bright);
+        text.draw(data.error(), {left, bar.y + line * 1.5f}, red);
+        text.draw("Click anywhere to try again.", {left, bar.y + line * 3.0f}, dim);
+        drawHint(bar.y + line * 4.5f);
+    }
+    else
+    {
+        const auto done = data.bytesDone();
+        const auto total = data.bytesTotal();
+        const auto fraction = total > 0 ? (float) ((double) done / (double) total) : -1.0f;
+        const auto unpacking = data.stage() == DemoData::Stage::unpacking;
+
+        const auto heading = unpacking
+                                 ? "Unpacking demo00.pk4 out of the demo installer"
+                                 : "No Doom 3 game data was found, so dhewm3 is "
+                                   "downloading the free demo";
+
+        // A server that declares no length gives no percentage to show, only
+        // how much has arrived.
+        const auto status =
+            unpacking ? formatted("%.0f%%", std::max(0.0f, fraction) * 100.0f)
+            : fraction >= 0.0f
+                ? formatted("%s of %s  (%.0f%%)",
+                            megabytes(done).c_str(),
+                            megabytes(total).c_str(),
+                            fraction * 100.0f)
+                : formatted("%s so far", megabytes(done).c_str());
+
+        sprites.fillRect(bar, {1.0f, 1.0f, 1.0f, 0.08f});
+
+        auto filled = bar;
+        filled.w = bar.w * std::max(0.0f, fraction);
+        sprites.fillRect(filled, {0.72f, 0.16f, 0.1f, 1.0f});
+        sprites.drawRect(bar, {1.0f, 1.0f, 1.0f, 0.25f}, 1.0f);
+
+        text.draw(heading, {left, bar.y - line * 0.8f}, bright);
+        text.draw(status, {left, bar.y + bar.h + line * 1.2f}, dim);
+        drawHint(bar.y + bar.h + line * 3.2f);
+    }
+
+    // The quads first, so the text lands on top of the bar: the sprite queue
+    // is otherwise drawn when the pass ends, which is after the glyphs.
+    sprites.flush();
+    text.flush(pass);
 }
 
 /*
@@ -197,6 +334,16 @@ void View::keyUp(const Graphics::KeyEvent& event)
 
 void View::mouseDown(const Graphics::MouseEvent& event)
 {
+    // Before the engine is started the only thing in the window is the demo
+    // screen, and the one thing a click does there is try a failed fetch again.
+    if (!engineStarted)
+    {
+        if (demoData)
+            demoData->retry();
+
+        return;
+    }
+
     Input::mouseButton(event, true);
 }
 

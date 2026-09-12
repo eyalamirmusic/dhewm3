@@ -29,9 +29,10 @@
 # and the ways it can sit there are not all worth enumerating.
 #
 # A build tree holds one binary, named dhewm3. BUILD says which tree, and
-# defaults to cmake-build-release - the IDE's own Release tree, which fetches
-# the demo data itself (FETCH_DEMO_DATA) and hashes identically to the Debug
-# builds every baseline was captured on, 297 of 297 when that was checked:
+# defaults to cmake-build-release - the IDE's own Release tree, which still
+# holds the neo/demo/demo00.pk4 the build used to fetch, and hashes identically
+# to the Debug builds every baseline was captured on, 297 of 297 when that was
+# checked:
 #
 #   BUILD=$PWD/some-other-tree ./regression/gate.sh capture x
 #
@@ -85,7 +86,9 @@ if otool -L "$exe" 2>/dev/null | grep -qi 'libSDL'; then
 	exit 1
 fi
 
-# fs_basepath has to stay where demo00.pk4 is; only the write path moves.
+# fs_basepath stays where the build put the game; only the write path moves. A
+# tree with no demo/demo00.pk4 of its own runs on the demo the game downloads
+# on its first start (sys/eacp/DemoData.cpp), which it finds without being told.
 basepath=$build/neo
 
 engine_pid=
